@@ -12,14 +12,12 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import { executeExecutionPlan } from "./batch-execution.ts";
 import {
     buildCallToolViewModel,
-    buildExecutionOutcome,
     buildOutcomeAgentContent,
     buildOutcomeUiDetails,
-    createExecutionPlan,
     editRequestParameters,
+    executeSingleFileEdit,
     parseEditRequest,
 } from "./pipeline.ts";
 import {
@@ -39,20 +37,16 @@ export default function (pi: ExtensionAPI) {
             "Exact text replacements in existing files. Use for small in-place edits with known oldText. Not for create, delete, move, or full rewrite.",
         promptSnippet: "Exact file edits",
         promptGuidelines: [
-            "Match oldText exactly, including whitespace (line endings and curly quotes are normalized).",
-            "Read the file before editing and copy oldText verbatim.",
-            "Use the smallest unique oldText; 2-4 lines usually suffice — excess context wastes tokens.",
-            "If oldText is not unique, add the minimum context needed for uniqueness, or set expectedOccurrences to the exact count to replace every occurrence (e.g. renaming an identifier).",
-            "Group edits by file: one entry per path.",
-            "Prefer perl/sed/rg/fd via bash for mechanical text-level batch edits across many files (imports, license headers, comment templates, fixed-string renames, bulk config changes); prefer AST-based tools for semantic code transformations.",
+            "Copy oldText verbatim from the latest read output — exact whitespace and quotes, never from memory.",
+            "Keep oldText short (1-3 lines) and unique; set expectedOccurrences to replace all occurrences.",
+            "One file per call; multiple files = parallel calls.",
+            "Bulk edits across many files: use bash (perl/sed) instead.",
         ],
         parameters: editRequestParameters,
         prepareArguments: parseEditRequest,
         async execute(_toolCallId, params, signal, _onUpdate, ctx) {
             const request = parseEditRequest(params);
-            const plan = createExecutionPlan(request, ctx.cwd);
-            const groupResults = await executeExecutionPlan(plan, signal);
-            const outcome = buildExecutionOutcome(groupResults);
+            const outcome = await executeSingleFileEdit(request, ctx.cwd, signal);
 
             return {
                 content: [

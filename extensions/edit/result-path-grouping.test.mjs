@@ -54,8 +54,8 @@ async function loadRegisteredEditTool() {
 	return registeredTool;
 }
 
-function makeEditArgs(entries) {
-	return { files: entries };
+function makeEditArgs(pathName, edits) {
+	return { path: pathName, edits };
 }
 
 function createTheme() {
@@ -127,61 +127,35 @@ function buildSingleFileSuccessGroup() {
 	};
 }
 
-function buildAgentResult(groups) {
-	const applied = groups
-		.filter((group) => group.status === "applied")
-		.map(({ status: _status, ...group }) => group);
-	const failed = groups
-		.filter((group) => group.status === "failed")
-		.map(({ status: _status, ...group }) => group);
+function buildAgentResult(group) {
 	return {
 		content: [{
 			type: "text",
 			text: JSON.stringify({
-				counts: { applied: groups.length, failed: 0 },
-				applied,
-				failed,
+				status: group.status,
+				path: group.path,
 			}),
 		}],
 		details: {
 			kind: "result",
 			summary: "",
-			groups: groups.map((group) =>
-				group.status === "applied"
-					? {
-						path: group.path,
-						status: "applied",
-						previewText: group.previewText ?? "",
-						previewStartLine: group.firstChangedLine,
-						previewTruncated: false,
-						changeStats: group.changeStats ?? { additions: 1, deletions: 1, changedLines: 2 },
-						summary: `Edited ${group.path}.`,
-					}
-					: {
-						path: group.path,
-						status: "failed",
-						error: group.error.message,
-					},
-			),
+			group: group.status === "applied"
+				? {
+					path: group.path,
+					status: "applied",
+					previewText: group.previewText ?? "",
+					previewStartLine: group.firstChangedLine,
+					previewTruncated: false,
+					changeStats: group.changeStats ?? { additions: 1, deletions: 1, changedLines: 2 },
+					summary: `Edited ${group.path}.`,
+				}
+				: {
+					path: group.path,
+					status: "failed",
+					error: group.error.message,
+				},
 		},
 	};
-}
-
-function buildMultiFileSuccessResult() {
-	return buildAgentResult([
-		{
-			path: "/tmp/pi-edit-ui-demo/first.ts",
-			status: "applied",
-			firstChangedLine: 1,
-			previewText: " 1 export const firstValue = 1;\n 2 export const firstName = \"after\";",
-		},
-		{
-			path: "/tmp/pi-edit-ui-demo/second.ts",
-			status: "applied",
-			firstChangedLine: 1,
-			previewText: " 1 export const secondValue = 2;\n 2 export const secondName = \"new\";",
-		},
-	]);
 }
 
 test("pending edit render shows only compact file headers", async () => {
@@ -189,9 +163,7 @@ test("pending edit render shows only compact file headers", async () => {
 	const tool = await loadRegisteredEditTool();
 	const output = renderText(
 		tool.renderCall(
-			makeEditArgs([
-				{ path: "src/example.ts", edits: [{ oldText: "before", newText: "after" }] },
-			]),
+			makeEditArgs("src/example.ts", [{ oldText: "before", newText: "after" }]),
 			createTheme(),
 			createRenderContext({ executionStarted: false, argsComplete: true, isPartial: false }),
 		),
@@ -204,12 +176,12 @@ test("pending edit render shows only compact file headers", async () => {
 test("production result renderer uses Pi native diff rendering", async () => {
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
-	const result = buildAgentResult([{
+	const result = buildAgentResult({
 		path: "src/example.ts",
 		status: "applied",
 		firstChangedLine: 10,
 		previewText: "-10 \tindented\n+10   indented",
-	}]);
+	});
 
 	const output = renderText(tool.renderResult(
 		result,
@@ -226,12 +198,12 @@ test("result file header and diff have exactly one blank line between them", asy
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
 	const output = renderText(tool.renderResult(
-		buildAgentResult([{
+		buildAgentResult({
 			path: "src/example.ts",
 			status: "applied",
 			firstChangedLine: 1,
 			previewText: "-1 before\n+1 after",
-		}]),
+		}),
 		{ expanded: true },
 		createTheme(),
 		createRenderContext(),
@@ -249,12 +221,12 @@ test("raw result fallback replaces a prior structured Container without throwing
 	const tool = await loadRegisteredEditTool();
 	const context = createRenderContext();
 	const structured = tool.renderResult(
-		buildAgentResult([{
+		buildAgentResult({
 			path: "src/example.ts",
 			status: "applied",
 			firstChangedLine: 1,
 			previewText: "-1 before\n+1 after",
-		}]),
+		}),
 		{ expanded: true },
 		createTheme(),
 		context,
@@ -273,14 +245,13 @@ test("renderResult keeps the single-file path header visible before its diff", a
 	const tool = await loadRegisteredEditTool();
 	const output = renderText(
 		tool.renderResult(
-			buildAgentResult([
-				{
+			buildAgentResult({
 					path: "src/example.ts",
 					status: "applied",
 					firstChangedLine: 1,
 					previewText: " 1 after",
 				},
-			]),
+			),
 			{ expanded: true },
 			createTheme(),
 			createRenderContext(),
@@ -290,45 +261,16 @@ test("renderResult keeps the single-file path header visible before its diff", a
 	assertAppearsInOrder(output, ["src/example.ts", " 1 after"]);
 });
 
-test("renderResult groups multi-file edit output into per-path blocks", async () => {
-	initTheme("dark");
-	const tool = await loadRegisteredEditTool();
-	const output = renderText(
-		tool.renderResult(
-			buildAgentResult([
-				{
-					path: "src/first.ts",
-					status: "applied",
-					firstChangedLine: 1,
-					previewText: " 1 after",
-				},
-				{
-					path: "src/second.ts",
-					status: "applied",
-					firstChangedLine: 1,
-					previewText: " 1 two",
-				},
-			]),
-			{ expanded: true },
-			createTheme(),
-			createRenderContext(),
-		),
-	);
-
-	assertAppearsInOrder(output, ["src/first.ts", " 1 after", "src/second.ts", " 1 two"]);
-});
 
 test("single-file execution replaces pending header with final diff", async () => {
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
-	const args = makeEditArgs([
-		{ path: "/tmp/pi-edit-ui-demo/example.ts", edits: [{ oldText: "before", newText: "after" }] },
-	]);
+	const args = makeEditArgs("/tmp/pi-edit-ui-demo/example.ts", [{ oldText: "before", newText: "after" }]);
 	const component = createToolExecutionComponent(tool, args);
 	component.setArgsComplete();
 	component.markExecutionStarted();
 	component.updateResult({
-		...buildAgentResult([buildSingleFileSuccessGroup()]),
+		...buildAgentResult(buildSingleFileSuccessGroup()),
 		isError: false,
 	}, false);
 
@@ -339,14 +281,12 @@ test("single-file execution replaces pending header with final diff", async () =
 test("completed single-file tool execution renders one standalone per-file block", async () => {
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
-	const args = makeEditArgs([
-		{ path: "/tmp/pi-edit-ui-demo/example.ts", edits: [{ oldText: "before", newText: "after" }] },
-	]);
+	const args = makeEditArgs("/tmp/pi-edit-ui-demo/example.ts", [{ oldText: "before", newText: "after" }]);
 	const component = createToolExecutionComponent(tool, args);
 	component.markExecutionStarted();
 	component.setArgsComplete();
 	component.updateResult({
-		...buildAgentResult([buildSingleFileSuccessGroup()]),
+		...buildAgentResult(buildSingleFileSuccessGroup()),
 		isError: false,
 	}, false);
 
@@ -357,33 +297,6 @@ test("completed single-file tool execution renders one standalone per-file block
 	assertAppearsInOrder(output, ["/tmp/pi-edit-ui-demo/example.ts", "export const name = \"after\";"]);
 });
 
-test("completed multi-file tool execution renders only standalone per-file blocks", async () => {
-	initTheme("dark");
-	const tool = await loadRegisteredEditTool();
-	const args = makeEditArgs([
-		{ path: "/tmp/pi-edit-ui-demo/first.ts", edits: [{ oldText: "before", newText: "after" }] },
-		{ path: "/tmp/pi-edit-ui-demo/second.ts", edits: [{ oldText: "old", newText: "new" }] },
-	]);
-	const component = createToolExecutionComponent(tool, args);
-	component.markExecutionStarted();
-	component.setArgsComplete();
-	component.updateResult({ ...buildMultiFileSuccessResult(), isError: false }, false);
-
-	const output = renderText(component);
-
-	assert.equal(countOccurrences(output, "/tmp/pi-edit-ui-demo/first.ts"), 1);
-	assert.equal(countOccurrences(output, "/tmp/pi-edit-ui-demo/second.ts"), 1);
-	assert.doesNotMatch(output, /Applied 2 files\./);
-	assertAppearsInOrder(
-		output,
-		[
-			"/tmp/pi-edit-ui-demo/first.ts",
-			"export const firstName = \"after\";",
-			"/tmp/pi-edit-ui-demo/second.ts",
-			"export const secondName = \"new\";",
-		],
-	);
-});
 
 test("renderResult makes edit path headers clickable file hyperlinks", async () => {
 	initTheme("dark");
@@ -391,14 +304,12 @@ test("renderResult makes edit path headers clickable file hyperlinks", async () 
 	const cwd = "/tmp/pi-edit-link-demo";
 	const raw = renderRawText(
 		tool.renderResult(
-			buildAgentResult([
-				{
-					path: "src/example.ts",
-					status: "applied",
-					firstChangedLine: 1,
-					previewText: " 1 after",
-				},
-			]),
+			buildAgentResult({
+				path: "src/example.ts",
+				status: "applied",
+				firstChangedLine: 1,
+				previewText: " 1 after",
+			}),
 			{ expanded: true },
 			createTheme(),
 			createRenderContext({ cwd }),

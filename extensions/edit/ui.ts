@@ -40,8 +40,7 @@ function isRenderedResultPayload(value: unknown): value is ResultToolViewModel {
 	return isRecord(value) &&
 		value.kind === "result" &&
 		typeof value.summary === "string" &&
-		Array.isArray(value.groups) &&
-		value.groups.every(isResultGroup);
+		isResultGroup(value.group);
 }
 
 export function renderCallTitle(theme: Theme, config: SharedToolRenderConfig = {}): string {
@@ -75,13 +74,11 @@ export function renderCallViewModel(
 	}
 
 	const container = reusableContainer(context);
-	for (const group of viewModel.groups) {
-		container.addChild(new Text(
-			`${renderCallTitle(theme, config)} file ${renderCwdFilePathLink(group.path, group.path, context.cwd, theme)}`,
-			0,
-			0,
-		));
-	}
+	container.addChild(new Text(
+		`${renderCallTitle(theme, config)} file ${renderCwdFilePathLink(viewModel.path, viewModel.path, context.cwd, theme)}`,
+		0,
+		0,
+	));
 	pendingState(context).pendingCallComponent = container;
 	return container;
 }
@@ -106,7 +103,7 @@ export function renderToolTextResult(
 }
 
 function renderResultGroupTitle(
-	group: ResultToolViewModel["groups"][number],
+	group: ResultToolViewModel["group"],
 	theme: Theme,
 	context: ToolRenderContext,
 	config: SharedToolRenderConfig,
@@ -123,7 +120,7 @@ function renderResultGroupTitle(
 }
 
 function renderResultGroupBody(
-	group: ResultToolViewModel["groups"][number],
+	group: ResultToolViewModel["group"],
 	theme: Theme,
 ): Text {
 	if (group.status === "failed") {
@@ -136,7 +133,7 @@ function renderResultGroupBody(
 }
 
 function renderResultGroup(
-	group: ResultToolViewModel["groups"][number],
+	group: ResultToolViewModel["group"],
 	theme: Theme,
 	context: ToolRenderContext,
 	config: SharedToolRenderConfig,
@@ -164,9 +161,6 @@ export function renderResultViewModel(
 ): Container {
 	clearPendingCall(context);
 	const container = reusableContainer(context);
-	for (let index = 0; index < viewModel.groups.length; index += 1) {
-		if (index > 0) container.addChild(new Spacer(1));
-		container.addChild(renderResultGroup(viewModel.groups[index]!, theme, context, config));
-	}
+	container.addChild(renderResultGroup(viewModel.group, theme, context, config));
 	return container;
 }

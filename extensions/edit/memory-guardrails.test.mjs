@@ -9,7 +9,7 @@ import {
 	generateEditPreview,
 	MAX_EDIT_FILE_SIZE_BYTES,
 } from "./edit-engine.ts";
-import { executeExecutionPlan } from "./batch-execution.ts";
+import { executeSingleFileEdit } from "./pipeline.ts";
 
 async function makeTempDir(prefix) {
 	return fs.promises.mkdtemp(path.join(os.tmpdir(), prefix));
@@ -20,32 +20,6 @@ async function writeTempFile(prefix, name, content) {
 	const file = path.join(dir, name);
 	await fs.promises.writeFile(file, content, "utf-8");
 	return file;
-}
-
-function makePlanGroup(pathName, canonicalPath, oldText = "x", newText = "y") {
-	return {
-		path: pathName,
-		canonicalPath,
-		edits: [{ oldText, newText }],
-	};
-}
-
-function makePlan(groups, maxConcurrency = groups.length) {
-	return {
-		groups,
-		totalEdits: groups.reduce((total, group) => total + group.edits.length, 0),
-		maxConcurrency,
-	};
-}
-
-function makeAppliedResult(displayPath, edits) {
-	return {
-		previewText: `preview:${displayPath}`,
-		previewStartLine: 1,
-		previewTruncated: false,
-		changeStats: { additions: 1, deletions: 0, changedLines: 1 },
-		summary: `ok ${edits.length}`,
-	};
 }
 
 test("large file exceeding MAX_EDIT_FILE_SIZE_BYTES is rejected without reading content", async () => {
@@ -78,54 +52,37 @@ test("large file exceeding MAX_EDIT_FILE_SIZE_BYTES is rejected without reading 
 	assert.equal(readCalled, false, "readFile must not be called for oversized files");
 });
 
-// ─── 2. Byte-budget scheduler keeps inflight bytes within budget ──────────────
-
-test("byte-budget scheduler keeps inflight bytes within MAX_INFLIGHT_BYTES across ten large files", async () => {
-	const dir = await makeTempDir("pi-budget-");
-	const filePaths = await Promise.all(
-		Array.from({ length: 10 }, async (_, i) => {
-			const p = path.join(dir, `file${i}.ts`);
-			await fs.promises.writeFile(p, "x".repeat(600 * 1024), "utf-8");
-			return p;
-		}),
-	);
-
-	let maxInflight = 0;
-	let currentInflight = 0;
-
-	await executeExecutionPlan(
-		makePlan(filePaths.map((filePath, index) => makePlanGroup(`file${index}.ts`, filePath)), 10),
-		undefined,
-		async (_abs, displayPath, edits) => {
-			currentInflight += 1;
-			if (currentInflight > maxInflight) maxInflight = currentInflight;
-			await new Promise((r) => setTimeout(r, 5));
-			currentInflight -= 1;
-			return makeAppliedResult(displayPath, edits);
-		},
-	);
-
-	assert.ok(maxInflight < 10, `expected scheduler to throttle; got maxInflight=${maxInflight}`);
-	assert.ok(maxInflight >= 1, "at least one file must run");
-});
+// ─── 2. Single-file execution outcome contract ───────────────────────────────
 
 test("successful execution outcome carries previewText and changeStats, not a diff string", async () => {
 	const file = await writeTempFile("pi-contract-", "target.ts", "const x = 1;\nconst y = 2;\n");
 
-	const results = await executeExecutionPlan(
-		makePlan([makePlanGroup("target.ts", file, "const x = 1;", "const x = 99;")], 1),
+	const group = await executeSingleFileEdit(
+		{ path: file, edits: [{ oldText: "const x = 1;", newText: "const x = 99;" }] },
+		process.cwd(),
 	);
 
-	assert.equal(results.length, 1);
-	const group = results[0];
-	assert.equal(group?.status, "applied");
-	if (group?.status !== "applied") throw new Error("expected applied");
+	assert.equal(group.status, "applied");
+	if (group.status !== "applied") throw new Error("expected applied");
 
 	// New contract: previewText and changeStats present
 	assert.ok(typeof group.previewText === "string", "previewText must be a string");
 	assert.ok(typeof group.changeStats === "object", "changeStats must be present");
 
 	assert.ok(!("diff" in group), "diff field must not exist on success outcome");
+});
+
+test("failed execution outcome carries errorKind for recoverable edit errors", async () => {
+	const file = await writeTempFile("pi-contract-", "target.ts", "const x = 1;\n");
+
+	const group = await executeSingleFileEdit(
+		{ path: file, edits: [{ oldText: "missing text", newText: "replacement" }] },
+		process.cwd(),
+	);
+
+	assert.equal(group.status, "failed");
+	if (group.status !== "failed") throw new Error("expected failed");
+	assert.equal(group.errorKind, "NOT_FOUND");
 });
 
 test("generateEditPreview produces only the changed window, not the whole file", () => {

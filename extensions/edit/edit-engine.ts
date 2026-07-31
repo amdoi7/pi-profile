@@ -34,7 +34,7 @@ export type ExecutedFileEditResult = {
 // Hard file-size gate. Files larger than this are rejected before reading.
 export const MAX_EDIT_FILE_SIZE_BYTES = 8 * 1024 * 1024; // 8 MB
 
-export type RecoverableEditErrorKind = "NOT_FOUND" | "DUPLICATE_MATCH" | "OCCURRENCE_MISMATCH" | "NO_CHANGE";
+export type RecoverableEditErrorKind = "NOT_FOUND" | "DUPLICATE_MATCH" | "NO_CHANGE";
 
 export class EditToolError extends Error {
 	readonly kind: RecoverableEditErrorKind;
@@ -160,7 +160,7 @@ function findAllMatchIndices(content: string, needle: string): number[] {
 function getNotFoundError(path: string, editIndex: number, totalEdits: number): EditToolError {
 	const ref = totalEdits === 1 ? "the text" : `edits[${editIndex}]`;
 	return new EditToolError(
-		`NOT_FOUND ${ref} in ${path}. oldText must match the file content exactly, including whitespace; line endings and curly quotes are normalized before matching.`,
+		`NOT_FOUND ${ref} in ${path}. oldText must match the file content exactly, including whitespace; line endings and curly quotes are normalized before matching. Re-read the file and copy oldText character-for-character from the read output — never write it from memory, paraphrase it, or "fix" the original text. Common causes: indentation/whitespace differences, quote style changes, or a paraphrased oldText.`,
 		"NOT_FOUND",
 		{
 			displayPath: path,
@@ -174,19 +174,6 @@ function getDuplicateError(path: string, editIndex: number, totalEdits: number, 
 	return new EditToolError(
 		`DUPLICATE_MATCH ${ref} in ${path} (${occurrences} occurrences). oldText is not unique.`,
 		"DUPLICATE_MATCH",
-		{
-			displayPath: path,
-			editIndex: totalEdits === 1 ? undefined : editIndex,
-			occurrences,
-		},
-	);
-}
-
-function getOccurrenceMismatchError(path: string, editIndex: number, totalEdits: number, expected: number, occurrences: number): EditToolError {
-	const ref = totalEdits === 1 ? "the text" : `edits[${editIndex}]`;
-	return new EditToolError(
-		`OCCURRENCE_MISMATCH ${ref} in ${path} (expected ${expected} occurrence${expected === 1 ? "" : "s"}, found ${occurrences}).`,
-		"OCCURRENCE_MISMATCH",
 		{
 			displayPath: path,
 			editIndex: totalEdits === 1 ? undefined : editIndex,
@@ -227,7 +214,6 @@ function getNoChangeError(path: string, totalEdits: number): EditToolError {
 function resolveEditMatches(
 	content: string,
 	oldText: string,
-	expectedOccurrences: number,
 	expectedOccurrencesWasExplicit: boolean,
 	path: string,
 	editIndex: number,
@@ -240,9 +226,8 @@ function resolveEditMatches(
 		if (!expectedOccurrencesWasExplicit && exactMatches.length > 1) {
 			throw getDuplicateError(path, editIndex, totalEdits, exactMatches.length);
 		}
-		if (exactMatches.length !== expectedOccurrences) {
-			throw getOccurrenceMismatchError(path, editIndex, totalEdits, expectedOccurrences, exactMatches.length);
-		}
+		// Explicit expectedOccurrences means "replace all occurrences";
+		// the count is a declaration, not a constraint.
 		return exactMatches.map((matchIndex) => ({
 			matchIndex,
 			actualOldText: oldText,
@@ -258,9 +243,7 @@ function resolveEditMatches(
 	if (!expectedOccurrencesWasExplicit && fuzzyMatches.length > 1) {
 		throw getDuplicateError(path, editIndex, totalEdits, fuzzyMatches.length);
 	}
-	if (fuzzyMatches.length !== expectedOccurrences) {
-		throw getOccurrenceMismatchError(path, editIndex, totalEdits, expectedOccurrences, fuzzyMatches.length);
-	}
+	// Explicit expectedOccurrences means "replace all occurrences".
 
 	return fuzzyMatches.map((matchIndex) => ({
 		matchIndex,
@@ -360,11 +343,9 @@ export function applyEditsToNormalizedContent(normalizedContent: string, edits: 
 		const edit = edits[index]!;
 		const oldText = normalizeToLF(edit.oldText);
 		const newText = normalizeToLF(edit.newText);
-		const expectedOccurrences = edit.expectedOccurrences ?? 1;
 		const resolvedMatches = resolveEditMatches(
 			normalizedContent,
 			oldText,
-			expectedOccurrences,
 			edit.expectedOccurrences !== undefined,
 			path,
 			index,

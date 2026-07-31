@@ -79,10 +79,11 @@ test("non-quote fuzzy mismatches fail with NOT_FOUND guidance on exact whitespac
 		(error) => {
 			assert.ok(error instanceof EditToolError);
 			assert.equal(error.kind, 'NOT_FOUND');
-			assert.equal(
+			assert.ok(
+				error.message.startsWith('NOT_FOUND the text in story.txt. oldText must match the file content exactly, including whitespace; line endings and curly quotes are normalized before matching.'),
 				error.message,
-				'NOT_FOUND the text in story.txt. oldText must match the file content exactly, including whitespace; line endings and curly quotes are normalized before matching.',
 			);
+			assert.match(error.message, /Re-read the file and copy oldText character-for-character/);
 			return true;
 		},
 	);
@@ -131,20 +132,17 @@ test("explicit expectedOccurrences replaces every exact occurrence", () => {
 	assert.equal(matchedSpans.length, 3);
 });
 
-test("explicit expectedOccurrences fails closed when the count differs", () => {
-	assert.throws(
-		() => applyEditsToNormalizedContent(
-			'const oldName = oldName;\n',
-			[{ oldText: 'oldName', newText: 'newName', expectedOccurrences: 3 }],
-			'demo.ts',
-		),
-		(error) => {
-			assert.ok(error instanceof EditToolError);
-			assert.equal(error.kind, 'OCCURRENCE_MISMATCH');
-			assert.match(error.message, /expected 3 occurrences, found 2/);
-			return true;
-		},
+test("explicit expectedOccurrences replaces all when the actual count differs", () => {
+	// expectedOccurrences is a declaration of intent ("replace all"), not a
+	// constraint: fewer actual matches still replace everything found.
+	const { newContent, matchedSpans } = applyEditsToNormalizedContent(
+		'const oldName = oldName;\n',
+		[{ oldText: 'oldName', newText: 'newName', expectedOccurrences: 3 }],
+		'demo.ts',
 	);
+
+	assert.equal(newContent, 'const newName = newName;\n');
+	assert.equal(matchedSpans.length, 2);
 });
 
 test("implicit single occurrence keeps duplicate-match guidance", () => {

@@ -3,7 +3,12 @@ import * as path from "node:path";
 
 import { type } from "arktype";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import type { FileEditOperation, RecoverableEditErrorKind } from "./edit-engine.ts";
+import {
+	executeFileGroupEdits,
+	isEditToolError,
+	type FileEditOperation,
+	type RecoverableEditErrorKind,
+} from "./edit-engine.ts";
 import type { ChangeStats } from "./preview.ts";
 
 const editOperationSchema = type({
@@ -12,68 +17,45 @@ const editOperationSchema = type({
 	"expectedOccurrences?": "number.integer>=1",
 }).onDeepUndeclaredKey("reject");
 
-const editFileSchema = type({
+// One file per call ({ path, edits }), matching pi's built-in edit tool so
+// models never have to learn a second shape. Multi-file edits are done with
+// one call per file; pi executes them in parallel.
+const editRequestSchema = type({
 	path: "string",
 	edits: editOperationSchema.array().atLeastLength(1),
-}).onDeepUndeclaredKey("reject");
-
-const editRequestSchema = type({
-	files: editFileSchema.array().atLeastLength(1),
 }).onDeepUndeclaredKey("reject");
 
 export const editRequestParameters: ToolDefinition["parameters"] = editRequestSchema.toJsonSchema() as ToolDefinition["parameters"];
 
 export type EditRequest = typeof editRequestSchema.infer;
-export type EditRequestFile = EditRequest["files"][number];
 
-export type ExecutionPlanGroup = {
-	path: string;
-	canonicalPath: string;
-	edits: FileEditOperation[];
-};
-
-export type ExecutionPlan = {
-	groups: ExecutionPlanGroup[];
-	totalEdits: number;
-	maxConcurrency: number;
-};
-
-type ExecutionOutcomeGroupBase = {
-	path: string;
-	canonicalPath: string;
-	edits: FileEditOperation[];
-	editCount: number;
-};
-
-export type SuccessfulExecutionOutcomeGroup = ExecutionOutcomeGroupBase & {
-	status: "applied";
-	operation: "replace";
-	previewText: string;
-	previewStartLine?: number;
-	previewTruncated: boolean;
-	changeStats: ChangeStats;
-	summary?: string;
-};
-
-export type FailedExecutionOutcomeGroup = ExecutionOutcomeGroupBase & {
-	status: "failed";
-	error: string;
-	errorKind?: RecoverableEditErrorKind;
-};
-
-export type ExecutionOutcomeGroup = SuccessfulExecutionOutcomeGroup | FailedExecutionOutcomeGroup;
-export type ExecutionOutcomeStatus = "success" | "partial_failure" | "failure";
-
-export type ExecutionOutcome = {
-	overallStatus: ExecutionOutcomeStatus;
-	appliedCount: number;
-	failedCount: number;
-	groups: ExecutionOutcomeGroup[];
-};
+export type EditOutcome =
+	| {
+			status: "applied";
+			path: string;
+			canonicalPath: string;
+			edits: FileEditOperation[];
+			editCount: number;
+			previewText: string;
+			previewStartLine?: number;
+			previewTruncated: boolean;
+			changeStats: ChangeStats;
+			summary?: string;
+	  }
+	| {
+			status: "failed";
+			path: string;
+			canonicalPath: string;
+			edits: FileEditOperation[];
+			editCount: number;
+			error: string;
+			errorKind?: RecoverableEditErrorKind;
+	  };
 
 export type CallToolViewModel = {
 	kind: "call";
-	groups: EditRequestFile[];
+	path: string;
+	edits: FileEditOperation[];
 };
 
 export type ResultToolViewGroup =
@@ -96,15 +78,13 @@ export type ResultToolViewGroup =
 export type ResultToolViewModel = {
 	kind: "result";
 	summary: string;
-	groups: ResultToolViewGroup[];
+	group: ResultToolViewGroup;
 };
 
 export type ToolViewModel =
 	| { kind: "invalid"; message: string }
 	| CallToolViewModel
 	| ResultToolViewModel;
-
-export const DEFAULT_PLAN_MAX_CONCURRENCY = 4;
 
 function resolvePath(filePath: string, cwd: string): string {
 	return path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
@@ -124,7 +104,47 @@ function cloneEdits(edits: FileEditOperation[]): FileEditOperation[] {
 }
 
 export function parseEditRequest(args: unknown): EditRequest {
-	return editRequestSchema.assert(args);
+	return editRequestSchema.assert(normalizeLegacyShapes(args));
+}
+
+/**
+ * Tolerate two input shapes models keep producing despite the public
+ * { path, edits } contract:
+ * - edits as a JSON string (same tolerance as pi's built-in edit tool)
+ * - a single-file { files: [...] } wrapper, which models learned from
+ *   session history predating the grouped-contract removal
+ * Anything else is left untouched so the schema rejects it loudly.
+ */
+function normalizeLegacyShapes(args: unknown): unknown {
+	if (!args || typeof args !== "object") {
+		return args;
+	}
+	const obj = args as Record<string, unknown>;
+
+	if (typeof obj.edits === "string") {
+		try {
+			const parsed = JSON.parse(obj.edits);
+			if (Array.isArray(parsed)) {
+				return { ...obj, edits: parsed };
+			}
+		} catch {
+			// fall through to the schema error for a non-array edits
+		}
+	}
+
+	if (Array.isArray(obj.files) && !("path" in obj)) {
+		if (obj.files.length !== 1) {
+			throw new Error(
+				`edit accepts one file per call ({ path, edits }); received ${obj.files.length} files in the legacy "files" wrapper — make one call per file`,
+			);
+		}
+		const file = obj.files[0];
+		if (file && typeof file === "object") {
+			return file;
+		}
+	}
+
+	return args;
 }
 
 export function buildCallToolViewModel(args: unknown): ToolViewModel {
@@ -132,185 +152,129 @@ export function buildCallToolViewModel(args: unknown): ToolViewModel {
 		const request = parseEditRequest(args);
 		return {
 			kind: "call",
-			groups: request.files.map((group) => ({ path: group.path, edits: cloneEdits(group.edits) })),
+			path: request.path,
+			edits: cloneEdits(request.edits),
 		};
 	} catch (error) {
 		return { kind: "invalid", message: error instanceof Error ? error.message : String(error) };
 	}
 }
 
-export function createExecutionPlan(
+function isOperationAborted(error: unknown): boolean {
+	return error instanceof Error && error.message === "Operation aborted";
+}
+
+/**
+ * Execute the single-file edit request atomically and build its outcome.
+ * Aborts rethrow; recoverable edit failures become failed outcomes.
+ */
+export async function executeSingleFileEdit(
 	request: EditRequest,
 	cwd: string,
-	options: {
-		maxConcurrency?: number;
-		canonicalize?: (filePath: string, cwd: string) => string;
-	} = {},
-): ExecutionPlan {
-	const canonicalize = options.canonicalize ?? canonicalizePath;
-	const canonicalPathMemo = new Map<string, string>();
-	const groups: ExecutionPlanGroup[] = [];
-	const seenCanonicalPaths = new Map<string, ExecutionPlanGroup>();
-	let totalEdits = 0;
+	signal?: AbortSignal,
+): Promise<EditOutcome> {
+	const canonicalPath = canonicalizePath(request.path, cwd);
 
-	for (const file of request.files) {
-		const resolvedPath = resolvePath(file.path, cwd);
-		let canonicalPath = canonicalPathMemo.get(resolvedPath);
-		if (canonicalPath === undefined) {
-			canonicalPath = canonicalize(file.path, cwd);
-			canonicalPathMemo.set(resolvedPath, canonicalPath);
-		}
+	try {
+		const result = await executeFileGroupEdits(canonicalPath, request.path, request.edits, signal);
 
-		const existing = seenCanonicalPaths.get(canonicalPath);
-		if (existing) {
-			existing.edits.push(...cloneEdits(file.edits));
-			totalEdits += file.edits.length;
-			continue;
-		}
-
-		const planGroup = {
-			path: file.path,
+		const outcome: EditOutcome = {
+			path: request.path,
 			canonicalPath,
-			edits: cloneEdits(file.edits),
+			edits: request.edits,
+			editCount: request.edits.length,
+			status: "applied",
+			previewText: result.previewText,
+			previewTruncated: result.previewTruncated,
+			changeStats: result.changeStats,
 		};
-		groups.push(planGroup);
-		seenCanonicalPaths.set(canonicalPath, planGroup);
-		totalEdits += file.edits.length;
-	}
+		if (typeof result.previewStartLine === "number") {
+			outcome.previewStartLine = result.previewStartLine;
+		}
+		if (result.summary.trim().length > 0) {
+			outcome.summary = result.summary.trim();
+		}
+		return outcome;
+	} catch (error) {
+		if (signal?.aborted || isOperationAborted(error)) {
+			throw error instanceof Error ? error : new Error(String(error));
+		}
 
-	const configuredConcurrency = options.maxConcurrency ?? DEFAULT_PLAN_MAX_CONCURRENCY;
-	const maxConcurrency = groups.length === 0
-		? 1
-		: Math.max(1, Math.min(configuredConcurrency, groups.length));
-
-	return {
-		groups,
-		totalEdits,
-		maxConcurrency,
-	};
-}
-
-export function determineOverallStatus(appliedCount: number, failedCount: number): ExecutionOutcomeStatus {
-	if (failedCount === 0) return "success";
-	if (appliedCount === 0) return "failure";
-	return "partial_failure";
-}
-
-export function buildExecutionOutcome(groups: ExecutionOutcomeGroup[]): ExecutionOutcome {
-	const appliedCount = groups.filter((group) => group.status === "applied").length;
-	const failedCount = groups.length - appliedCount;
-	return {
-		overallStatus: determineOverallStatus(appliedCount, failedCount),
-		appliedCount,
-		failedCount,
-		groups,
-	};
-}
-
-function fileLabel(count: number): string {
-	return `${count} file${count === 1 ? "" : "s"}`;
-}
-
-export function buildOutcomeSummary(outcome: ExecutionOutcome): string {
-	if (outcome.failedCount === 0) {
-		return `Applied ${fileLabel(outcome.appliedCount)}.`;
-	}
-	if (outcome.appliedCount === 0) {
-		return `Failed ${fileLabel(outcome.failedCount)}.`;
-	}
-	return `Applied ${fileLabel(outcome.appliedCount)}; ${outcome.failedCount} failed.`;
-}
-
-function buildAppliedAgentGroupPayload(group: SuccessfulExecutionOutcomeGroup): AgentAppliedExecutionOutcomeGroup {
-	return {
-		path: group.path,
-		changes: group.changeStats,
-		firstChangedLine: group.previewStartLine,
-	};
-}
-
-function buildFailedAgentGroupPayload(group: FailedExecutionOutcomeGroup): AgentFailedExecutionOutcomeGroup {
-	return {
-		path: group.path,
-		error: {
-			kind: group.errorKind,
-			message: group.error,
-		},
-	};
-}
-
-export type AgentAppliedExecutionOutcomeGroup = {
-	path: string;
-	changes: ChangeStats;
-	firstChangedLine?: number;
-};
-
-export type AgentFailedExecutionOutcomeGroup = {
-	path: string;
-	error: {
-		kind?: RecoverableEditErrorKind;
-		message: string;
-	};
-};
-
-export type AgentExecutionOutcome = {
-	counts: {
-		applied: number;
-		failed: number;
-	};
-	applied: AgentAppliedExecutionOutcomeGroup[];
-	failed: AgentFailedExecutionOutcomeGroup[];
-};
-
-export function buildOutcomeAgentContent(outcome: ExecutionOutcome): string {
-	return JSON.stringify({
-		counts: {
-			applied: outcome.appliedCount,
-			failed: outcome.failedCount,
-		},
-		applied: outcome.groups
-			.filter((group): group is SuccessfulExecutionOutcomeGroup => group.status === "applied")
-			.map(buildAppliedAgentGroupPayload),
-		failed: outcome.groups
-			.filter((group): group is FailedExecutionOutcomeGroup => group.status === "failed")
-			.map(buildFailedAgentGroupPayload),
-	} satisfies AgentExecutionOutcome);
-}
-
-function buildResultToolViewGroup(group: ExecutionOutcomeGroup): ResultToolViewGroup {
-	if (group.status === "failed") {
+		const baseError = error instanceof Error ? error : new Error(String(error));
 		return {
-			path: group.path,
+			path: request.path,
+			canonicalPath,
+			edits: request.edits,
+			editCount: request.edits.length,
 			status: "failed",
-			error: group.error,
-			errorKind: group.errorKind,
+			error: baseError.message,
+			errorKind: isEditToolError(baseError) ? baseError.kind : undefined,
+		};
+	}
+}
+
+export type AgentEditOutcome =
+	| {
+			status: "applied";
+			path: string;
+			changes: ChangeStats;
+			firstChangedLine?: number;
+	  }
+	| {
+			status: "failed";
+			path: string;
+			error: {
+				kind?: RecoverableEditErrorKind;
+				message: string;
+			};
+	  };
+
+export function buildOutcomeAgentContent(outcome: EditOutcome): string {
+	if (outcome.status === "failed") {
+		const agentOutcome: AgentEditOutcome = {
+			status: "failed",
+			path: outcome.path,
+			error: {
+				kind: outcome.errorKind,
+				message: outcome.error,
+			},
+		};
+		return JSON.stringify(agentOutcome);
+	}
+
+	const agentOutcome: AgentEditOutcome = {
+		status: "applied",
+		path: outcome.path,
+		changes: outcome.changeStats,
+		firstChangedLine: outcome.previewStartLine,
+	};
+	return JSON.stringify(agentOutcome);
+}
+
+function buildResultToolViewGroup(outcome: EditOutcome): ResultToolViewGroup {
+	if (outcome.status === "failed") {
+		return {
+			path: outcome.path,
+			status: "failed",
+			error: outcome.error,
+			errorKind: outcome.errorKind,
 		};
 	}
 	return {
-		path: group.path,
+		path: outcome.path,
 		status: "applied",
-		previewText: group.previewText,
-		previewStartLine: group.previewStartLine,
-		previewTruncated: group.previewTruncated,
-		changeStats: group.changeStats,
-		summary: group.summary,
+		previewText: outcome.previewText,
+		previewStartLine: outcome.previewStartLine,
+		previewTruncated: outcome.previewTruncated,
+		changeStats: outcome.changeStats,
+		summary: outcome.summary,
 	};
 }
 
-export function buildResultToolViewModel(input: {
-	groups: ResultToolViewGroup[];
-	summary: string;
-}): ResultToolViewModel {
+export function buildOutcomeUiDetails(outcome: EditOutcome): ResultToolViewModel {
 	return {
 		kind: "result",
-		summary: input.summary,
-		groups: input.groups,
+		summary: outcome.status === "applied" ? "Applied." : "Failed.",
+		group: buildResultToolViewGroup(outcome),
 	};
-}
-
-export function buildOutcomeUiDetails(outcome: ExecutionOutcome): ResultToolViewModel {
-	return buildResultToolViewModel({
-		summary: buildOutcomeSummary(outcome),
-		groups: outcome.groups.map(buildResultToolViewGroup),
-	});
 }

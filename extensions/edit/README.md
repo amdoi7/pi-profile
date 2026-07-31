@@ -21,8 +21,7 @@
 ## 目录结构
 
 - `index.ts`：tool 注册入口
-- `pipeline.ts`：输入校验、执行计划、agent payload 与 UI details 组装
-- `batch-execution.ts`：多文件执行与并发调度
+- `pipeline.ts`：输入校验、单文件执行、agent payload 与 UI details 组装
 - `edit-engine.ts`：单文件匹配、替换、落盘
 - `preview.ts`：preview window、行级 diff 与 summary
 - `ui.ts`：call/result render
@@ -35,25 +34,19 @@
 
 ```json
 {
-  "files": [
-    {
-      "path": "src/a.ts",
-      "edits": [
-        { "oldText": "foo", "newText": "bar" },
-        { "oldText": "oldName", "newText": "newName", "expectedOccurrences": 3 }
-      ]
-    }
+  "path": "src/a.ts",
+  "edits": [
+    { "oldText": "foo", "newText": "bar" },
+    { "oldText": "oldName", "newText": "newName", "expectedOccurrences": 3 }
   ]
 }
 ```
 
 规则：
 
-- 只支持顶层 `{"files": [{ path, edits }]}` 请求
-- 单文件与多文件都合法；最小文件数为 `1`
-- 每个文件 entry 只对应一个文件
-- 同一文件可在一次调用里出现多次；扩展会按 canonical path 自动合并
-- 为省 token，仍优先推荐同文件多个改动直接并入同一文件 entry
+- 标准格式为 `{ path, edits }`（与 pi 内置 edit 一致）；一次调用只编辑一个文件
+- 多文件编辑：每个文件发一次调用，pi 并行执行
+- `edits` 为 JSON 字符串的输入会自动解析（与 pi 内置 edit 行为一致）
 - `oldText` / `newText` 必须成对出现
 - `expectedOccurrences` 可选，默认为 `1`；若显式设置，必须为正整数
 
