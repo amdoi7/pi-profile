@@ -6,6 +6,7 @@ readonly PROGRAM_NAME="${0##*/}"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly SCRIPT_PATH="$SCRIPT_DIR/${BASH_SOURCE[0]##*/}"
 readonly RUN_ROOT="${PI_SUB_RUN_DIR:-${TMPDIR:-/tmp}/pi-subagent-$UID}"
+readonly DEFAULT_MODEL="${PI_SUB_DEFAULT_MODEL:-deepseek-v4-flash}"
 
 usage() {
 	cat <<EOF
@@ -29,6 +30,17 @@ fail() {
 
 require_command() {
 	command -v "$1" >/dev/null 2>&1 || fail "missing_command" "required command is unavailable: $1"
+}
+
+has_explicit_model() {
+	local argument
+	for argument in "$@"; do
+		[[ "$argument" == "--" ]] && break
+		case "$argument" in
+			--model | --model=*) return 0 ;;
+		esac
+	done
+	return 1
 }
 
 validate_alias() {
@@ -186,6 +198,9 @@ start_run() {
 	local session_id run_dir run_id handshake
 	validate_alias "$alias_name"
 	reject_owned_pi_arguments "$@"
+	if ! has_explicit_model "$@"; then
+		set -- --model "$DEFAULT_MODEL" "$@"
+	fi
 	for command_name in pi shasum lockf mktemp nohup; do
 		require_command "$command_name"
 	done

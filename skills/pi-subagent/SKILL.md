@@ -50,6 +50,9 @@ Aliases accept letters, digits, `.`, `_`, and `-`. Piped stdin is captured
 before the worker starts. Run artifacts live under the system temp directory;
 override it with `PI_SUB_RUN_DIR` when durable result files are required.
 
+Subagent runs default to `deepseek-v4-flash` (pinned in `pi-sub.sh`); override
+with `PI_SUB_DEFAULT_MODEL` or an explicit `--model`.
+
 The wrapper owns print mode, session selection, session directory, and session
 name. Invoke `pi` directly for interactive mode, `--resume`, `--fork`, an
 ephemeral session, or an explicit session ID.
