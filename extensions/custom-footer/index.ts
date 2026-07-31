@@ -9,6 +9,7 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { createGitStatusCache, type GitStatusSnapshot } from "./custom-footer-git.ts";
+import { createTpsTracker } from "./custom-footer-tps.ts";
 
 function formatGitStatusSegment(
 	theme: { fg(name: string, text: string): string },
@@ -37,6 +38,18 @@ function formatGitStatusSegment(
 export default function (pi: ExtensionAPI) {
 	let sessionStart = Date.now();
 	const readGitStatus = createGitStatusCache();
+	const readTps = createTpsTracker();
+
+	pi.on("message_start", async (event, ctx) => {
+		if (event.message.role !== "assistant") return;
+		readTps.onMessageStart(ctx.sessionManager.getCwd());
+	});
+
+	pi.on("message_end", async (event, ctx) => {
+		if (event.message.role !== "assistant") return;
+		const m = event.message as AssistantMessage;
+		readTps.onMessageEnd(ctx.sessionManager.getCwd(), m.usage?.output ?? 0);
+	});
 
 	function formatElapsed(ms: number): string {
 		const s = Math.floor(ms / 1000);
@@ -97,15 +110,22 @@ export default function (pi: ExtensionAPI) {
 						? `${pct.toFixed(0)}%`
 						: "?";
 
+					const cwd = ctx.sessionManager.getCwd();
+
+					const lastTokPerSec = readTps.getLast(cwd);
+					const tpsDisplay = lastTokPerSec !== null
+						? theme.fg("text", `${Math.round(lastTokPerSec)} t/s`)
+						: null;
+
 					const tokenStats = [
 						theme.fg("text", usedDisplay),
 						theme.fg(pctColor, percentDisplay),
 						theme.fg("warning", `$${cost.toFixed(2)}`),
+						...(tpsDisplay ? [tpsDisplay] : []),
 					].join(" ");
 
 					const elapsed = theme.fg("thinkingText", `⏱ ${formatElapsed(Date.now() - sessionStart)}`);
 
-					const cwd = ctx.sessionManager.getCwd();
 					const parts = cwd.split("/");
 					const short = parts.length > 2 ? parts.slice(-2).join("/") : cwd;
 					const cwdStr = theme.fg("thinkingText", `⌂ ${short}`);
