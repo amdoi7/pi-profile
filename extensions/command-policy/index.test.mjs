@@ -1,0 +1,72 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import commandPolicyExtension from "./index.ts";
+import { evaluateCommand } from "./policy.ts";
+
+test("evaluates command policies in one explicit pipeline", () => {
+  const calls = [];
+  const decision = evaluateCommand("python app.py && cargo test", {
+    getBlockedMessage(command) {
+      calls.push(["deny", command]);
+      return null;
+    },
+    rewriteRtk(command) {
+      calls.push(["rtk", command]);
+      return "python app.py && rtk cargo test";
+    },
+    rewriteUv(command) {
+      calls.push(["uv", command]);
+      return "uv run python app.py && rtk cargo test";
+    },
+  });
+
+  assert.deepEqual(calls, [
+    ["deny", "python app.py && cargo test"],
+    ["rtk", "python app.py && cargo test"],
+    ["uv", "python app.py && rtk cargo test"],
+    ["deny", "uv run python app.py && rtk cargo test"],
+  ]);
+  assert.deepEqual(decision, {
+    kind: "rewrite",
+    originalCommand: "python app.py && cargo test",
+    executedCommand: "uv run python app.py && rtk cargo test",
+  });
+});
+
+test("registers one command hook and applies the composed policy", async () => {
+  const hooks = new Map();
+  const statuses = [];
+  commandPolicyExtension({
+    on(event, handler) {
+      assert.equal(hooks.has(event), false, `duplicate ${event} hook`);
+      hooks.set(event, handler);
+    },
+  });
+
+  assert.deepEqual([...hooks.keys()], ["tool_call", "tool_execution_end"]);
+
+  const call = {
+    toolCallId: "call-1",
+    toolName: "bash",
+    input: { command: "python -c 'print(42)'" },
+  };
+  const ctx = {
+    hasUI: true,
+    ui: {
+      setStatus(name, value) {
+        statuses.push({ name, value });
+      },
+    },
+  };
+  await hooks.get("tool_call")(call, ctx);
+  assert.equal(call.input.command, "uv run python -c 'print(42)'");
+
+  await hooks.get("tool_execution_end")({
+    toolCallId: "call-1",
+    toolName: "bash",
+    isError: false,
+  }, ctx);
+
+  assert.equal(statuses.at(-1).value, undefined);
+});

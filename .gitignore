@@ -1,0 +1,36 @@
+# OS noise
+.DS_Store
+
+# Secrets and machine-local configuration
+/auth.json
+/models.json
+/keybindings.json
+/mcp-cache.json
+/trust.json
+/update-cache.json
+/usage-tracker-history.json
+
+# Locally built tools
+/bin/apply_patch
+
+# Runtime state, local caches, and cloned repositories
+/git/
+/sessions/
+/processes/
+/.cache/
+/pi-crash.log
+
+# Dependencies, build output, and test coverage
+**/node_modules/
+**/dist/
+**/coverage/
+**/.cache/
+
+# Locally synced skillshare links and generated metadata
+/skills/.skillshare-manifest.json
+/skills/ascii-diagram
+/skills/commit
+/skills/human-prose
+/skills/idiomatic-go
+/skills/modern-python
+/skills/skillshare

@@ -1,0 +1,16 @@
+{
+  "name": "local-pi-edit-extension",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "arktype": "^2.2.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.83.0",
+    "@earendil-works/pi-tui": "0.83.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}
