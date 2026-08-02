@@ -1,78 +1,72 @@
-/**
- * Core scan logic for pi-sub-watch: detect completed pi-sub runs.
- *
- * Pure and testable: scans a runs directory (as written by pi-sub.sh's
- * publish_status: `state\tvalue` in each run dir's `status` file) and calls
- * onCompleted exactly once per run that transitions to "complete".
- */
-
-import { readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, openSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+
+const RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 export type CompletedRun = {
   runId: string;
   exitCode: string;
 };
 
+function readTrimmed(path: string): string | undefined {
+  try {
+    return readFileSync(path, "utf8").trim();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+function claimNotification(runDir: string): string | undefined {
+  const claimPath = join(runDir, "notification-claimed");
+  try {
+    closeSync(openSync(claimPath, "wx", 0o600));
+    return claimPath;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return undefined;
+    throw error;
+  }
+}
+
+function releaseFailedClaim(claimPath: string, deliveryError: unknown): never {
+  try {
+    unlinkSync(claimPath);
+  } catch (cleanupError) {
+    throw new AggregateError([deliveryError, cleanupError], "pi-sub notification delivery and claim cleanup failed");
+  }
+  throw deliveryError;
+}
+
 export function scanRunsDir(
   runsDir: string,
-  notified: Set<string>,
+  ownerSessionId: string,
   onCompleted: (run: CompletedRun) => void,
 ): void {
   let entries;
   try {
     entries = readdirSync(runsDir, { withFileTypes: true });
-  } catch {
-    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
   }
 
   for (const entry of entries) {
-    if (!entry.isDirectory() || notified.has(entry.name)) continue;
+    if (!entry.isDirectory() || !RUN_ID_PATTERN.test(entry.name)) continue;
 
-    let status: string;
+    const runDir = join(runsDir, entry.name);
+    if (readTrimmed(join(runDir, "owner-session-id")) !== ownerSessionId) continue;
+
+    const status = readTrimmed(join(runDir, "status"));
+    if (status === undefined) continue;
+    const [state, exitCode] = status.split("\t");
+    if (state !== "complete" || !/^[0-9]+$/.test(exitCode ?? "") || Number(exitCode) > 255) continue;
+
+    const claimPath = claimNotification(runDir);
+    if (claimPath === undefined) continue;
     try {
-      status = readFileSync(join(runsDir, entry.name, "status"), "utf8");
-    } catch {
-      continue;
+      onCompleted({ runId: entry.name, exitCode });
+    } catch (error) {
+      releaseFailedClaim(claimPath, error);
     }
-
-    const [state, value] = status.split("\t");
-    if (state?.trim() !== "complete") continue;
-
-    notified.add(entry.name);
-    onCompleted({ runId: entry.name, exitCode: value?.trim() || "?" });
   }
-}
-
-export function loadNotified(file: string): Set<string> {
-  try {
-    const parsed = JSON.parse(readFileSync(file, "utf8"));
-    if (Array.isArray(parsed)) {
-      return new Set(parsed.filter((entry): entry is string => typeof entry === "string"));
-    }
-  } catch {
-    // missing or corrupt file: start empty
-  }
-  return new Set<string>();
-}
-
-export function saveNotified(file: string, notified: Set<string>): void {
-  const temporary = `${file}.tmp`;
-  writeFileSync(temporary, JSON.stringify([...notified]));
-  renameSync(temporary, file);
-}
-
-/**
- * Collect every run that is already in "complete" state. Used on first start
- * or upgrade from a pre-persistence version: those runs were announced (or
- * finished) before this extension existed, so they must be marked as notified
- * silently instead of being re-announced.
- */
-export function collectCompletedRunIds(runsDir: string): string[] {
-  const ids: string[] = [];
-  const seen = new Set<string>();
-  scanRunsDir(runsDir, seen, (run) => {
-    ids.push(run.runId);
-  });
-  return ids;
 }

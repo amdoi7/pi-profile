@@ -1,69 +1,70 @@
 ---
 name: pi-subagent
-description: >
-  Pi subagent. Use to run a one-shot Pi task in the background, delegate
-  parallel independent work, or check and collect a previous background run.
+description: >-
+  Pi subagent. Use only when the user explicitly asks to delegate a background
+  task, run independent work in parallel, or check and collect a pi-sub run.
+compatibility: macOS with Bash, lockf, shasum, mkfifo, nohup, and the Pi CLI.
 ---
 
 # Pi Subagent
 
-Invoke the script from the target project directory. It returns after the
-background worker is ready; Pi continues without blocking the calling shell.
+Run the wrapper from the target project directory:
 
 ```bash
 PI_SUB="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/skills/pi-subagent/pi-sub.sh"
 ```
 
-## Start And Collect
+## Orchestrate
+
+1. Build a self-contained task packet with the goal, scope, non-goals, inputs,
+   expected evidence, and write ownership. A durable lane may provide context,
+   but hidden lane state is never an input contract.
+2. Select the alias and tools. An alias is a durable project-local lane: reuse
+   it only for a follow-up with the same responsibility; use a new alias for an
+   independent task. Infer tools from intent:
+   - Supplied text only: `--no-tools`.
+   - Inspection or review: `--tools read,grep,find,ls`.
+   - Mutation: `--tools read,bash,edit,write,grep,find,ls`, only after assigning
+     an exclusive file set or worktree. `bash` grants mutation authority.
+3. Start the run and retain its `runId`:
 
 ```bash
-"$PI_SUB" reviewer "Review this repository"
-# {"ok":true,"state":"started","runId":"reviewer.xxxxxx","sessionId":"..."}
+"$PI_SUB" reviewer --tools read,grep,find,ls "Review this repository"
+# {"ok":true,"state":"started","runId":"reviewer.xxxxxx",...}
 
-"$PI_SUB" --status reviewer.xxxxxx
-# queued, running, complete, or lost
-
-"$PI_SUB" --result reviewer.xxxxxx
-# Return immediately. Fails while the run is active.
-
-"$PI_SUB" --wait reviewer.xxxxxx
-# Wait for this run, then relay Pi stdout, stderr, and exit code.
+git diff | "$PI_SUB" diff-review --no-tools \
+  "Review the supplied diff for correctness risks"
 ```
 
-Continue useful parent work after `start`; call `--wait` only when the result is
-needed. Reusing an alias resumes the same Pi session. Runs for the same alias
-are serialized by the OS file lock, while different aliases may run together.
-
-## Inputs And Options
+4. Continue only parent work disjoint from every running child. Subagents do
+   not start subagents or coordinate with each other; the parent owns the task
+   graph, explicit handoffs, and integration.
+5. Collect every result before making a dependent decision or finishing:
 
 ```bash
-"$PI_SUB" reviewer --model sonnet:high @README.md "Review this file"
-
-git diff | "$PI_SUB" diff-review "Review this diff for correctness risks"
-
-"$PI_SUB" audit --tools read,grep,find,ls "Review this repo"
-
-"$PI_SUB" audit --no-tools "Analyze the supplied text only"
+"$PI_SUB" --status reviewer.xxxxxx  # queued, running, complete, or lost
+"$PI_SUB" --result reviewer.xxxxxx  # immediate; fails while active
+"$PI_SUB" --wait reviewer.xxxxxx    # wait; relay stdout, stderr, and exit code
 ```
 
-Aliases accept letters, digits, `.`, `_`, and `-`. Piped stdin is captured
-before the worker starts. Run artifacts live under the system temp directory;
-override it with `PI_SUB_RUN_DIR` when durable result files are required.
+Treat a child result as evidence, not authority. Verify its claims against the
+workspace and reconcile any authorized edits. The orchestration is complete
+only when every relevant run is collected and its output is validated or its
+failure is accounted for.
 
-Subagent runs default to `deepseek-v4-flash` (pinned in `pi-sub.sh`); override
-with `PI_SUB_DEFAULT_MODEL` or an explicit `--model`.
+## Runtime Contract
 
-The wrapper owns print mode, session selection, session directory, and session
-name. Invoke `pi` directly for interactive mode, `--resume`, `--fork`, an
-ephemeral session, or an explicit session ID.
+Runs started by a Pi bash tool inherit the parent `PI_SESSION_ID`; only that
+session's watcher receives the completion event. Runs started from a normal
+shell have no owner and must be collected manually. If `PI_SUB_RUN_DIR` is
+overridden, set it in the parent Pi environment as well so its watcher scans
+the same artifacts.
 
-## Native Pi Sessions
+Same-alias runs are serialized; different aliases may run concurrently. Piped
+stdin is captured before launch. Artifacts use the system temp directory unless
+`PI_SUB_RUN_DIR` is set. Aliases accept letters, digits, `.`, `_`, and `-`.
 
-```bash
-pi -c                 # Continue the latest session
-pi -r                 # Browse sessions
-pi --session <id>     # Open a specific session
-pi --fork <id>        # Fork a session
-pi --no-session       # Use an ephemeral session
-pi --name "Audit"     # Name an interactive session
-```
+The default model is `deepseek-v4-flash`; override it with
+`PI_SUB_DEFAULT_MODEL` or `--model`. The wrapper owns print mode, naming, and
+session selection. It rejects `--` because Pi does not implement an
+end-of-options marker.
