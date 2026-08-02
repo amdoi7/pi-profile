@@ -1,8 +1,8 @@
 ---
 name: pi-subagent
 description: >
-  Start Pi as a background one-shot subagent, keep a deterministic
-  project-local session by alias, and collect the run later.
+  Pi subagent. Use to run a one-shot Pi task in the background, delegate
+  parallel independent work, or check and collect a previous background run.
 ---
 
 # Pi Subagent
@@ -39,7 +39,7 @@ are serialized by the OS file lock, while different aliases may run together.
 ```bash
 "$PI_SUB" reviewer --model sonnet:high @README.md "Review this file"
 
-git diff | "$PI_SUB" commit-writer "Write a commit message"
+git diff | "$PI_SUB" diff-review "Review this diff for correctness risks"
 
 "$PI_SUB" audit --tools read,grep,find,ls "Review this repo"
 
