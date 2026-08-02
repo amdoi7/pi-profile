@@ -1,6 +1,7 @@
 import { constants } from "node:fs";
 import { access, readFile, stat, writeFile } from "node:fs/promises";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
+import { generateFinalDiff, type ChangeStats, type DisplayDiff } from "../_shared/final-diff.ts";
 
 export type FileEditOperation = {
 	oldText: string;
@@ -13,10 +14,6 @@ export type AppliedEditsResult = {
 	matchedSpans: MatchedEditSpan[];
 };
 
-import type { ChangeStats } from "./preview.ts";
-import { generateEditPreview } from "./preview.ts";
-export { generateEditPreview };
-
 export type MatchedEditSpan = {
 	matchIndex: number;
 	matchLength: number;
@@ -24,11 +21,10 @@ export type MatchedEditSpan = {
 };
 
 export type ExecutedFileEditResult = {
-	previewText: string;
+	previewDisplay: DisplayDiff;
 	previewStartLine?: number;
 	previewTruncated: boolean;
 	changeStats: ChangeStats;
-	summary: string;
 };
 
 // Hard file-size gate. Files larger than this are rejected before reading.
@@ -156,7 +152,7 @@ function getNotFoundError(editIndex: number): EditToolError {
 
 function getDuplicateError(editIndex: number, occurrences: number): EditToolError {
 	return new EditToolError(
-		`${replacementPrefix(editIndex)}oldText matched ${occurrences} locations. Add context or set replaceAll: true to replace all matches.`,
+		`${replacementPrefix(editIndex)}oldText matched ${occurrences} locations. Add more lines or set replaceAll: true`,
 		"DUPLICATE_MATCH",
 	);
 }
@@ -398,19 +394,18 @@ export async function executeFileEdits(
 
 		// Resolve, validate, apply, and return spans in one call.
 		// applyEditsToNormalizedContent is the single source of truth for match logic.
-		const { newContent, matchedSpans } = applyEditsToNormalizedContent(normalizedContent, edits);
+		const { newContent } = applyEditsToNormalizedContent(normalizedContent, edits);
 		throwIfAborted(signal);
 
 		await operations.writeFile(absolutePath, bom + restoreLineEndings(newContent, originalEnding));
 		throwIfAborted(signal);
 
-		const preview = generateEditPreview(normalizedContent, newContent);
+		const preview = generateFinalDiff(normalizedContent, newContent);
 		return {
-			previewText: preview.previewText,
-			previewStartLine: preview.previewStartLine,
-			previewTruncated: preview.previewTruncated,
-			changeStats: preview.changeStats,
-			summary: `updated ${matchedSpans.length} replacement${matchedSpans.length === 1 ? "" : "s"}`,
+			previewDisplay: preview.display,
+			previewStartLine: preview.firstChangedLine,
+			previewTruncated: preview.truncated,
+			changeStats: preview.stats,
 		};
 	});
 }

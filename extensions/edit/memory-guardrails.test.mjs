@@ -6,10 +6,10 @@ import path from "node:path";
 
 import {
 	executeFileEdits,
-	generateEditPreview,
 	MAX_EDIT_FILE_SIZE_BYTES,
 } from "./edit-engine.ts";
 import { buildOutcomeAgentContent, executeSingleFileEdit } from "./pipeline.ts";
+import { generateFinalDiff, serializeDisplayDiff } from "../_shared/final-diff.ts";
 
 async function makeTempDir(prefix) {
 	return fs.promises.mkdtemp(path.join(os.tmpdir(), prefix));
@@ -56,7 +56,7 @@ test("large file exceeding MAX_EDIT_FILE_SIZE_BYTES is rejected without reading 
 
 // ─── 2. Single-file execution outcome contract ───────────────────────────────
 
-test("successful execution outcome carries previewText and changeStats, not a diff string", async () => {
+test("successful execution outcome carries structured preview and changeStats", async () => {
 	const file = await writeTempFile("pi-contract-", "target.ts", "const x = 1;\nconst y = 2;\n");
 
 	const outcome = await executeSingleFileEdit(
@@ -67,8 +67,7 @@ test("successful execution outcome carries previewText and changeStats, not a di
 	assert.equal(outcome.status, "applied");
 	if (outcome.status !== "applied") throw new Error("expected applied");
 
-	// New contract: previewText and changeStats present
-	assert.ok(typeof outcome.previewText === "string", "previewText must be a string");
+	assert.ok(Array.isArray(outcome.previewDisplay.rows), "previewDisplay must be present");
 	assert.ok(typeof outcome.changeStats === "object", "changeStats must be present");
 
 	assert.ok(!("diff" in outcome), "diff field must not exist on success outcome");
@@ -99,23 +98,24 @@ test("failed execution outcome carries errorKind for recoverable edit errors", a
 	});
 });
 
-test("generateEditPreview produces only the changed window, not the whole file", () => {
+test("shared final diff produces only the changed window, not the whole file", () => {
 	const lines = Array.from({ length: 100 }, (_, i) => `line${i + 1}`);
 	const oldContent = lines.join("\n") + "\n";
 	const newLines = [...lines];
 	newLines[49] = "CHANGED";
 	const newContent = newLines.join("\n") + "\n";
 
-	const result = generateEditPreview(oldContent, newContent, 4);
+	const result = generateFinalDiff(oldContent, newContent, 4);
+	const rendered = serializeDisplayDiff(result.display);
 
-	assert.match(result.previewText, /CHANGED/);
-	assert.doesNotMatch(result.previewText, /\bline1\b/);
-	assert.doesNotMatch(result.previewText, /\bline100\b/);
-	const previewLineCount = result.previewText.split("\n").length;
+	assert.match(rendered, /CHANGED/);
+	assert.doesNotMatch(rendered, /\bline1\b/);
+	assert.doesNotMatch(rendered, /\bline100\b/);
+	const previewLineCount = result.display.rows.length;
 	assert.ok(previewLineCount < 20, `expected small preview, got ${previewLineCount} lines`);
 });
 
-test("generateEditPreview produces separate windows for edits far apart in the file", () => {
+test("shared final diff produces separate windows for edits far apart in the file", () => {
 	const lines = Array.from({ length: 200 }, (_, i) => `line${i + 1}`);
 	const oldContent = lines.join("\n") + "\n";
 	const newLines = [...lines];
@@ -123,12 +123,13 @@ test("generateEditPreview produces separate windows for edits far apart in the f
 	newLines[189] = "EDIT_BOTTOM";
 	const newContent = newLines.join("\n") + "\n";
 
-	const result = generateEditPreview(oldContent, newContent, 4);
+	const result = generateFinalDiff(oldContent, newContent, 4);
+	const rendered = serializeDisplayDiff(result.display);
 
-	assert.match(result.previewText, /EDIT_TOP/);
-	assert.match(result.previewText, /EDIT_BOTTOM/);
-	assert.match(result.previewText, /\.\.\./);
-	const previewLineCount = result.previewText.split("\n").length;
+	assert.match(rendered, /EDIT_TOP/);
+	assert.match(rendered, /EDIT_BOTTOM/);
+	assert.match(rendered, /\.\.\./);
+	const previewLineCount = result.display.rows.length;
 	assert.ok(previewLineCount < 30, `expected two small windows, got ${previewLineCount} lines`);
-	assert.doesNotMatch(result.previewText, /\bline100\b/);
+	assert.doesNotMatch(rendered, /\bline100\b/);
 });

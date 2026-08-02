@@ -9,7 +9,7 @@
 ### Runtime 与 memory
 
 - `memory/` — `Issue -> Task` work control-plane owner；负责 project scaffold、prompt injection、issue/task/lesson contract 与 context features；无 CLI/graph，issues/tasks/lessons 由普通编辑工具按 project-memory skill 维护。
-- `_shared/` — sibling extensions 共用 helper；非 extension 入口。
+- `_shared/` — sibling extensions 共用 helper；非 extension 入口；结构化 diff 由 `jsdiff` 计算，Pi TUI renderer 只负责 gutter、ANSI 与 width-aware wrapping。
 
 ### Tool ownership
 

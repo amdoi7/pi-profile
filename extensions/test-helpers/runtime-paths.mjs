@@ -52,6 +52,15 @@ export async function linkPiPackages(targetExtensionDir, options = {}) {
 	}
 }
 
+export async function linkSharedPackages(targetExtensionDir) {
+	const diffPackageDir = path.join(sharedDir, "node_modules", "diff");
+	if (!fs.existsSync(path.join(diffPackageDir, "package.json"))) {
+		throw new Error("Shared extension dependency diff is not installed; run npm install in extensions/_shared");
+	}
+	await fs.promises.mkdir(path.join(targetExtensionDir, "node_modules"), { recursive: true });
+	await symlinkDir(diffPackageDir, path.join(targetExtensionDir, "node_modules", "diff"));
+}
+
 export function packageFileUrl(packageDir, relativePath) {
 	return pathToFileURL(path.join(packageDir, relativePath)).href;
 }

@@ -1,28 +1,28 @@
-import { renderDiff, type ToolRenderContext, type ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
-import { Container, Spacer, Text, type Theme } from "@earendil-works/pi-tui";
+import {
+	type Theme,
+	type ToolDefinition,
+	type ToolRenderResultOptions,
+} from "@earendil-works/pi-coding-agent";
+import { Container, Text } from "@earendil-works/pi-tui";
 
-import { renderDiffSummary, renderHiddenFooter } from "../_shared/code-preview.ts";
+import {
+	appendFileMutationBatch,
+	beginFileMutationResultRender,
+	beginPendingFileMutationRender,
+	clearPendingFileMutationRender,
+	type FileMutationRenderItem,
+} from "../_shared/file-mutation-view.ts";
+import { isChangeStats, isDisplayDiff } from "../_shared/final-diff.ts";
+
+import { renderDiffSummary } from "../_shared/code-preview.ts";
 import { renderCwdFilePathLink } from "../_shared/file-link.ts";
 
-import type { ResultToolViewModel, ToolViewModel } from "./pipeline.ts";
+import type { CallRenderViewModel, ResultToolViewModel } from "./pipeline.ts";
 
-export type SharedToolRenderConfig = {
-	toolLabel?: string;
-};
-
-type EditRenderState = {
-	pendingCallComponent?: Container;
-};
+type EditToolRenderContext = Parameters<NonNullable<ToolDefinition["renderCall"]>>[2];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
-}
-
-function isChangeStats(value: unknown): boolean {
-	return isRecord(value) &&
-		typeof value.additions === "number" &&
-		typeof value.deletions === "number" &&
-		typeof value.changedLines === "number";
 }
 
 function isFileResult(value: unknown): boolean {
@@ -31,7 +31,7 @@ function isFileResult(value: unknown): boolean {
 		return typeof value.error === "string";
 	}
 	return value.status === "applied" &&
-		typeof value.previewText === "string" &&
+		isDisplayDiff(value.previewDisplay) &&
 		typeof value.previewTruncated === "boolean" &&
 		isChangeStats(value.changeStats);
 }
@@ -42,109 +42,73 @@ function isRenderedResultPayload(value: unknown): value is ResultToolViewModel {
 		isFileResult(value.file);
 }
 
-export function renderCallTitle(theme: Theme, config: SharedToolRenderConfig = {}): string {
-	return theme.fg("toolTitle", theme.bold(config.toolLabel ?? "edit"));
+function renderCallTitle(theme: Theme): string {
+	return theme.fg("toolTitle", theme.bold("edit"));
 }
 
-function reusableContainer(context: ToolRenderContext): Container {
-	const container = context.lastComponent instanceof Container ? context.lastComponent : new Container();
-	container.clear();
-	return container;
-}
-
-function pendingState(context: ToolRenderContext): EditRenderState {
-	return context.state as EditRenderState;
-}
-
-export function renderClearedCallState(context: ToolRenderContext): Container {
-	const container = reusableContainer(context);
-	pendingState(context).pendingCallComponent = container;
-	return container;
+export function renderClearedCallState(context: EditToolRenderContext): Container {
+	return beginPendingFileMutationRender(context);
 }
 
 export function renderCallViewModel(
-	viewModel: ToolViewModel,
+	viewModel: CallRenderViewModel,
 	theme: Theme,
-	context: ToolRenderContext,
-	config: SharedToolRenderConfig = {},
+	context: EditToolRenderContext,
 ): Container | Text {
 	if (viewModel.kind === "invalid") {
-		return new Text(`${renderCallTitle(theme, config)}\n${theme.fg("error", viewModel.message)}`, 0, 0);
+		return new Text(`${renderCallTitle(theme)}\n${theme.fg("error", viewModel.message)}`, 0, 0);
 	}
 
-	const container = reusableContainer(context);
-	container.addChild(new Text(
-		`${renderCallTitle(theme, config)} file ${renderCwdFilePathLink(viewModel.path, viewModel.path, context.cwd, theme)}`,
-		0,
-		0,
-	));
-	pendingState(context).pendingCallComponent = container;
+	const container = beginPendingFileMutationRender(context);
+	appendFileMutationBatch(container, [{
+		title: `${renderCallTitle(theme)} file ${renderCwdFilePathLink(viewModel.path, viewModel.path, context.cwd, theme)}`,
+		outcome: "pending",
+	}], theme);
 	return container;
 }
 
-function clearPendingCall(context: ToolRenderContext): void {
-	pendingState(context).pendingCallComponent?.clear();
-}
-
-export function renderToolTextResult(
-	result: { content: Array<{ type: string; text?: string }> },
+export function renderResultContractError(
 	theme: Theme,
-	context: ToolRenderContext,
+	context: EditToolRenderContext,
 ): Text {
-	clearPendingCall(context);
+	clearPendingFileMutationRender(context);
 	const text = context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
-	const body = result.content
-		.filter((item) => item.type === "text")
-		.map((item) => item.text ?? "")
-		.join("\n");
-	text.setText(body.length > 0 ? theme.fg("toolOutput", body) : "");
+	text.setText(theme.fg(
+		"error",
+		'edit_result_contract_invalid expected="details.kind=result with one structured file result" action="report the edit extension result payload"',
+	));
 	return text;
 }
 
-function renderFileResultTitle(
+function fileResultTitle(
 	file: ResultToolViewModel["file"],
 	theme: Theme,
-	context: ToolRenderContext,
-	config: SharedToolRenderConfig,
-): Text {
+	context: EditToolRenderContext,
+): string {
 	const summary = file.status === "applied"
 		? renderDiffSummary(file.changeStats, theme)
 		: theme.fg("error", "failed");
-	return new Text(
-		`${renderCallTitle(theme, config)} file ${renderCwdFilePathLink(file.path, file.path, context.cwd, theme)}` +
-		`${theme.fg("muted", " · ")}${summary}`,
-		0,
-		0,
-	);
+	return `${renderCallTitle(theme)} file ${renderCwdFilePathLink(file.path, file.path, context.cwd, theme)}` +
+		`${theme.fg("muted", " · ")}${summary}`;
 }
 
-function renderFileResultBody(
+function fileResultItem(
 	file: ResultToolViewModel["file"],
 	theme: Theme,
-): Text {
+	context: EditToolRenderContext,
+): FileMutationRenderItem {
+	const title = fileResultTitle(file, theme, context);
 	if (file.status === "failed") {
-		return new Text(theme.fg("error", file.error), 0, 0);
+		return { title, outcome: "failed", message: file.error };
 	}
-	const body = file.previewText.length > 0
-		? renderDiff(file.previewText)
-		: theme.fg("toolOutput", file.summary ?? "");
-	return new Text(body, 0, 0);
-}
-
-function renderFileResult(
-	file: ResultToolViewModel["file"],
-	theme: Theme,
-	context: ToolRenderContext,
-	config: SharedToolRenderConfig,
-): Container {
-	const block = new Container();
-	block.addChild(renderFileResultTitle(file, theme, context, config));
-	block.addChild(new Spacer(1));
-	block.addChild(renderFileResultBody(file, theme));
-	if (file.status === "applied" && file.previewTruncated) {
-		block.addChild(new Text(renderHiddenFooter(1, "preview chunk", theme), 0, 0));
-	}
-	return block;
+	const hasDiff = file.previewDisplay.rows.length > 0 || file.previewTruncated;
+	return {
+		title,
+		outcome: "applied",
+		previews: hasDiff
+			? [{ display: file.previewDisplay, truncated: file.previewTruncated }]
+			: [],
+	};
 }
 
 export function parseRenderedResultPayload(result: { details?: unknown }): ResultToolViewModel | undefined {
@@ -155,11 +119,9 @@ export function renderResultViewModel(
 	viewModel: ResultToolViewModel,
 	_options: ToolRenderResultOptions,
 	theme: Theme,
-	context: ToolRenderContext,
-	config: SharedToolRenderConfig = {},
+	context: EditToolRenderContext,
 ): Container {
-	clearPendingCall(context);
-	const container = reusableContainer(context);
-	container.addChild(renderFileResult(viewModel.file, theme, context, config));
+	const container = beginFileMutationResultRender(context);
+	appendFileMutationBatch(container, [fileResultItem(viewModel.file, theme, context)], theme);
 	return container;
 }

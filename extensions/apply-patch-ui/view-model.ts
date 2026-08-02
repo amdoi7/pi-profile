@@ -1,10 +1,12 @@
 import { readFile } from "node:fs/promises";
 
-import type { ChangeStats } from "../_shared/final-diff.ts";
-import { generateFinalDiff } from "../_shared/final-diff.ts";
-import { analyzeAstScopes, type AstScope, type AstScopeAnalysis } from "./ast-scope.ts";
-import type { ParsedPatch, PatchOperation } from "./patch-command.ts";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateHead } from "@earendil-works/pi-coding-agent";
+import type { ChangeStats, DisplayDiff } from "../_shared/final-diff.ts";
+import { displayDiffFromLines, generateFinalDiff, isChangeStats, isDisplayDiff } from "../_shared/final-diff.ts";
+import { operationByIndex, type ParsedPatch, type PatchOperation } from "./patch-command.ts";
 import {
+	type AppliedChange,
+	type ApplyPatchFailure,
 	failureMatchesPatch,
 	parseApplyPatchResultSequence,
 	resultText,
@@ -19,14 +21,12 @@ export type BeforeSnapshots = Map<string, { absolutePath: string; before: string
 export const PATCH_DIFF_CONTEXT_LINES = 2;
 
 export type ApplyPatchFileDiff = {
-	kind: "Add" | "Update" | "Move" | "Delete";
+	kind: "Add" | "Update" | "Move" | "Delete" | "Rewrite";
 	path: string;
 	destination?: string;
 	changeStats: ChangeStats;
-	diffText: string;
+	diffDisplay: DisplayDiff;
 	diffTruncated: boolean;
-	astScopes?: AstScope[];
-	astDiagnostic?: string;
 };
 
 export type ApplyPatchBatchFileDiff = ApplyPatchFileDiff & { patchCount: number };
@@ -54,9 +54,23 @@ export type ApplyPatchSingleResultViewModel =
 			chunkIndex?: number;
 		};
 		applied: ApplyPatchFileDiff[];
+		skipped: ApplyPatchSkipped[];
+		contextMismatch?: ApplyPatchContextMismatch;
 		unapplied: ApplyPatchUnapplied[];
 		trailing: string;
 	};
+
+export type ApplyPatchSkipped = {
+	operation?: string;
+	path?: string;
+	message: string;
+};
+
+export type ApplyPatchContextMismatch = {
+	expectedLines: string[];
+	actualLines: string[];
+	actualTruncated: boolean;
+};
 
 export type ApplyPatchResultViewModel =
 	| ApplyPatchSingleResultViewModel
@@ -71,30 +85,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
 }
 
-function isChangeStats(value: unknown): value is ChangeStats {
-	return isRecord(value) &&
-		typeof value.additions === "number" &&
-		typeof value.deletions === "number" &&
-		typeof value.changedLines === "number";
-}
-
 function isFileDiff(value: unknown): value is ApplyPatchFileDiff {
 	return isRecord(value) &&
-		["Add", "Update", "Move", "Delete"].includes(String(value.kind)) &&
+		["Add", "Update", "Move", "Delete", "Rewrite"].includes(String(value.kind)) &&
 		typeof value.path === "string" &&
 		(value.destination === undefined || typeof value.destination === "string") &&
 		isChangeStats(value.changeStats) &&
-		typeof value.diffText === "string" &&
-		typeof value.diffTruncated === "boolean" &&
-		(value.astScopes === undefined || (Array.isArray(value.astScopes) && value.astScopes.every(isAstScope))) &&
-		(value.astDiagnostic === undefined || typeof value.astDiagnostic === "string");
-}
-
-function isAstScope(value: unknown): value is AstScope {
-	return isRecord(value) &&
-		typeof value.startLine === "number" &&
-		typeof value.endLine === "number" &&
-		typeof value.label === "string";
+		isDisplayDiff(value.diffDisplay) &&
+		typeof value.diffTruncated === "boolean";
 }
 
 function isBatchFileDiff(value: unknown): value is ApplyPatchBatchFileDiff {
@@ -113,6 +111,24 @@ function isUnapplied(value: unknown): value is ApplyPatchUnapplied {
 		(value.destination === undefined || typeof value.destination === "string");
 }
 
+function isSkipped(value: unknown): value is ApplyPatchSkipped {
+	return isRecord(value) &&
+		(value.operation === undefined || typeof value.operation === "string") &&
+		(value.path === undefined || typeof value.path === "string") &&
+		typeof value.message === "string";
+}
+
+function parseContextMismatch(value: unknown): ApplyPatchContextMismatch | undefined {
+	if (!isRecord(value) || !Array.isArray(value.expectedLines) || !Array.isArray(value.actualLines)) return undefined;
+	if (!value.expectedLines.every((line) => typeof line === "string")) return undefined;
+	if (!value.actualLines.every((line) => typeof line === "string")) return undefined;
+	return {
+		expectedLines: value.expectedLines,
+		actualLines: value.actualLines,
+		actualTruncated: value.actualTruncated === true,
+	};
+}
+
 function parseSingleRenderedResultPayload(details: unknown): ApplyPatchSingleResultViewModel | undefined {
 	if (!isRecord(details) || details.kind !== "apply-patch-result" || typeof details.success !== "boolean") return undefined;
 	if (details.success === true) {
@@ -125,10 +141,14 @@ function parseSingleRenderedResultPayload(details: unknown): ApplyPatchSingleRes
 		typeof details.error.message !== "string" ||
 		!Array.isArray(details.applied) ||
 		!details.applied.every(isFileDiff) ||
+		!Array.isArray(details.skipped) ||
+		!details.skipped.every(isSkipped) ||
 		!Array.isArray(details.unapplied) ||
 		!details.unapplied.every(isUnapplied) ||
 		typeof details.trailing !== "string"
 	) return undefined;
+	const contextMismatch = details.contextMismatch === undefined ? undefined : parseContextMismatch(details.contextMismatch);
+	if (details.contextMismatch !== undefined && !contextMismatch) return undefined;
 	return {
 		kind: "apply-patch-result",
 		success: false,
@@ -139,6 +159,8 @@ function parseSingleRenderedResultPayload(details: unknown): ApplyPatchSingleRes
 			chunkIndex: typeof details.error.chunkIndex === "number" ? details.error.chunkIndex : undefined,
 		},
 		applied: details.applied,
+		skipped: details.skipped,
+		contextMismatch,
 		unapplied: details.unapplied,
 		trailing: details.trailing,
 	};
@@ -168,7 +190,7 @@ export function parseRenderedResultPayload(details: unknown): ApplyPatchResultVi
 		};
 }
 
-export function operationKindWord(operation: PatchOperation): ApplyPatchFileDiff["kind"] {
+export function operationKindWord(operation: PatchOperation): Exclude<ApplyPatchFileDiff["kind"], "Rewrite"> {
 	if (operation.kind === "add") return "Add";
 	if (operation.kind === "delete") return "Delete";
 	return operation.destination ? "Move" : "Update";
@@ -181,13 +203,23 @@ export function changeMatchesOperation(change: SuccessfulChange, operation: Patc
 
 type BuiltFileDiff = Pick<
 	ApplyPatchFileDiff,
-	"changeStats" | "diffText" | "diffTruncated" | "astScopes" | "astDiagnostic"
+	"changeStats" | "diffDisplay" | "diffTruncated"
 >;
 
 async function buildFileDiff(
 	before: BeforeSnapshots | undefined,
 	operation: PatchOperation,
+	content?: AppliedChange,
 ): Promise<BuiltFileDiff | undefined> {
+	if (content?.oldContent !== undefined && content.newContent !== undefined) {
+		const diff = generateFinalDiff(content.oldContent, content.newContent, PATCH_DIFF_CONTEXT_LINES);
+		if (diff.stats.changedLines === 0) return undefined;
+		return {
+			changeStats: diff.stats,
+			diffDisplay: diff.display,
+			diffTruncated: diff.truncated,
+		};
+	}
 	const beforeSnapshot = before?.get(operation.path);
 	if (!beforeSnapshot) return undefined;
 	if (!before) return undefined;
@@ -202,25 +234,48 @@ async function buildFileDiff(
 		}
 	}
 	const diff = generateFinalDiff(beforeSnapshot.before ?? "", after ?? "", PATCH_DIFF_CONTEXT_LINES);
-	if (diff.text.length === 0) return undefined;
-	const ast: AstScopeAnalysis = after === null
-		? { scopes: [] }
-		: await analyzeAstScopes(afterPath, after, changedNewLines(diff.text));
+	if (diff.stats.changedLines === 0) return undefined;
 	return {
 		changeStats: diff.stats,
-		diffText: diff.text,
+		diffDisplay: diff.display,
 		diffTruncated: diff.truncated,
-		astScopes: ast.scopes,
-		astDiagnostic: ast.diagnostic,
 	};
 }
 
-function changedNewLines(diffText: string): number[] {
-	return diffText.split("\n").flatMap((line) => {
-		if (!line.startsWith("+")) return [];
-		const matched = line.match(/^\+\s*(\d+)\s/);
-		return matched ? [Number(matched[1])] : [];
-	});
+/** delete 后第一个同 path 的 add 是重写配对（引擎按序应用）。 */
+function findRewritePartner(operations: PatchOperation[], start: number): number | undefined {
+	const operation = operations[start]!;
+	if (operation.kind !== "delete") return undefined;
+	for (let i = start + 1; i < operations.length; i++) {
+		const candidate = operations[i]!;
+		if (candidate.kind === "add" && candidate.path === operation.path) return i;
+	}
+	return undefined;
+}
+
+async function buildRewriteFileDiff(
+	before: BeforeSnapshots | undefined,
+	deleteOp: PatchOperation,
+	addOp: PatchOperation,
+): Promise<ApplyPatchFileDiff> {
+	const oldSnapshot = before?.get(deleteOp.path);
+	const oldContent = oldSnapshot?.before ?? "";
+	let after: string | null = null;
+	if (oldSnapshot) {
+		try {
+			after = await readFile(oldSnapshot.absolutePath, "utf8");
+		} catch {
+			// 文件不存在：after 为 null。
+		}
+	}
+	const diff = generateFinalDiff(oldContent, after ?? "", PATCH_DIFF_CONTEXT_LINES);
+	return {
+		kind: "Rewrite",
+		path: addOp.path,
+		changeStats: diff.stats,
+		diffDisplay: diff.display,
+		diffTruncated: diff.truncated,
+	};
 }
 
 function fileDiffOf(
@@ -234,10 +289,8 @@ function fileDiffOf(
 		path: operation.path,
 		destination: operation.destination,
 		changeStats: diff?.changeStats ?? { additions, deletions, changedLines: additions + deletions },
-		diffText: diff?.diffText ?? operation.lines.map((line) => `${line.prefix}${line.text}`).join("\n"),
+		diffDisplay: diff?.diffDisplay ?? displayDiffFromLines(operation.lines),
 		diffTruncated: diff?.diffTruncated ?? false,
-		astScopes: diff?.astScopes,
-		astDiagnostic: diff?.astDiagnostic,
 	};
 }
 
@@ -249,9 +302,17 @@ async function buildSingleResultViewModel(
 	if (parsed.success) {
 		if (!successMatchesPatch(patch, parsed.changes)) return undefined;
 		const files: ApplyPatchFileDiff[] = [];
-		for (const change of parsed.changes) {
-			const operation = patch.operations.find((candidate) => changeMatchesOperation(change, candidate));
-			if (!operation) return undefined;
+		const used = new Set<number>();
+		for (let i = 0; i < patch.operations.length; i++) {
+			if (used.has(i)) continue;
+			const operation = patch.operations[i]!;
+			const partner = findRewritePartner(patch.operations, i);
+			if (partner !== undefined) {
+				used.add(i);
+				used.add(partner);
+				files.push(await buildRewriteFileDiff(before, operation, patch.operations[partner]!));
+				continue;
+			}
 			files.push(fileDiffOf(operation, await buildFileDiff(before, operation)));
 		}
 		return { kind: "apply-patch-result", success: true, files, trailing: "" };
@@ -259,15 +320,40 @@ async function buildSingleResultViewModel(
 	const failure = parsed.failure;
 	if (!failureMatchesPatch(patch, failure)) return undefined;
 	const applied: ApplyPatchFileDiff[] = [];
+	const appliedDiffs = new Map<number, ApplyPatchFileDiff>();
 	for (const change of failure.appliedPrefix) {
-		const operation = patch.operations[change.index];
+		const operation = operationByIndex(patch, change.index);
 		if (!operation) return undefined;
-		applied.push(fileDiffOf(operation, await buildFileDiff(before, operation)));
+		appliedDiffs.set(change.index, fileDiffOf(operation, await buildFileDiff(before, operation, change)));
+	}
+	const used = new Set<number>();
+	for (const change of failure.appliedPrefix) {
+		if (used.has(change.index)) continue;
+		if (change.operation === "delete") {
+			const partner = failure.appliedPrefix.find((candidate) =>
+				candidate.index !== change.index && candidate.operation === "add" && candidate.path === change.path);
+			if (partner !== undefined) {
+				used.add(change.index);
+				used.add(partner.index);
+				const deleteOp = operationByIndex(patch, change.index)!;
+				const addOp = operationByIndex(patch, partner.index)!;
+				applied.push(await buildRewriteFileDiff(before, deleteOp, addOp));
+				continue;
+			}
+		}
+		applied.push(appliedDiffs.get(change.index)!);
 	}
 	const appliedIndexes = new Set(failure.appliedPrefix.map((change) => change.index));
+	const skippedIndexes = new Set(failure.skipped.map((skip) => skip.index));
+	const skipped: ApplyPatchSkipped[] = failure.skipped.map((skip) => ({
+		operation: skip.operation,
+		path: skip.path,
+		message: skip.message,
+	}));
 	const unapplied: ApplyPatchUnapplied[] = patch.operations
-		.filter((operation) => !appliedIndexes.has(operation.index))
+		.filter((operation) => !appliedIndexes.has(operation.index) && !skippedIndexes.has(operation.index))
 		.map((operation) => ({ kind: operationKindWord(operation), path: operation.path, destination: operation.destination }));
+	const contextMismatch = buildContextMismatch(patch, failure, before);
 	return {
 		kind: "apply-patch-result",
 		success: false,
@@ -278,32 +364,100 @@ async function buildSingleResultViewModel(
 			chunkIndex: failure.error.hunk?.chunkIndex,
 		},
 		applied,
+		skipped,
+		contextMismatch,
 		unapplied,
 		trailing: "",
 	};
 }
+
+function buildContextMismatch(
+	patch: ParsedPatch,
+	failure: ApplyPatchFailure,
+	before: BeforeSnapshots | undefined,
+): ApplyPatchContextMismatch | undefined {
+	if (failure.error.code !== "CONTEXT_NOT_FOUND" || !failure.error.hunk?.path) return undefined;
+	const hunk = failure.error.hunk;
+	if (hunk.index === undefined || hunk.chunkIndex === undefined) return undefined;
+	const path = hunk.path;
+	if (path === undefined) return undefined;
+	const operation = operationByIndex(patch, hunk.index);
+	const chunk = operation?.chunks?.[hunk.chunkIndex];
+	if (!chunk) return undefined;
+	const expectedLines = chunk.lines.filter((line) => line.prefix !== "+").map((line) => line.text);
+	const beforeContent = before?.get(path)?.before ?? null;
+	if (beforeContent === null) return undefined;
+	const actual = truncateHead(beforeContent, {
+		maxLines: DEFAULT_MAX_LINES,
+		maxBytes: DEFAULT_MAX_BYTES,
+	});
+	return {
+		expectedLines,
+		actualLines: actual.content.split("\n"),
+		actualTruncated: actual.truncated,
+	};
+}
+
+type BatchGroup =
+	| { kind: Exclude<ApplyPatchFileDiff["kind"], "Rewrite">; operation: PatchOperation; patchCount: number }
+	| { kind: "Rewrite"; deleteOp: PatchOperation; addOp: PatchOperation; patchCount: number };
 
 async function buildBatchFinalFiles(
 	patches: ParsedPatch[],
 	before: BeforeSnapshots | undefined,
 ): Promise<ApplyPatchBatchFileDiff[] | undefined> {
 	if (!before) return undefined;
-	const grouped = new Map<string, { operation: PatchOperation; patchCount: number }>();
+	const grouped = new Map<string, BatchGroup>();
 	for (const patch of patches) {
-		for (const operation of patch.operations) {
+		const used = new Set<number>();
+		for (let i = 0; i < patch.operations.length; i++) {
+			if (used.has(i)) continue;
+			const operation = patch.operations[i]!;
+			const partner = findRewritePartner(patch.operations, i);
+			if (partner !== undefined) {
+				used.add(i);
+				used.add(partner);
+				const key = JSON.stringify(["Rewrite", operation.path, undefined]);
+				const current = grouped.get(key);
+				if (current && current.kind === "Rewrite") current.patchCount += 1;
+				else grouped.set(key, { kind: "Rewrite", deleteOp: operation, addOp: patch.operations[partner]!, patchCount: 1 });
+				continue;
+			}
 			const key = JSON.stringify([operationKindWord(operation), operation.path, operation.destination]);
 			const current = grouped.get(key);
-			if (current) current.patchCount += 1;
-			else grouped.set(key, { operation, patchCount: 1 });
+			if (current && current.kind !== "Rewrite") current.patchCount += 1;
+			else grouped.set(key, { kind: operationKindWord(operation), operation, patchCount: 1 });
 		}
 	}
+	mergeCrossPatchRewrites(grouped);
 	const files: ApplyPatchBatchFileDiff[] = [];
-	for (const { operation, patchCount } of grouped.values()) {
-		const diff = await buildFileDiff(before, operation);
+	for (const group of grouped.values()) {
+		if (group.kind === "Rewrite") {
+			const diff = await buildRewriteFileDiff(before, group.deleteOp, group.addOp);
+			files.push({ ...diff, patchCount: group.patchCount });
+			continue;
+		}
+		const diff = await buildFileDiff(before, group.operation);
 		if (!diff) return undefined;
-		files.push({ ...fileDiffOf(operation, diff), patchCount });
+		files.push({ ...fileDiffOf(group.operation, diff), patchCount: group.patchCount });
 	}
 	return files;
+}
+
+function mergeCrossPatchRewrites(grouped: Map<string, BatchGroup>): void {
+	for (const [deleteKey, group] of [...grouped.entries()]) {
+		if (group.kind !== "Delete") continue;
+		const addKey = JSON.stringify(["Add", group.operation.path, undefined]);
+		const addGroup = grouped.get(addKey);
+		if (!addGroup || addGroup.kind !== "Add") continue;
+		grouped.set(deleteKey, {
+			kind: "Rewrite",
+			deleteOp: group.operation,
+			addOp: addGroup.operation,
+			patchCount: group.patchCount + addGroup.patchCount,
+		});
+		grouped.delete(addKey);
+	}
 }
 
 /** Build one result per invocation; mixed patch outcomes remain independently addressable. */

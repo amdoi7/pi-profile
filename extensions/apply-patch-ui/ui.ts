@@ -1,17 +1,23 @@
 import { readFileSync } from "node:fs";
 
-import { renderDiff, type AgentToolResult, type Theme, type ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
+import { type AgentToolResult, type Theme, type ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
 import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 
 import { renderDiffSummary, renderShellCommandCall } from "../_shared/code-preview.ts";
+import type { DiffPreview } from "../_shared/diff-view.ts";
+import {
+	appendFileMutationBatch,
+	beginFileMutationResultRender,
+	beginPendingFileMutationRender,
+	type FileMutationRenderItem,
+} from "../_shared/file-mutation-view.ts";
 import { renderCwdFilePathLink } from "../_shared/file-link.ts";
-import { generateFinalDiff } from "../_shared/final-diff.ts";
-import { trailingCommandAfterApplyPatches, type ParsedPatch, type PatchOperation } from "./patch-command.ts";
+import { displayDiffFromLines, generateFinalDiff } from "../_shared/final-diff.ts";
+import { operationByIndex, trailingCommandAfterApplyPatches, type ParsedPatch, type PatchOperation } from "./patch-command.ts";
 import {
 	changeMatchesOperation,
 	parseRenderedResultPayload,
 	operationKindWord,
-	type ApplyPatchBatchFileDiff,
 	type ApplyPatchUnapplied,
 	type ApplyPatchFileDiff,
 	type ApplyPatchSingleResultViewModel,
@@ -51,10 +57,6 @@ export type PatchRenderContext = {
 	beforeSnapshots?: BeforeSnapshots;
 };
 
-type ApplyPatchRenderState = {
-	pendingCallComponent?: Container;
-};
-
 function operationStats(operation: PatchOperation) {
 	const additions = operation.lines.filter((line) => line.prefix === "+").length;
 	const deletions = operation.lines.filter((line) => line.prefix === "-").length;
@@ -90,41 +92,25 @@ function renderOperationRow(
 	return parts.join(" ");
 }
 
-function indentText(text: string, spaces: number): string {
-	const prefix = " ".repeat(spaces);
-	return text.split("\n").map((line) => `${prefix}${line}`).join("\n");
-}
-
-/**
- * 意图 diff：patch 内容即实际变更。apply_patch 是原子精确应用（update 按行替换），
- * CLI 确认成功后文件内容与 patch lines 一致——无需文件快照对比。
- */
-function renderOperationLines(container: Container, operation: PatchOperation, theme: Theme): void {
-	if (operation.lines.length === 0) return;
-	const rendered = operation.lines.map((line) => {
-		const color = line.prefix === "+" ? "success" : line.prefix === "-" ? "error" : "dim";
-		return theme.fg(color, `${line.prefix}${line.text}`);
-	}).join("\n");
-	container.addChild(new Text(indentText(rendered, 2), 0, 0));
+function operationIntentPreview(operation: PatchOperation): DiffPreview | undefined {
+	if (operation.lines.length === 0) return undefined;
+	return {
+		display: displayDiffFromLines(operation.lines),
+		truncated: false,
+	};
 }
 
 /**
  * 行号 diff：before 来自 execute 前快照，after 实时读取当前文件。
  * 快照缺失（渲染时文件不可读）时回退意图 diff。
  */
-function renderOperationDiff(
-	container: Container,
+function operationPreview(
 	operation: PatchOperation,
 	context: PatchRenderContext,
-	theme: Theme,
-): void {
+): DiffPreview | undefined {
 	const snapshots = context.beforeSnapshots;
 	const beforeSnapshot = snapshots?.get(operation.path);
-	if (!beforeSnapshot) {
-		renderOperationLines(container, operation, theme);
-		return;
-	}
-	if (!snapshots) return;
+	if (!beforeSnapshot || !snapshots) return operationIntentPreview(operation);
 	const afterPath = operation.destination ?? operation.path;
 	const afterSnapshot = snapshots.get(afterPath);
 	let after: string | null = null;
@@ -136,17 +122,26 @@ function renderOperationDiff(
 		}
 	}
 	const diff = generateFinalDiff(beforeSnapshot.before ?? "", after ?? "", PATCH_DIFF_CONTEXT_LINES);
-	if (diff.text.length === 0) {
-		renderOperationLines(container, operation, theme);
-		return;
-	}
-	container.addChild(new Spacer(1));
-	appendDiffPreview(container, diff.text, diff.truncated, theme);
+	if (diff.stats.changedLines === 0) return operationIntentPreview(operation);
+	return { display: diff.display, truncated: diff.truncated };
 }
 
-function appendDiffPreview(container: Container, diffText: string, truncated: boolean, theme: Theme): void {
-	container.addChild(new Text(indentText(renderDiff(diffText), 2), 0, 0));
-	if (truncated) container.addChild(new Text(theme.fg("warning", "... diff truncated at tool output limit"), 0, 0));
+function operationRenderItem(
+	operation: PatchOperation,
+	theme: Theme,
+	context: PatchRenderContext,
+	options: { confirmed: boolean; indent: boolean; preview: boolean },
+): FileMutationRenderItem {
+	const preview = options.preview ? operationPreview(operation, context) : undefined;
+	const title = renderOperationRow(operation, theme, context, options);
+	if (!options.confirmed) {
+		return { title, outcome: "pending" };
+	}
+	return {
+		title,
+		outcome: "applied",
+		previews: preview ? [preview] : [],
+	};
 }
 
 function renderTrailing(
@@ -176,10 +171,12 @@ export function renderPendingApplyPatch(
 	theme: Theme,
 	context: PatchRenderContext,
 ): Container {
-	const container = new Container();
+	const container = beginPendingFileMutationRender(context);
 	const multiple = patch.operations.length > 1;
 	for (const operation of patch.operations) {
-		container.addChild(new Text(renderOperationRow(operation, theme, context, { confirmed: false, indent: multiple }), 0, 0));
+		appendFileMutationBatch(container, [
+			operationRenderItem(operation, theme, context, { confirmed: false, indent: multiple, preview: false }),
+		], theme);
 		for (const chunk of operation.chunks ?? []) {
 			if (chunk.lines.some((line) => line.prefix === "+" || line.prefix === "-")) continue;
 			container.addChild(new Text(
@@ -189,74 +186,57 @@ export function renderPendingApplyPatch(
 			));
 		}
 	}
-	// edit 模式：pending 容器登记到 state，结果渲染时 clearPendingCall 清掉，避免重复。
-	renderState(context).pendingCallComponent = container;
 	return container;
 }
 
-// ============================================================================
-// edit 模式渲染：reusableContainer + view model 消费
-// ============================================================================
-
-function reusableContainer(context: PatchRenderContext): Container {
-	const container = context.lastComponent instanceof Container ? context.lastComponent : new Container();
-	container.clear();
-	return container;
+function filePreview(file: ApplyPatchFileDiff): DiffPreview {
+	return { display: file.diffDisplay, truncated: file.diffTruncated };
 }
 
-function renderState(context: PatchRenderContext): ApplyPatchRenderState {
-	return context.state as ApplyPatchRenderState;
-}
-
-export function clearPendingCall(context: PatchRenderContext): void {
-	renderState(context).pendingCallComponent?.clear();
-}
-
-/** 每文件结果块（edit 结构）：标题行 + Spacer + diff 预览 + 截断 footer。 */
-function renderFileResult(
+function fileResultItem(
 	file: ApplyPatchFileDiff,
 	theme: Theme,
 	context: PatchRenderContext,
 	patchCount = 1,
-): Container {
-	const block = new Container();
+	previews?: DiffPreview[],
+): FileMutationRenderItem {
+	const defaultPreview = filePreview(file);
+	const resolvedPreviews = previews ?? [defaultPreview];
 	const displayPath = file.destination ? `${file.path}${theme.fg("muted", " -> ")}${file.destination}` : file.path;
 	const linkTarget = file.destination ?? file.path;
 	const count = patchCount > 1 ? theme.fg("muted", ` · ${patchCount} patches`) : "";
-	block.addChild(new Text(
-		`${theme.fg("toolTitle", theme.bold("apply_patch"))} ${theme.fg("success", file.kind)} file ` +
+	return {
+		title: `${theme.fg("toolTitle", theme.bold("apply_patch"))} ${theme.fg("success", file.kind)} file ` +
 		`${renderCwdFilePathLink(displayPath, linkTarget, context.cwd, theme)}` +
 		`${theme.fg("muted", " · ")}${renderDiffSummary(file.changeStats, theme)}${count}`,
-		0,
-		0,
-	));
-	for (const scope of file.astScopes ?? []) {
-		block.addChild(new Text(theme.fg("muted", `scope L${scope.startLine}-L${scope.endLine} · ${scope.label}`), 0, 0));
-	}
-	if (file.astDiagnostic) block.addChild(new Text(theme.fg("warning", file.astDiagnostic), 0, 0));
-	if (file.diffText.length > 0) {
-		block.addChild(new Spacer(1));
-		appendDiffPreview(block, file.diffText, file.diffTruncated, theme);
-	}
-	return block;
+		outcome: "applied",
+		previews: resolvedPreviews,
+	};
 }
 
-function aggregateSuccessfulFiles(files: ApplyPatchFileDiff[]): ApplyPatchBatchFileDiff[] {
-	const aggregated = new Map<string, ApplyPatchBatchFileDiff>();
+type AggregatedSuccessfulFile = {
+	file: ApplyPatchFileDiff;
+	patchCount: number;
+	previews: DiffPreview[];
+};
+
+function aggregateSuccessfulFiles(files: ApplyPatchFileDiff[]): AggregatedSuccessfulFile[] {
+	const aggregated = new Map<string, AggregatedSuccessfulFile>();
 	for (const file of files) {
 		const key = JSON.stringify([file.kind, file.path, file.destination]);
 		const current = aggregated.get(key);
 		if (!current) {
-			aggregated.set(key, { ...file, patchCount: 1 });
+			const preview = filePreview(file);
+			aggregated.set(key, { file: { ...file }, patchCount: 1, previews: [preview] });
 			continue;
 		}
-		current.changeStats = {
-			additions: current.changeStats.additions + file.changeStats.additions,
-			deletions: current.changeStats.deletions + file.changeStats.deletions,
-			changedLines: current.changeStats.changedLines + file.changeStats.changedLines,
+		current.file.changeStats = {
+			additions: current.file.changeStats.additions + file.changeStats.additions,
+			deletions: current.file.changeStats.deletions + file.changeStats.deletions,
+			changedLines: current.file.changeStats.changedLines + file.changeStats.changedLines,
 		};
-		current.diffText = [current.diffText, file.diffText].filter(Boolean).join("\n");
-		current.diffTruncated = current.diffTruncated || file.diffTruncated;
+		const preview = filePreview(file);
+		current.previews.push(preview);
 		current.patchCount += 1;
 	}
 	return [...aggregated.values()];
@@ -278,6 +258,7 @@ function renderUnappliedRow(
 function renderFailureViewModel(
 	container: Container,
 	viewModel: Extract<ApplyPatchSingleResultViewModel, { success: false }>,
+	options: ToolRenderResultOptions,
 	theme: Theme,
 	context: PatchRenderContext,
 ): void {
@@ -298,8 +279,30 @@ function renderFailureViewModel(
 	if (viewModel.applied.length > 0) {
 		container.addChild(new Spacer(1));
 		container.addChild(new Text(theme.fg("success", "applied:"), 0, 0));
-		for (const file of viewModel.applied) {
-			container.addChild(renderFileResult(file, theme, context));
+		appendFileMutationBatch(container, viewModel.applied.map((file) => fileResultItem(file, theme, context)), theme);
+	}
+	if (viewModel.skipped.length > 0) {
+		container.addChild(new Spacer(1));
+		container.addChild(new Text(theme.fg("error", "skipped:"), 0, 0));
+		for (const item of viewModel.skipped) {
+			const operation = item.operation ? `${item.operation[0]!.toUpperCase()}${item.operation.slice(1)}` : "Operation";
+			const path = item.path ? ` ${renderCwdFilePathLink(item.path, item.path, context.cwd, theme)}` : "";
+			container.addChild(new Text(`  ${theme.fg("error", `${operation} file`)}${path}`, 0, 0));
+			container.addChild(new Text(`    ${theme.fg("muted", item.message)}`, 0, 0));
+		}
+	}
+	if (viewModel.contextMismatch && options.expanded) {
+		container.addChild(new Spacer(1));
+		container.addChild(new Text(theme.fg("warning", "expected:"), 0, 0));
+		for (const line of viewModel.contextMismatch.expectedLines) {
+			container.addChild(new Text(theme.fg("dim", `  ${line}`), 0, 0));
+		}
+		container.addChild(new Text(theme.fg("warning", "actual:"), 0, 0));
+		for (const line of viewModel.contextMismatch.actualLines) {
+			container.addChild(new Text(theme.fg("toolOutput", `  ${line}`), 0, 0));
+		}
+		if (viewModel.contextMismatch.actualTruncated) {
+			container.addChild(new Text(theme.fg("muted", "  ... file truncated"), 0, 0));
 		}
 	}
 	if (viewModel.unapplied.length > 0) {
@@ -314,43 +317,48 @@ function renderFailureViewModel(
 function renderSingleResultViewModel(
 	container: Container,
 	viewModel: ApplyPatchSingleResultViewModel,
+	options: ToolRenderResultOptions,
 	theme: Theme,
 	context: PatchRenderContext,
 ): void {
 	if (viewModel.success) {
-		for (const file of viewModel.files) container.addChild(renderFileResult(file, theme, context));
+		appendFileMutationBatch(container, viewModel.files.map((file) => fileResultItem(file, theme, context)), theme);
 		return;
 	}
-	renderFailureViewModel(container, viewModel, theme, context);
+	renderFailureViewModel(container, viewModel, options, theme, context);
 }
 
-/** 结果渲染主入口（edit 模式）：消费 tool_result 注入的结构化 view model。 */
+/** 结果渲染主入口：消费 tool_result 注入的结构化 view model。 */
 export function renderResultViewModel(
 	viewModel: ApplyPatchResultViewModel,
 	options: ToolRenderResultOptions,
 	theme: Theme,
 	context: PatchRenderContext,
 ): Container {
-	clearPendingCall(context);
-	const container = reusableContainer(context);
+	const container = beginFileMutationResultRender(context);
 	if (viewModel.kind === "apply-patch-batch-result" && options.expanded) {
 		viewModel.results.forEach((result, index) => {
 			if (index > 0) container.addChild(new Spacer(1));
-			renderSingleResultViewModel(container, result, theme, context);
+			renderSingleResultViewModel(container, result, options, theme, context);
 		});
 	} else if (viewModel.kind === "apply-patch-batch-result" && viewModel.finalFiles) {
-		for (const file of viewModel.finalFiles) {
-			container.addChild(renderFileResult(file, theme, context, file.patchCount));
-		}
+		appendFileMutationBatch(
+			container,
+			viewModel.finalFiles.map((file) => fileResultItem(file, theme, context, file.patchCount)),
+			theme,
+		);
 	} else if (viewModel.kind === "apply-patch-batch-result") {
 		const successfulFiles: ApplyPatchFileDiff[] = [];
 		let hasRendered = false;
 		const flushSuccessfulFiles = () => {
 			if (successfulFiles.length === 0) return;
 			if (hasRendered) container.addChild(new Spacer(1));
-			for (const file of aggregateSuccessfulFiles(successfulFiles)) {
-				container.addChild(renderFileResult(file, theme, context, file.patchCount));
-			}
+			appendFileMutationBatch(
+				container,
+				aggregateSuccessfulFiles(successfulFiles)
+					.map(({ file, patchCount, previews }) => fileResultItem(file, theme, context, patchCount, previews)),
+				theme,
+			);
 			successfulFiles.length = 0;
 			hasRendered = true;
 		};
@@ -361,12 +369,12 @@ export function renderResultViewModel(
 			}
 			flushSuccessfulFiles();
 			if (hasRendered) container.addChild(new Spacer(1));
-			renderFailureViewModel(container, result, theme, context);
+			renderFailureViewModel(container, result, options, theme, context);
 			hasRendered = true;
 		}
 		flushSuccessfulFiles();
 	} else {
-		renderSingleResultViewModel(container, viewModel, theme, context);
+		renderSingleResultViewModel(container, viewModel, options, theme, context);
 	}
 	if (viewModel.trailing.trim().length > 0) {
 		renderTrailing(container, viewModel.trailing, options.expanded, theme, trailingCommandAfterApplyPatches(context.args.command));
@@ -392,12 +400,13 @@ function renderSuccess(
 ): Container {
 	const container = new Container();
 	const multiple = patch.operations.length > 1;
+	const items: FileMutationRenderItem[] = [];
 	for (const change of changes) {
 		const operation = patch.operations.find((op) => changeMatchesOperation(change, op));
 		if (!operation) continue;
-		container.addChild(new Text(renderOperationRow(operation, theme, context, { confirmed: true, indent: multiple }), 0, 0));
-		renderOperationDiff(container, operation, context, theme);
+		items.push(operationRenderItem(operation, theme, context, { confirmed: true, indent: multiple, preview: true }));
 	}
+	appendFileMutationBatch(container, items, theme);
 	if (options.expanded) {
 		container.addChild(new Spacer(1));
 		container.addChild(new Text(theme.fg("dim", text), 0, 0));
@@ -440,14 +449,33 @@ function renderFailure(
 		container.addChild(new Spacer(1));
 		container.addChild(new Text(theme.fg("success", "applied:"), 0, 0));
 		container.addChild(new Spacer(1));
-		for (const change of failure.appliedPrefix) {
-			const operation = patch.operations[change.index]!;
-			container.addChild(new Text(renderOperationRow(operation, theme, context, { confirmed: true, indent: true }), 0, 0));
-			renderOperationDiff(container, operation, context, theme);
+		appendFileMutationBatch(
+			container,
+			failure.appliedPrefix.map((change) => operationRenderItem(
+				operationByIndex(patch, change.index)!,
+				theme,
+				context,
+				{ confirmed: true, indent: true, preview: true },
+			)),
+			theme,
+		);
+	}
+	if (failure.skipped.length > 0) {
+		container.addChild(new Spacer(1));
+		container.addChild(new Text(theme.fg("error", "skipped:"), 0, 0));
+		container.addChild(new Spacer(1));
+		for (const skip of failure.skipped) {
+			const operation = skip.operation ? `${skip.operation[0]!.toUpperCase()}${skip.operation.slice(1)}` : "Operation";
+			const path = skip.path ? ` ${renderCwdFilePathLink(skip.path, skip.path, context.cwd, theme)}` : "";
+			container.addChild(new Text(`  ${theme.fg("error", `${operation} file`)}${path}`, 0, 0));
+			container.addChild(new Text(`    ${theme.fg("muted", skip.message)}`, 0, 0));
 		}
 	}
 	const appliedIndexes = new Set(failure.appliedPrefix.map((change) => change.index));
-	const unapplied = patch.operations.filter((operation) => !appliedIndexes.has(operation.index));
+	const skippedIndexes = new Set(failure.skipped.map((skip) => skip.index));
+	const unapplied = patch.operations.filter(
+		(operation) => !appliedIndexes.has(operation.index) && !skippedIndexes.has(operation.index),
+	);
 	if (unapplied.length > 0) {
 		container.addChild(new Spacer(1));
 		container.addChild(new Text(theme.fg("muted", "unapplied:"), 0, 0));

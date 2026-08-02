@@ -24,6 +24,11 @@ export type ParsedPatch = {
 };
 
 const OPERATION_HEADER = /^\*\*\* (Add|Delete|Update) File: (.+)$/;
+const OPERATION_HEADER_PREFIXES = ["*** Add File: ", "*** Delete File: ", "*** Update File: "] as const;
+
+function isOperationHeader(line: string): boolean {
+	return OPERATION_HEADER_PREFIXES.some((prefix) => line.startsWith(prefix));
+}
 
 function normalizeLines(text: string): string[] {
 	const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
@@ -70,7 +75,7 @@ function parseOperationHeader(line: string): { kind: PatchOperation["kind"]; pat
 function parseAddOperation(lines: string[], start: number, index: number, path: string) {
 	const patchLines: PatchLine[] = [];
 	let cursor = start;
-	while (cursor < lines.length && lines[cursor] !== "*** End Patch" && !OPERATION_HEADER.test(lines[cursor] ?? "")) {
+	while (cursor < lines.length && lines[cursor] !== "*** End Patch" && !isOperationHeader(lines[cursor] ?? "")) {
 		const line = lines[cursor] ?? "";
 		if (line.startsWith("+")) patchLines.push({ prefix: "+", text: line.slice(1) });
 		cursor += 1;
@@ -89,7 +94,7 @@ function parseUpdateOperation(lines: string[], start: number, index: number, pat
 		if (candidate.length > 0 && candidate === candidate.trim()) destination = candidate;
 		cursor += 1;
 	}
-	while (cursor < lines.length && lines[cursor] !== "*** End Patch" && !OPERATION_HEADER.test(lines[cursor] ?? "")) {
+	while (cursor < lines.length && lines[cursor] !== "*** End Patch" && !isOperationHeader(lines[cursor] ?? "")) {
 		const line = lines[cursor] ?? "";
 		if (line === "@@" || line.startsWith("@@ ")) {
 			if (chunkLines !== undefined) chunks.push({ index: chunks.length, lines: chunkLines });
@@ -109,30 +114,43 @@ function parseUpdateOperation(lines: string[], start: number, index: number, pat
 	return { operation: { index, kind: "update" as const, path, destination, lines: patchLines, chunks }, cursor };
 }
 
+function nextOperationHeader(lines: string[], start: number): number {
+	for (let cursor = start; cursor < lines.length; cursor += 1) {
+		if (lines[cursor] === "*** End Patch" || isOperationHeader(lines[cursor] ?? "")) return cursor;
+	}
+	return lines.length;
+}
+
 function parsePatchEnvelope(source: string): ParsedPatch | undefined {
 	const lines = normalizeLines(source);
 	if (lines[0] !== "*** Begin Patch") return undefined;
 	const operations: PatchOperation[] = [];
 	let cursor = 1;
+	let operationIndex = 0;
 	while (cursor < lines.length && lines[cursor] !== "*** End Patch") {
+		const index = operationIndex;
+		operationIndex += 1;
 		const header = parseOperationHeader(lines[cursor] ?? "");
 		if (!header) {
-			cursor += 1;
+			cursor = nextOperationHeader(lines, cursor + 1);
 			continue;
 		}
 		if (header.kind === "delete") {
-			operations.push({ index: operations.length, kind: "delete", path: header.path, lines: [] });
+			operations.push({ index, kind: "delete", path: header.path, lines: [] });
 			cursor += 1;
 			continue;
 		}
 		const parsed = header.kind === "add"
-			? parseAddOperation(lines, cursor + 1, operations.length, header.path)
-			: parseUpdateOperation(lines, cursor + 1, operations.length, header.path);
-		if (!parsed) return undefined;
+			? parseAddOperation(lines, cursor + 1, index, header.path)
+			: parseUpdateOperation(lines, cursor + 1, index, header.path);
 		operations.push(parsed.operation);
 		cursor = parsed.cursor;
 	}
 	return operations.length > 0 ? { operations } : undefined;
+}
+
+export function operationByIndex(patch: ParsedPatch, index: number): PatchOperation | undefined {
+	return patch.operations.find((operation) => operation.index === index);
 }
 
 function resolveWorkingDirectory(command: string, initialCwd: string): string {

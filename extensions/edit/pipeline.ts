@@ -3,13 +3,13 @@ import * as path from "node:path";
 
 import { type } from "arktype";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ChangeStats, DisplayDiff } from "../_shared/final-diff.ts";
 import {
 	executeFileEdits,
 	isEditToolError,
 	type FileEditOperation,
 	type RecoverableEditErrorKind,
 } from "./edit-engine.ts";
-import type { ChangeStats } from "./preview.ts";
 
 const editOperationSchema = type({
 	oldText: "string",
@@ -33,11 +33,10 @@ export type EditOutcome =
 	| {
 			status: "applied";
 			path: string;
-			previewText: string;
+			previewDisplay: DisplayDiff;
 			previewStartLine?: number;
 			previewTruncated: boolean;
 			changeStats: ChangeStats;
-			summary?: string;
 	  }
 	| {
 			status: "failed";
@@ -56,11 +55,10 @@ export type FileResultView =
 	| {
 			path: string;
 			status: "applied";
-			previewText: string;
+			previewDisplay: DisplayDiff;
 			previewStartLine?: number;
 			previewTruncated: boolean;
 			changeStats: ChangeStats;
-			summary?: string;
 	  }
 	| {
 			path: string;
@@ -73,9 +71,12 @@ export type ResultToolViewModel = {
 	file: FileResultView;
 };
 
-export type ToolViewModel =
+export type CallRenderViewModel =
 	| { kind: "invalid"; message: string }
-	| CallToolViewModel
+	| CallToolViewModel;
+
+export type ToolViewModel =
+	| CallRenderViewModel
 	| ResultToolViewModel;
 
 function resolveFilePath(filePath: string, cwd: string): string {
@@ -96,11 +97,8 @@ export function parseEditRequest(input: unknown): EditRequest {
 }
 
 /**
- * Tolerate two input shapes models keep producing despite the public
- * { path, edits } contract:
+ * Tolerate edits as a JSON string, matching pi's built-in edit tool.
  * - edits as a JSON string (same tolerance as pi's built-in edit tool)
- * - a single-file { files: [...] } wrapper, which models learned from
- *   session history predating the grouped-contract removal
  * Anything else is left untouched so the schema rejects it loudly.
  */
 function normalizeEditInput(input: unknown): unknown {
@@ -120,22 +118,10 @@ function normalizeEditInput(input: unknown): unknown {
 		}
 	}
 
-	if (Array.isArray(request.files) && !("path" in request)) {
-		if (request.files.length !== 1) {
-			throw new Error(
-				`edit accepts one file per call ({ path, edits }); received ${request.files.length} files in the legacy "files" wrapper — make one call per file`,
-			);
-		}
-		const legacyFile = request.files[0];
-		if (legacyFile && typeof legacyFile === "object") {
-			return legacyFile;
-		}
-	}
-
 	return input;
 }
 
-export function buildCallToolViewModel(args: unknown): ToolViewModel {
+export function buildCallToolViewModel(args: unknown): CallRenderViewModel {
 	try {
 		const request = parseEditRequest(args);
 		return {
@@ -169,15 +155,12 @@ export async function executeSingleFileEdit(
 		const outcome: EditOutcome = {
 			path: request.path,
 			status: "applied",
-			previewText: result.previewText,
+			previewDisplay: result.previewDisplay,
 			previewTruncated: result.previewTruncated,
 			changeStats: result.changeStats,
 		};
 		if (typeof result.previewStartLine === "number") {
 			outcome.previewStartLine = result.previewStartLine;
-		}
-		if (result.summary.trim().length > 0) {
-			outcome.summary = result.summary.trim();
 		}
 		return outcome;
 	} catch (error) {
@@ -244,11 +227,10 @@ function buildFileResultView(outcome: EditOutcome): FileResultView {
 	return {
 		path: outcome.path,
 		status: "applied",
-		previewText: outcome.previewText,
+		previewDisplay: outcome.previewDisplay,
 		previewStartLine: outcome.previewStartLine,
 		previewTruncated: outcome.previewTruncated,
 		changeStats: outcome.changeStats,
-		summary: outcome.summary,
 	};
 }
 

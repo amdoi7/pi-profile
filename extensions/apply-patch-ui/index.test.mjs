@@ -9,6 +9,7 @@ import {
 	copySharedFiles,
 	extensionDir,
 	linkPiPackages,
+	linkSharedPackages,
 	packageFileUrl,
 	resolvePiPackageDir,
 } from "../test-helpers/runtime-paths.mjs";
@@ -28,8 +29,11 @@ async function loadRegisteredTool() {
 		"code-preview.ts",
 		"file-link.ts",
 		"final-diff.ts",
+		"diff-view.ts",
+		"file-mutation-view.ts",
 	]);
 	await linkPiPackages(tempExtensionDir, { tui: true });
+	await linkSharedPackages(tempExtensionDir);
 
 	const moduleUrl = `${pathToFileURL(path.join(tempToolDir, "index.ts")).href}?t=${Date.now()}`;
 	const extensionModule = await import(moduleUrl);
@@ -231,9 +235,9 @@ test("successful result renders confirmed affected paths", async () => {
 		"apply_patch Delete file src/dead.ts",
 	]);
 	// 完成态：CLI 确认成功，patch 内容即实际变更（意图 diff）。
-	assert.match(output, /\+export const created = true;/);
-	assert.match(output, /-export const old = true;/);
-	assert.match(output, /\+export const old = false;/);
+	assert.match(output, /\+\s+│ export const created = true;/);
+	assert.match(output, /-\s+│ export const old = true;/);
+	assert.match(output, /\+\s+│ export const old = false;/);
 });
 
 test("successful result followed by unrelated command output is still rendered", async () => {
@@ -278,8 +282,8 @@ test("partial result renders the apply_patch block once the complete result is r
 		"apply_patch Add file src/new.ts",
 		"FAILED tests/integration/test_identity_access_api.py",
 	]);
-	assert.match(output, /\+export const created = true;/);
-	assert.match(output, /-export const old = true;/);
+	assert.match(output, /\+\s+│ export const created = true;/);
+	assert.match(output, /-\s+│ export const old = true;/);
 	assert.doesNotMatch(output, /^\$ apply_patch/);
 });
 
@@ -753,27 +757,32 @@ PATCH`;
 		createTheme(),
 		createContext(command, { toolCallId, executionStarted: true }),
 	));
-	assert.match(output, /-1 const left = oldLeft \+ oldRight;/);
-	assert.match(output, /\+1 const left = newLeft \+ newRight;/);
-	assert.match(output, / 2 next\(\);/);
+	const lines = output.split("\n");
+	const headerIndex = lines.findIndex((line) => line.includes("apply_patch Update file target.ts"));
+	const diffIndex = lines.findIndex((line) => line.includes("-1   │ const left"));
+	assert.equal(diffIndex - headerIndex, 1, output);
+	assert.match(output, /-1   │ const left = oldLeft \+ oldRight;/);
+	assert.match(output, /\+  1 │ const left = newLeft \+ newRight;/);
+	assert.match(output, / 2 2 │ next\(\);/);
 });
-test("completed result labels the smallest enclosing AST control scope", async (t) => {
+
+test("completed result keeps old and new context coordinates after inserted lines", async (t) => {
 	const workspace = await fs.promises.mkdtemp(path.join(process.cwd(), ".apply-patch-ui-test-"));
 	t.after(() => fs.promises.rm(workspace, { recursive: true, force: true }));
-	await fs.promises.writeFile(
-		path.join(workspace, "scope.ts"),
-		"function decide(value: boolean) {\n  const ready = true\n  if (value) {\n    oldCall()\n  }\n  return ready\n}\n",
-		"utf8",
-	);
+	const source = ["stems = values", "rows = [", "{", "}", ...Array.from({ length: 8 }, (_, index) => `tail${index + 1}`)].join("\n") + "\n";
+	await fs.promises.writeFile(path.join(workspace, "target.py"), source, "utf8");
 	const command = `cd ${workspace} && apply_patch <<'PATCH'
 *** Begin Patch
-*** Update File: scope.ts
+*** Update File: target.py
 @@
--    oldCall()
-+    newCall()
+-rows = [
++ordered = sorted(
++    values,
++)
++return [
 *** End Patch
 PATCH`;
-	const toolCallId = "ast-scope";
+	const toolCallId = "divergent-line-number-check";
 	const { tool, handlers } = await loadRegisteredTool();
 	const result = await runWithEvents(toolCallId, command, tool, handlers);
 	const output = renderText(tool.renderResult(
@@ -783,10 +792,12 @@ PATCH`;
 		createContext(command, { toolCallId, executionStarted: true }),
 	));
 
-	assert.match(output, /scope L3-L5 · if \(value\) \{/);
-	assert.match(output, /  2   const ready = true/);
-	assert.match(output, /  6   return ready/);
+	assert.match(output, /- 2    │ rows = \[/);
+	assert.match(output, /\+    2 │ ordered = sorted\(/);
+	assert.match(output, / 3  6 │ \{/);
+	assert.match(output, /\.\.\. 8 unchanged lines omitted/);
 });
+
 test("collapsed batch renders the final file diff instead of concatenated intermediate diffs", async (t) => {
 	const workspace = await fs.promises.mkdtemp(path.join(process.cwd(), ".apply-patch-ui-test-"));
 	t.after(() => fs.promises.rm(workspace, { recursive: true, force: true }));
@@ -813,8 +824,8 @@ test("collapsed batch renders the final file diff instead of concatenated interm
 	));
 
 	assert.match(collapsed, /apply_patch Update file state\.txt · 2 changed · \+1 · -1 · 2 patches/);
-	assert.match(collapsed, /-1 one/);
-	assert.match(collapsed, /\+1 three/);
+	assert.match(collapsed, /-1   │ one/);
+	assert.match(collapsed, /\+  1 │ three/);
 	assert.doesNotMatch(collapsed, /two/);
 	assert.match(collapsed, /\$ printf/);
 	assert.match(collapsed, /checks done/);
@@ -857,16 +868,16 @@ PATCH`;
 		createTheme(),
 		createContext(command, { toolCallId, executionStarted: true }),
 	));
-	assert.match(output, /- 1 line 0/);
-	assert.match(output, /\+ 1 line zero/);
-	assert.match(output, /  9 line 8/);
-	assert.match(output, / 10 line 9/);
-	assert.match(output, /-11 line 10/);
-	assert.match(output, /\+11 line ten/);
-	assert.match(output, / 12 line 11/);
-	assert.match(output, / 13 line 12/);
-	assert.match(output, /-21 line 20/);
-	assert.match(output, /\+21 line twenty/);
+	assert.match(output, /- 1    │ line 0/);
+	assert.match(output, /\+    1 │ line zero/);
+	assert.match(output, /  9  9 │ line 8/);
+	assert.match(output, / 10 10 │ line 9/);
+	assert.match(output, /-11    │ line 10/);
+	assert.match(output, /\+   11 │ line ten/);
+	assert.match(output, / 12 12 │ line 11/);
+	assert.match(output, / 13 13 │ line 12/);
+	assert.match(output, /-21    │ line 20/);
+	assert.match(output, /\+   21 │ line twenty/);
 	assert.doesNotMatch(output, /more diff lines/);
 });
 
@@ -890,4 +901,318 @@ test("executing render clears the pending call slot", async () => {
 	));
 	assert.doesNotMatch(output, /apply_patch 4 operations/);
 	assert.doesNotMatch(output, /^\$ apply_patch/);
+});
+
+async function buildDetailsViaHandlers(toolCallId, command, handlers, text, { cwd, isError = false } = {}) {
+	for (const handler of handlers["tool_call"] ?? []) {
+		await handler({ toolName: "bash", toolCallId, input: { command } }, { cwd, mode: "tui" });
+	}
+	let details;
+	for (const handler of handlers["tool_result"] ?? []) {
+		const outcome = await handler(
+			{ toolName: "bash", toolCallId, input: { command }, content: [{ type: "text", text }], isError },
+			{ cwd },
+		);
+		if (outcome?.details) details = outcome.details;
+	}
+	return details;
+}
+
+test("delete followed by add of the same file renders a single rewrite", async () => {
+	const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-apply-patch-rewrite-"));
+	await fs.promises.writeFile(path.join(tempRoot, "a.txt"), "old content\n");
+	const command = `apply_patch <<'PATCH'
+*** Begin Patch
+*** Delete File: a.txt
+*** Add File: a.txt
++new content
+*** End Patch
+PATCH`;
+	const { tool, handlers } = await loadRegisteredTool();
+	const details = await buildDetailsViaHandlers("rewrite-call", command, handlers,
+		"Success. Updated the following files:\nD a.txt\nA a.txt", { cwd: tempRoot });
+	const output = renderText(tool.renderResult(
+		{ content: [{ type: "text", text: "Success. Updated the following files:\nD a.txt\nA a.txt" }], details, isError: false },
+		{ expanded: false, isPartial: false },
+		createTheme(),
+		createContext(command, { executionStarted: true }),
+	));
+
+	assert.match(output, /apply_patch Rewrite file a\.txt/);
+	assert.equal(output.match(/apply_patch (?:Delete|Add) file a\.txt/g)?.length ?? 0, 0);
+	await fs.promises.rm(tempRoot, { recursive: true, force: true });
+});
+
+test("failure appliedPrefix renders engine content without before snapshots", async () => {
+	const command = `apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: a.txt
+@@
+-old
++new
+*** Update File: missing.txt
+@@
+-x
++y
+*** End Patch
+PATCH`;
+	const failure = {
+		ok: false,
+		exitCode: 1,
+		error: { code: "FILE_NOT_FOUND", message: "resolve file to update missing.txt", hunk: { index: 1, operation: "update", path: "missing.txt" } },
+		appliedPrefix: [{
+			index: 0,
+			operation: "update",
+			path: "a.txt",
+			oldContent: "alpha\nold\nomega\n",
+			newContent: "alpha\nnew\nomega\n",
+		}],
+	};
+	const { tool, handlers } = await loadRegisteredTool();
+	let details;
+	for (const handler of handlers["tool_result"] ?? []) {
+		const outcome = await handler(
+			{ toolName: "bash", toolCallId: "content-call", input: { command }, content: [{ type: "text", text: JSON.stringify(failure) }], isError: true },
+			{ cwd: "/tmp/pi-apply-patch-ui-workspace" },
+		);
+		if (outcome?.details) details = outcome.details;
+	}
+	const output = renderText(tool.renderResult(
+		{ content: [{ type: "text", text: JSON.stringify(failure) }], details, isError: true },
+		{ expanded: false, isPartial: false },
+		createTheme(),
+		createContext(command, { executionStarted: true, isError: true }),
+	));
+
+	assertAppearsInOrder(output, [
+		"apply_patch failed FILE_NOT_FOUND",
+		"applied:",
+		"apply_patch Update file a.txt",
+		"alpha",
+		"omega",
+	]);
+});
+
+test("failure path merges delete and add of the same file into one rewrite", async () => {
+	const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-apply-patch-rewrite-fail-"));
+	await fs.promises.writeFile(path.join(tempRoot, "a.txt"), "old content\n");
+	const command = `apply_patch <<'PATCH'
+*** Begin Patch
+*** Delete File: a.txt
+*** Add File: a.txt
++new content
+*** Update File: missing.txt
+@@
+-x
++y
+*** End Patch
+PATCH`;
+	const failure = {
+		ok: false,
+		exitCode: 1,
+		error: { code: "FILE_NOT_FOUND", message: "resolve file to update missing.txt", hunk: { index: 2, operation: "update", path: "missing.txt" } },
+		appliedPrefix: [
+			{ index: 0, operation: "delete", path: "a.txt" },
+			{ index: 1, operation: "add", path: "a.txt" },
+		],
+	};
+	const { tool, handlers } = await loadRegisteredTool();
+	const details = await buildDetailsViaHandlers("rewrite-fail-call", command, handlers, JSON.stringify(failure), { cwd: tempRoot, isError: true });
+	const output = renderText(tool.renderResult(
+		{ content: [{ type: "text", text: JSON.stringify(failure) }], details, isError: true },
+		{ expanded: false, isPartial: false },
+		createTheme(),
+		createContext(command, { executionStarted: true, isError: true }),
+	));
+
+	assert.match(output, /apply_patch Rewrite file a\.txt/);
+	assert.equal(output.match(/apply_patch (?:Delete|Add) file a\.txt/g)?.length ?? 0, 0);
+	await fs.promises.rm(tempRoot, { recursive: true, force: true });
+});
+
+test("failure renders skipped operations with reasons", async () => {
+	const command = `apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: good.txt
+@@
+-old
++new
+*** Add File: bad.txt
+not a plus line
+*** Add File: created.txt
++hello
+*** Update File: missing.txt
+@@
+-x
++y
+*** End Patch
+PATCH`;
+	const failure = {
+		ok: false,
+		exitCode: 1,
+		error: { code: "FILE_NOT_FOUND", message: "resolve file to update missing.txt", hunk: { index: 3, operation: "update", path: "missing.txt" } },
+		appliedPrefix: [
+			{ index: 0, operation: "update", path: "good.txt", oldContent: "old\n", newContent: "new\n" },
+			{ index: 2, operation: "add", path: "created.txt" },
+		],
+		skipped: [{
+			hunk: {
+				index: 1,
+				operation: "add",
+				path: "bad.txt",
+			},
+			message: "Invalid patch hunk on line 7: Add File lines must start with '+'",
+		}],
+	};
+	const { tool, handlers } = await loadRegisteredTool();
+	let details;
+	for (const handler of handlers["tool_result"] ?? []) {
+		const outcome = await handler(
+			{ toolName: "bash", toolCallId: "skipped-call", input: { command }, content: [{ type: "text", text: JSON.stringify(failure) }], isError: true },
+			{ cwd: "/tmp/pi-apply-patch-ui-workspace" },
+		);
+		if (outcome?.details) details = outcome.details;
+	}
+	const output = renderText(tool.renderResult(
+		{ content: [{ type: "text", text: JSON.stringify(failure) }], details, isError: true },
+		{ expanded: false, isPartial: false },
+		createTheme(),
+		createContext(command, { executionStarted: true, isError: true }),
+	));
+
+	assertAppearsInOrder(output, [
+		"apply_patch failed FILE_NOT_FOUND",
+		"applied:",
+		"apply_patch Update file good.txt",
+		"apply_patch Add file created.txt",
+		"skipped:",
+		"Add file bad.txt",
+		"Invalid patch hunk on line 7",
+		"unapplied:",
+		"Update file missing.txt",
+	]);
+	assert.doesNotMatch(output, /unapplied:[\s\S]*bad\.txt/);
+});
+
+test("failure preserves CLI hunk indexes across an unparseable skipped operation", async () => {
+	const trailingSpace = " ";
+	const command = `apply_patch <<'PATCH'
+*** Begin Patch
+*** Add File: bad.txt${trailingSpace}
++bad
+*** Update File: good.txt
+@@
+-old
++new
+*** Update File: missing.txt
+@@
+-x
++y
+*** End Patch
+PATCH`;
+	const failure = {
+		ok: false,
+		exitCode: 1,
+		error: { code: "FILE_NOT_FOUND", message: "resolve file to update missing.txt", hunk: { index: 2, operation: "update", path: "missing.txt" } },
+		appliedPrefix: [
+			{ index: 1, operation: "update", path: "good.txt", oldContent: "old\n", newContent: "new\n" },
+		],
+		skipped: [{
+			hunk: { index: 0 },
+			message: "Invalid patch hunk on line 2: file path must not have leading or trailing whitespace",
+		}],
+	};
+	const { tool, handlers } = await loadRegisteredTool();
+	const details = await buildDetailsViaHandlers(
+		"unparseable-skipped-call",
+		command,
+		handlers,
+		JSON.stringify(failure),
+		{ cwd: "/tmp/pi-apply-patch-ui-workspace", isError: true },
+	);
+	const output = renderText(tool.renderResult(
+		{ content: [{ type: "text", text: JSON.stringify(failure) }], details, isError: true },
+		{ expanded: false, isPartial: false },
+		createTheme(),
+		createContext(command, { executionStarted: true, isError: true }),
+	));
+
+	assertAppearsInOrder(output, [
+		"apply_patch failed FILE_NOT_FOUND",
+		"applied:",
+		"apply_patch Update file good.txt",
+		"skipped:",
+		"unapplied:",
+		"Update file missing.txt",
+	]);
+	assert.doesNotMatch(output, /\"ok\":false/);
+});
+
+test("context mismatch renders expected vs actual lines when expanded", async () => {
+	const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-apply-patch-mismatch-"));
+	await fs.promises.writeFile(path.join(tempRoot, "a.txt"), "actual line one\nactual line two\n");
+	const command = `apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: a.txt
+@@
+-expected line
++changed
+*** End Patch
+PATCH`;
+	const failure = {
+		ok: false,
+		exitCode: 1,
+		error: {
+			code: "CONTEXT_NOT_FOUND",
+			message: "Failed to find expected lines in a.txt:\nexpected line",
+			hunk: { index: 0, operation: "update", path: "a.txt", chunkIndex: 0 },
+		},
+		appliedPrefix: [],
+	};
+	const { tool, handlers } = await loadRegisteredTool();
+	const details = await buildDetailsViaHandlers("mismatch-call", command, handlers, JSON.stringify(failure), { cwd: tempRoot, isError: true });
+	const output = renderText(tool.renderResult(
+		{ content: [{ type: "text", text: JSON.stringify(failure) }], details, isError: true },
+		{ expanded: true, isPartial: false },
+		createTheme(),
+		createContext(command, { executionStarted: true, isError: true }),
+	));
+
+	assertAppearsInOrder(output, [
+		"apply_patch failed CONTEXT_NOT_FOUND",
+		"expected:",
+		"expected line",
+		"actual:",
+		"actual line one",
+	]);
+	await fs.promises.rm(tempRoot, { recursive: true, force: true });
+});
+
+test("batch delete then add across invocations merges into one rewrite", async () => {
+	const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-apply-patch-batch-rewrite-"));
+	await fs.promises.writeFile(path.join(tempRoot, "a.txt"), "old\n");
+	const command = `apply_patch <<'PATCH1'
+*** Begin Patch
+*** Delete File: a.txt
+*** End Patch
+PATCH1
+apply_patch <<'PATCH2'
+*** Begin Patch
+*** Add File: a.txt
++new
+*** End Patch
+PATCH2`;
+	const text = "Success. Updated the following files:\nD a.txt\nSuccess. Updated the following files:\nA a.txt";
+	const { tool, handlers } = await loadRegisteredTool();
+	const details = await buildDetailsViaHandlers("batch-rewrite-call", command, handlers, text, { cwd: tempRoot });
+	const output = renderText(tool.renderResult(
+		{ content: [{ type: "text", text }], details, isError: false },
+		{ expanded: false, isPartial: false },
+		createTheme(),
+		createContext(command, { executionStarted: true }),
+	));
+
+	assert.match(output, /apply_patch Rewrite file a\.txt/);
+	assert.equal(output.match(/apply_patch (?:Delete|Add) file a\.txt/g)?.length ?? 0, 0);
+	await fs.promises.rm(tempRoot, { recursive: true, force: true });
 });

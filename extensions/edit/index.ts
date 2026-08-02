@@ -22,8 +22,8 @@ import {
     parseRenderedResultPayload,
     renderCallViewModel,
     renderClearedCallState,
+    renderResultContractError,
     renderResultViewModel,
-    renderToolTextResult,
 } from "./ui.ts";
 
 export default function (pi: ExtensionAPI) {
@@ -71,7 +71,7 @@ export default function (pi: ExtensionAPI) {
             };
             const rendered = parseRenderedResultPayload(typedResult);
             if (!rendered) {
-                return renderToolTextResult(typedResult, theme, context);
+                return renderResultContractError(theme, context);
             }
             return renderResultViewModel(
                 rendered,

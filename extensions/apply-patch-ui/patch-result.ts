@@ -1,9 +1,19 @@
-import type { ParsedPatch, PatchOperation } from "./patch-command.ts";
+import { operationByIndex, type ParsedPatch, type PatchOperation } from "./patch-command.ts";
 
 export type AppliedChange = {
 	index: number;
 	operation: PatchOperation["kind"];
 	path: string;
+	oldContent?: string;
+	newContent?: string;
+};
+
+export type SkippedHunk = {
+	index: number;
+	operation?: PatchOperation["kind"];
+	path?: string;
+	chunkIndex?: number;
+	message: string;
 };
 
 export type ApplyPatchFailure = {
@@ -20,6 +30,7 @@ export type ApplyPatchFailure = {
 		};
 	};
 	appliedPrefix: AppliedChange[];
+	skipped: SkippedHunk[];
 };
 
 export type SuccessfulChange = {
@@ -128,7 +139,15 @@ function parseAppliedChange(value: unknown): AppliedChange | undefined {
 	if (!isRecord(value)) return undefined;
 	if (!Number.isInteger(value.index) || !["add", "delete", "update"].includes(String(value.operation))) return undefined;
 	if (typeof value.path !== "string") return undefined;
-	return { index: value.index as number, operation: value.operation as AppliedChange["operation"], path: value.path };
+	if (value.oldContent !== undefined && typeof value.oldContent !== "string") return undefined;
+	if (value.newContent !== undefined && typeof value.newContent !== "string") return undefined;
+	return {
+		index: value.index as number,
+		operation: value.operation as AppliedChange["operation"],
+		path: value.path,
+		oldContent: typeof value.oldContent === "string" ? value.oldContent : undefined,
+		newContent: typeof value.newContent === "string" ? value.newContent : undefined,
+	};
 }
 
 function parseFailureHunk(value: unknown): ApplyPatchFailure["error"]["hunk"] | undefined {
@@ -141,6 +160,16 @@ function parseFailureHunk(value: unknown): ApplyPatchFailure["error"]["hunk"] | 
 		operation: value.operation as PatchOperation["kind"] | undefined,
 		path: value.path as string | undefined,
 		chunkIndex: value.chunkIndex as number | undefined,
+	};
+}
+
+function parseSkippedHunk(value: unknown): SkippedHunk | undefined {
+	if (!isRecord(value) || typeof value.message !== "string") return undefined;
+	const hunk = parseFailureHunk(value.hunk);
+	if (!hunk) return undefined;
+	return {
+		...hunk,
+		message: value.message,
 	};
 }
 
@@ -160,11 +189,16 @@ export function parseApplyPatchFailure(text: string): ApplyPatchFailure | undefi
 	if (value.error.hunk !== undefined && !hunk) return undefined;
 	const appliedPrefix = value.appliedPrefix.map(parseAppliedChange);
 	if (appliedPrefix.some((change) => change === undefined)) return undefined;
+	const skipped = value.skipped === undefined
+		? []
+		: (Array.isArray(value.skipped) ? value.skipped.map(parseSkippedHunk) : undefined);
+	if (skipped === undefined || skipped.some((skip) => skip === undefined)) return undefined;
 	return {
 		ok: false,
 		exitCode: value.exitCode as number,
 		error: { code: value.error.code, message: value.error.message, hunk },
 		appliedPrefix: appliedPrefix as AppliedChange[],
+		skipped: skipped as SkippedHunk[],
 	};
 }
 
@@ -190,7 +224,7 @@ export function successMatchesPatch(patch: ParsedPatch, changes: SuccessfulChang
 }
 
 function appliedChangeMatchesPatch(patch: ParsedPatch, change: AppliedChange): boolean {
-	const operation = patch.operations[change.index];
+	const operation = operationByIndex(patch, change.index);
 	return operation !== undefined &&
 		operation.kind === change.operation &&
 		change.path === (operation.destination ?? operation.path);
@@ -200,7 +234,7 @@ export function failureMatchesPatch(patch: ParsedPatch, failure: ApplyPatchFailu
 	if (!failure.appliedPrefix.every((change) => appliedChangeMatchesPatch(patch, change))) return false;
 	const hunk = failure.error.hunk;
 	if (!hunk) return true;
-	const operation = patch.operations[hunk.index];
+	const operation = operationByIndex(patch, hunk.index);
 	if (!operation) return false;
 	if (hunk.operation !== undefined && hunk.operation !== operation.kind) return false;
 	return hunk.path === undefined || hunk.path === operation.path;

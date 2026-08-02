@@ -9,6 +9,7 @@ import {
 	copySharedFiles,
 	extensionDir,
 	linkPiPackages,
+	linkSharedPackages,
 	packageFileUrl,
 	resolvePiPackageDir,
 } from "../test-helpers/runtime-paths.mjs";
@@ -37,8 +38,9 @@ async function loadRegisteredEditTool() {
 		recursive: true,
 		filter: (source) => path.basename(source) !== "node_modules",
 	});
-	await copySharedFiles(tempSharedDir, ["file-link.ts", "code-preview.ts", "final-diff.ts"]);
+	await copySharedFiles(tempSharedDir, ["file-link.ts", "code-preview.ts", "final-diff.ts", "diff-view.ts", "file-mutation-view.ts"]);
 	await linkPiPackages(tempExtensionDir, { tui: true });
+	await linkSharedPackages(tempExtensionDir);
 	await linkLocalDependency(tempEditDir, "arktype");
 
 	const extensionModule = await import(`${pathToFileURL(path.join(tempEditDir, "index.ts")).href}?t=${Date.now()}`);
@@ -118,12 +120,32 @@ function assertAppearsInOrder(text, fragments) {
 	}
 }
 
+function replacementDisplay(line, before, after) {
+	return {
+		lineNumberWidth: String(line).length,
+		rows: [
+			{ kind: "remove", oldLine: line, content: before },
+			{ kind: "add", newLine: line, content: after },
+		],
+	};
+}
+
+function contextDisplay(entries) {
+	return {
+		lineNumberWidth: String(Math.max(...entries.map(([line]) => line))).length,
+		rows: entries.map(([line, content]) => ({ kind: "context", oldLine: line, newLine: line, content })),
+	};
+}
+
 function buildSingleFileSuccessGroup() {
 	return {
 		path: "/tmp/pi-edit-ui-demo/example.ts",
 		status: "applied",
 		firstChangedLine: 1,
-		previewText: " 1 export const value = 1;\n 2 export const name = \"after\";",
+		previewDisplay: contextDisplay([
+			[1, "export const value = 1;"],
+			[2, 'export const name = "after";'],
+		]),
 	};
 }
 
@@ -142,11 +164,10 @@ function buildAgentResult(fileResult) {
 				? {
 					path: fileResult.path,
 					status: "applied",
-					previewText: fileResult.previewText ?? "",
+					previewDisplay: fileResult.previewDisplay,
 					previewStartLine: fileResult.firstChangedLine,
 					previewTruncated: false,
 					changeStats: fileResult.changeStats ?? { additions: 1, deletions: 1, changedLines: 2 },
-					summary: `Edited ${fileResult.path}.`,
 				}
 				: {
 					path: fileResult.path,
@@ -179,7 +200,7 @@ test("production result renderer uses Pi native diff rendering", async () => {
 		path: "src/example.ts",
 		status: "applied",
 		firstChangedLine: 10,
-		previewText: "-10 \tindented\n+10   indented",
+		previewDisplay: replacementDisplay(10, "\tindented", "  indented"),
 	});
 
 	const output = renderText(tool.renderResult(
@@ -189,11 +210,11 @@ test("production result renderer uses Pi native diff rendering", async () => {
 		createRenderContext(),
 	));
 
-	assert.match(output, /-10 {3}indented/);
-	assert.match(output, /\+10 {3}indented/);
+	assert.match(output, /-10 {4}│ {3}indented/);
+	assert.match(output, /\+ {3}10 │ {3}indented/);
 });
 
-test("result file header and diff have exactly one blank line between them", async () => {
+test("result file header and diff are adjacent", async () => {
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
 	const output = renderText(tool.renderResult(
@@ -201,7 +222,7 @@ test("result file header and diff have exactly one blank line between them", asy
 			path: "src/example.ts",
 			status: "applied",
 			firstChangedLine: 1,
-			previewText: "-1 before\n+1 after",
+			previewDisplay: replacementDisplay(1, "before", "after"),
 		}),
 		{ expanded: true },
 		createTheme(),
@@ -211,8 +232,7 @@ test("result file header and diff have exactly one blank line between them", asy
 	const headerIndex = lines.findIndex((line) => line.includes("src/example.ts"));
 	const diffIndex = lines.findIndex((line) => line.trimStart().startsWith("-1 "));
 
-	assert.equal(diffIndex - headerIndex, 2, output);
-	assert.equal(lines[headerIndex + 1], "");
+	assert.equal(diffIndex - headerIndex, 1, output);
 });
 
 test("failed result shows the path only in its header", async () => {
@@ -235,7 +255,7 @@ test("failed result shows the path only in its header", async () => {
 	assert.match(output, /oldText was not found/);
 });
 
-test("raw result fallback replaces a prior structured Container without throwing", async () => {
+test("malformed result replaces a prior structured container with a contract diagnostic", async () => {
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
 	const context = createRenderContext();
@@ -244,19 +264,20 @@ test("raw result fallback replaces a prior structured Container without throwing
 			path: "src/example.ts",
 			status: "applied",
 			firstChangedLine: 1,
-			previewText: "-1 before\n+1 after",
+			previewDisplay: replacementDisplay(1, "before", "after"),
 		}),
 		{ expanded: true },
 		createTheme(),
 		context,
 	);
 
-	assert.doesNotThrow(() => tool.renderResult(
+	const diagnostic = tool.renderResult(
 		{ content: [{ type: "text", text: "raw fallback" }], details: undefined },
 		{ expanded: true },
 		createTheme(),
 		{ ...context, lastComponent: structured },
-	));
+	);
+	assert.match(renderText(diagnostic), /edit_result_contract_invalid/);
 });
 
 test("renderResult keeps the single-file path header visible before its diff", async () => {
@@ -268,7 +289,7 @@ test("renderResult keeps the single-file path header visible before its diff", a
 					path: "src/example.ts",
 					status: "applied",
 					firstChangedLine: 1,
-					previewText: " 1 after",
+					previewDisplay: contextDisplay([[1, "after"]]),
 				},
 			),
 			{ expanded: true },
@@ -277,7 +298,7 @@ test("renderResult keeps the single-file path header visible before its diff", a
 		),
 	);
 
-	assertAppearsInOrder(output, ["src/example.ts", " 1 after"]);
+	assertAppearsInOrder(output, ["src/example.ts", " 1 1 │ after"]);
 });
 
 
@@ -327,7 +348,7 @@ test("renderResult makes edit path headers clickable file hyperlinks", async () 
 				path: "src/example.ts",
 				status: "applied",
 				firstChangedLine: 1,
-				previewText: " 1 after",
+				previewDisplay: contextDisplay([[1, "after"]]),
 			}),
 			{ expanded: true },
 			createTheme(),

@@ -75,25 +75,6 @@ test("parseEditRequest rejects extra top-level properties", () => {
 	);
 });
 
-test("parseEditRequest unwraps a legacy single-file { files: [...] } wrapper", () => {
-	const resolution = parseEditRequest({ files: [{ path: "a.ts", edits: [makeEdit("foo", "alpha")] }] });
-
-	assert.equal(resolution.path, "a.ts");
-	assert.deepEqual(resolution.edits, [makeEdit("foo", "alpha")]);
-});
-
-test("parseEditRequest rejects legacy multi-file wrappers with a migration error", () => {
-	assert.throws(() =>
-		parseEditRequest({
-			files: [
-				{ path: "a.ts", edits: [makeEdit("foo", "alpha")] },
-				{ path: "b.ts", edits: [makeEdit("one", "uno")] },
-			],
-		}),
-	/one call per file/,
-	);
-});
-
 test("buildCallToolViewModel rejects malformed edit entries with a concrete validation error", () => {
 	const viewModel = buildCallToolViewModel(makeArgs("a.ts", [{ oldText: "foo" }]));
 

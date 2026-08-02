@@ -37,7 +37,7 @@
 - 同一调用中的所有替换要么全部写入，要么一个也不写入
 - 重叠或嵌套的 replacement 被拒绝
 - LF/CRLF 与直引号/弯引号只做窄范围归一化；空白、破折号和其他文本仍须精确匹配
-- 成功后生成一次最终行级 diff，并用 Pi 原生 `renderDiff()` 展示
+- 成功后由 `jsdiff` 生成结构化 hunk，并交给 Pi `Component` renderer 展示双行号最终 diff
 
 ## Failures
 
@@ -70,7 +70,7 @@
 ## UI
 
 - pending 阶段只显示文件标题，不读取文件或预计算 diff
-- 成功时标题后显示统计和最终 diff
+- 成功时标题后显示统计和最终 diff；旧/新行号分列，折叠行显示省略数量，源码空行保留 gutter
 - 失败时标题是路径的唯一展示位置，正文只显示恢复信息
 
 ## Structure
@@ -78,6 +78,5 @@
 - `index.ts`：tool 注册入口
 - `pipeline.ts`：输入规范化、单文件执行、agent/UI payload
 - `edit-engine.ts`：匹配、替换、落盘
-- `preview.ts`：最终 diff window
 - `ui.ts`：call/result render
 - `*.test.mjs`：行为测试

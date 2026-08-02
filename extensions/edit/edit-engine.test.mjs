@@ -4,12 +4,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
+import { generateFinalDiff, serializeDisplayDiff } from "../_shared/final-diff.ts";
 
 import {
 	applyEditsToNormalizedContent,
 	EditToolError,
 	executeFileEdits,
-	generateEditPreview,
 } from "./edit-engine.ts";
 
 async function writeTempFile(prefix, name, content) {
@@ -115,7 +115,6 @@ test("LF oldText matches CRLF file content and preserves the original line endin
 
 	const result = await executeFileEdits(file, [{ oldText: 'alpha\nbeta\n', newText: 'alpha\ngamma\n' }]);
 
-	assert.equal(result.summary, "updated 1 replacement");
 	assert.equal(await fs.promises.readFile(file, "utf-8"), 'alpha\r\ngamma\r\nomega\r\n');
 });
 
@@ -127,7 +126,7 @@ test("duplicate matches report their count and recovery", () => {
 			assert.equal(error.kind, 'DUPLICATE_MATCH');
 			assert.equal(
 				error.message,
-				"oldText matched 2 locations. Add context or set replaceAll: true to replace all matches.",
+				"oldText matched 2 locations. Add more lines or set replaceAll: true",
 			);
 			return true;
 		},
@@ -164,7 +163,7 @@ test("replaceAll false keeps duplicate-match guidance", () => {
 			assert.equal(error.kind, 'DUPLICATE_MATCH');
 			assert.equal(
 				error.message,
-				"oldText matched 2 locations. Add context or set replaceAll: true to replace all matches.",
+				"oldText matched 2 locations. Add more lines or set replaceAll: true",
 			);
 			return true;
 		},
@@ -251,14 +250,14 @@ test("preview line numbers describe complete before and after lines when edits s
 		],
 	);
 
-	const preview = generateEditPreview(oldContent, newContent);
+	const preview = generateFinalDiff(oldContent, newContent);
 
 	assert.equal(
-		preview.previewText,
-		"-1 const total = oldLeft + oldRight;\n+1 const total = newLeft + newRight;\n 2 next();",
+		serializeDisplayDiff(preview.display),
+		"-1   │ const total = oldLeft + oldRight;\n+  1 │ const total = newLeft + newRight;\n 2 2 │ next();",
 	);
-	assert.equal(preview.previewStartLine, 1);
-	assert.deepEqual(preview.changeStats, { additions: 1, deletions: 1, changedLines: 2 });
+	assert.equal(preview.firstChangedLine, 1);
+	assert.deepEqual(preview.stats, { additions: 1, deletions: 1, changedLines: 2 });
 });
 
 test("preview keeps unchanged lines as context inside a replaced block", () => {
@@ -312,11 +311,12 @@ test("preview keeps unchanged lines as context inside a replaced block", () => {
 		oldContent,
 		[{ oldText, newText }],
 	);
-	const preview = generateEditPreview(oldContent, newContent);
+	const preview = generateFinalDiff(oldContent, newContent);
 
-	assert.match(preview.previewText, /"bytes"/);
-	assert.match(preview.previewText, /"context"/);
-	assert.match(preview.previewText, /^\+ 5/m);
-	assert.doesNotMatch(preview.previewText, /^- 4/m);
-	assert.ok((preview.previewStartLine ?? 0) > 0);
+	const rendered = serializeDisplayDiff(preview.display);
+	assert.match(rendered, /"bytes"/);
+	assert.match(rendered, /"context"/);
+	assert.match(rendered, /^\+    5 │/m);
+	assert.doesNotMatch(rendered, /^- 4/m);
+	assert.ok((preview.firstChangedLine ?? 0) > 0);
 });

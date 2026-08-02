@@ -45,20 +45,6 @@ export function renderHiddenFooter(hidden: number, unit: string, theme: PreviewT
 	return theme.fg("muted", `... ${hidden} more ${unit}, expand to view`);
 }
 
-export function summarizeDiffText(diffText: string): {
-	additions: number;
-	deletions: number;
-	changedLines: number;
-} {
-	let additions = 0;
-	let deletions = 0;
-	for (const line of diffText.split("\n")) {
-		if (line.startsWith("+") && !line.startsWith("+++")) additions += 1;
-		else if (line.startsWith("-") && !line.startsWith("---")) deletions += 1;
-	}
-	return { additions, deletions, changedLines: additions + deletions };
-}
-
 export function renderDiffSummary(
 	stats: { additions?: number; deletions?: number; changedLines?: number } | undefined,
 	theme: PreviewTheme,

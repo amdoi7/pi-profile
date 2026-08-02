@@ -1,0 +1,8 @@
+{
+  "name": "local-pi-shared-extension-support",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "diff": "8.0.4"
+  }
+}
