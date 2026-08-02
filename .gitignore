@@ -8,6 +8,7 @@
 /mcp-cache.json
 /trust.json
 /update-cache.json
+/models-store.json
 /usage-tracker-history.json
 
 # Locally built tools
