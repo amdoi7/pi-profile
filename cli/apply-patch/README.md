@@ -1,6 +1,6 @@
 # apply_patch
 
-Small Go implementation of the Codex patch envelope. The runtime uses only the standard library and accepts workspace-relative patch paths.
+Small Go implementation of the Codex patch envelope. The runtime uses only the standard library and accepts relative or absolute patch paths.
 
 ## Build
 
@@ -38,12 +38,23 @@ Supported operations are `Add File`, `Delete File`, `Update File`, `Move to`, `@
 
 - Operations execute in patch order.
 - Each update validates and computes all chunks before writing that file.
-- A later failed operation does not roll back an earlier successful operation; failures report `appliedPrefix`.
+- Syntactically invalid hunks are skipped with a `skipped` report; every other
+  operation is applied. When nothing remains valid the failure uses
+  `PARTIAL_APPLY` with the full skip list.
+- An apply failure stops at the first failing operation and reports its exact
+  code with `appliedPrefix` and any `skipped` hunks; a later failure never
+  rolls back an earlier successful operation.
 - Add fails when the target exists. Move fails when the destination exists.
-- Patch paths remain lexical workspace-relative paths: absolute paths and `..` traversal are rejected.
+- Relative patch paths resolve from the working directory and reject `..` traversal. Absolute paths are applied directly, including paths outside the working directory.
 - Update follows symlinks, including targets outside the workspace, and preserves the link. Delete removes the link itself.
 - Patch input and CRLF files are converted to LF once at their input boundaries.
 - Update context uses exact line matching. Whitespace and Unicode punctuation are not rewritten.
+- A match failure reports the expected lines inside the error message. A
+  trailing empty line that stands for the replaced region's terminating
+  newline is retried without it, mirroring the Codex matcher.
+- Failed apply reports list each applied change; update and move changes also
+  carry `oldContent` and `newContent` so consumers can render exact diffs or
+  roll back without re-reading files.
 - Writes use a synced temporary file followed by rename or link.
 
 Success uses the Codex summary format on stdout. Failure writes one JSON object to stderr:
@@ -80,4 +91,4 @@ go test -race ./...
 go vet ./...
 ```
 
-The tests cover parse boundaries, exact matching, CRLF input, update atomicity, ordered partial failure, add/move collisions, lexical workspace traversal, symlink target updates, and machine-readable failures.
+The tests cover parse boundaries, exact matching, CRLF input, update atomicity, ordered partial failure, skip-and-continue degradation, add/move collisions, absolute and relative path handling, symlink target updates, and machine-readable failures.

@@ -9,9 +9,11 @@ import (
 )
 
 type appliedChange struct {
-	Index     int    `json:"index"`
-	Operation string `json:"operation"`
-	Path      string `json:"path"`
+	Index      int    `json:"index"`
+	Operation  string `json:"operation"`
+	Path       string `json:"path"`
+	OldContent string `json:"oldContent,omitempty"`
+	NewContent string `json:"newContent,omitempty"`
 }
 
 type applyFailure struct {
@@ -55,7 +57,8 @@ func applyHunks(cwd string, hunks []patchHunk) (affectedPaths, []appliedChange, 
 		if err != nil {
 			return affected, applied, hunkFailure(hunk, "INVALID_PATH", err.Error(), nil, applied)
 		}
-		if err := applyHunk(workspace, path, hunk); err != nil {
+		oldContent, newContent, err := applyHunk(workspace, path, hunk)
+		if err != nil {
 			code, message, chunkIndex := classifyApplyError(hunk, err)
 			return affected, applied, hunkFailure(hunk, code, message, chunkIndex, applied)
 		}
@@ -64,7 +67,13 @@ func applyHunks(cwd string, hunks []patchHunk) (affectedPaths, []appliedChange, 
 		if hunk.movePath != "" {
 			resultPath = hunk.movePath
 		}
-		applied = append(applied, appliedChange{Index: hunk.index, Operation: string(hunk.operation), Path: resultPath})
+		applied = append(applied, appliedChange{
+			Index:      hunk.index,
+			Operation:  string(hunk.operation),
+			Path:       resultPath,
+			OldContent: oldContent,
+			NewContent: newContent,
+		})
 		switch hunk.operation {
 		case operationAdd:
 			affected.added = append(affected.added, resultPath)
@@ -77,37 +86,37 @@ func applyHunks(cwd string, hunks []patchHunk) (affectedPaths, []appliedChange, 
 	return affected, applied, nil
 }
 
-func applyHunk(workspace, path string, hunk patchHunk) error {
-	workspacePath := filepath.Join(workspace, path)
+func applyHunk(workspace, path string, hunk patchHunk) (string, string, error) {
+	workspacePath := resolvePatchPath(workspace, path)
 	switch hunk.operation {
 	case operationAdd:
 		if _, err := os.Lstat(workspacePath); err == nil {
-			return &operationFailure{code: "TARGET_EXISTS", message: fmt.Sprintf("Add File target already exists: %s", path)}
+			return "", "", &operationFailure{code: "TARGET_EXISTS", message: fmt.Sprintf("Add File target already exists: %s", path)}
 		} else if !errors.Is(err, os.ErrNotExist) {
-			return err
+			return "", "", err
 		}
-		return atomicWrite(workspacePath, hunk.content, 0o644, false)
+		return "", "", atomicWrite(workspacePath, hunk.content, 0o644, false)
 	case operationDelete:
 		info, err := os.Lstat(workspacePath)
 		if err != nil {
-			return fmt.Errorf("delete file %s: %w", path, err)
+			return "", "", fmt.Errorf("delete file %s: %w", path, err)
 		}
 		if info.IsDir() {
-			return fmt.Errorf("delete file %s: path is a directory", path)
+			return "", "", fmt.Errorf("delete file %s: path is a directory", path)
 		}
-		return os.Remove(workspacePath)
+		return "", "", os.Remove(workspacePath)
 	case operationUpdate:
 		return applyUpdateHunk(workspace, path, hunk)
 	default:
-		return fmt.Errorf("unsupported operation %q", hunk.operation)
+		return "", "", fmt.Errorf("unsupported operation %q", hunk.operation)
 	}
 }
 
-func applyUpdateHunk(workspace, path string, hunk patchHunk) error {
-	sourcePath := filepath.Join(workspace, path)
+func applyUpdateHunk(workspace, path string, hunk patchHunk) (string, string, error) {
+	sourcePath := resolvePatchPath(workspace, path)
 	resolvedSource, err := filepath.EvalSymlinks(sourcePath)
 	if err != nil {
-		return fmt.Errorf("resolve file to update %s: %w", path, err)
+		return "", "", fmt.Errorf("resolve file to update %s: %w", path, err)
 	}
 
 	destination := ""
@@ -115,61 +124,65 @@ func applyUpdateHunk(workspace, path string, hunk patchHunk) error {
 	if hunk.movePath != "" {
 		destination, err = cleanPatchPath(hunk.movePath)
 		if err != nil {
-			return &operationFailure{code: "INVALID_PATH", message: err.Error()}
+			return "", "", &operationFailure{code: "INVALID_PATH", message: err.Error()}
 		}
 		if destination == path {
-			return &operationFailure{code: "MOVE_PATH_INVALID", message: "Move source and destination must differ"}
+			return "", "", &operationFailure{code: "MOVE_PATH_INVALID", message: "Move source and destination must differ"}
 		}
-		destinationPath = filepath.Join(workspace, destination)
+		destinationPath = resolvePatchPath(workspace, destination)
 		if _, err := os.Lstat(destinationPath); err == nil {
-			return &operationFailure{code: "DESTINATION_EXISTS", message: fmt.Sprintf("Move destination already exists: %s", destination)}
+			return "", "", &operationFailure{code: "DESTINATION_EXISTS", message: fmt.Sprintf("Move destination already exists: %s", destination)}
 		} else if !errors.Is(err, os.ErrNotExist) {
-			return err
+			return "", "", err
 		}
 	}
 
 	content, err := os.ReadFile(resolvedSource)
 	if err != nil {
-		return fmt.Errorf("read file to update %s: %w", path, err)
+		return "", "", fmt.Errorf("read file to update %s: %w", path, err)
 	}
 	updated := content
 	if len(hunk.chunks) > 0 {
 		updated, err = deriveUpdatedContent(updated, path, hunk.chunks)
 		if err != nil {
-			return err
+			return "", "", err
 		}
 	}
 	info, err := os.Stat(resolvedSource)
 	if err != nil {
-		return fmt.Errorf("stat file to update %s: %w", path, err)
+		return "", "", fmt.Errorf("stat file to update %s: %w", path, err)
 	}
 	if destination == "" {
-		return atomicWrite(resolvedSource, updated, info.Mode().Perm(), true)
+		return string(content), string(updated), atomicWrite(resolvedSource, updated, info.Mode().Perm(), true)
 	}
 	if err := atomicWrite(destinationPath, updated, info.Mode().Perm(), false); err != nil {
-		return fmt.Errorf("write move destination %s: %w", destination, err)
+		return "", "", fmt.Errorf("write move destination %s: %w", destination, err)
 	}
 	if err := os.Remove(sourcePath); err != nil {
-		return fmt.Errorf("remove move source %s: %w", path, err)
+		return "", "", fmt.Errorf("remove move source %s: %w", path, err)
 	}
-	return nil
+	return string(content), string(updated), nil
 }
 
 func cleanPatchPath(path string) (string, error) {
 	if path == "" {
 		return "", errors.New("patch path must not be empty")
 	}
-	if filepath.IsAbs(path) {
-		return "", fmt.Errorf("absolute patch path is outside the workspace: %s", path)
-	}
 	if strings.HasPrefix(path, "~") || strings.ContainsAny(path, "$`*?[]") {
 		return "", fmt.Errorf("patch path contains expansion or glob syntax: %s", path)
 	}
 	path = filepath.Clean(path)
-	if path == "." || path == ".." || strings.HasPrefix(path, ".."+string(filepath.Separator)) {
+	if !filepath.IsAbs(path) && (path == "." || path == ".." || strings.HasPrefix(path, ".."+string(filepath.Separator))) {
 		return "", fmt.Errorf("patch path escapes workspace: %s", path)
 	}
 	return path, nil
+}
+
+func resolvePatchPath(workspace, path string) string {
+	if filepath.IsAbs(path) {
+		return path
+	}
+	return filepath.Join(workspace, path)
 }
 
 func atomicWrite(path string, content []byte, mode os.FileMode, replace bool) error {

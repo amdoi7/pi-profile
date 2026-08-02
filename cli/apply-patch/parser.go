@@ -54,28 +54,49 @@ func (failure *parseFailure) Error() string {
 	return failure.message
 }
 
-func parsePatch(input string) ([]patchHunk, error) {
+func parsePatch(input string) ([]patchHunk, []skippedHunk, error) {
 	lines := strings.Split(input, "\n")
 	if len(lines) == 0 || lines[0] != beginPatch {
-		return nil, invalidPatch("The first line of the patch must be '*** Begin Patch'")
+		return nil, nil, invalidPatch("The first line of the patch must be '*** Begin Patch'")
 	}
 	if lines[len(lines)-1] != endPatch {
-		return nil, invalidPatch("The last line of the patch must be '*** End Patch'")
+		return nil, nil, invalidPatch("The last line of the patch must be '*** End Patch'")
 	}
 
 	var hunks []patchHunk
+	var skipped []skippedHunk
+	operationIndex := 0
 	for lineIndex := 1; lineIndex < len(lines)-1; {
-		hunk, next, err := parseHunk(lines, lineIndex, len(hunks))
+		hunk, next, err := parseHunk(lines, lineIndex, operationIndex)
+		operationIndex++
 		if err != nil {
-			return nil, err
+			reference := hunkReference{Index: operationIndex - 1}
+			if failure, ok := err.(*parseFailure); ok && failure.hunk != nil {
+				reference = *failure.hunk
+			}
+			skipped = append(skipped, skippedHunk{Hunk: reference, Message: err.Error()})
+			lineIndex = nextOperationLine(lines, lineIndex)
+			continue
 		}
 		hunks = append(hunks, hunk)
 		lineIndex = next
 	}
 	if len(hunks) == 0 {
-		return nil, invalidPatch("At least one file operation is required")
+		if len(skipped) > 0 {
+			return nil, skipped, invalidPatch("No valid file operations remain in the patch")
+		}
+		return nil, nil, invalidPatch("At least one file operation is required")
 	}
-	return hunks, nil
+	return hunks, skipped, nil
+}
+
+func nextOperationLine(lines []string, lineIndex int) int {
+	for i := lineIndex + 1; i < len(lines)-1; i++ {
+		if isOperationHeader(lines[i]) {
+			return i
+		}
+	}
+	return len(lines) - 1
 }
 
 func parseHunk(lines []string, lineIndex, hunkIndex int) (patchHunk, int, error) {

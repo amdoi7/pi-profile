@@ -24,11 +24,17 @@ type errorPayload struct {
 	Hunk    *hunkReference `json:"hunk,omitempty"`
 }
 
+type skippedHunk struct {
+	Hunk    hunkReference `json:"hunk"`
+	Message string        `json:"message"`
+}
+
 type failurePayload struct {
 	OK            bool            `json:"ok"`
 	ExitCode      int             `json:"exitCode"`
 	Error         errorPayload    `json:"error"`
 	AppliedPrefix []appliedChange `json:"appliedPrefix"`
+	Skipped       []skippedHunk   `json:"skipped,omitempty"`
 }
 
 func main() {
@@ -38,33 +44,41 @@ func main() {
 func runCLI(args []string, stdin io.Reader, stdout, stderr io.Writer, cwd string) int {
 	patch, exitCode, err := readPatch(args, stdin)
 	if err != nil {
-		writeFailure(stderr, exitCode, "USAGE", err.Error(), nil, nil)
+		writeFailure(stderr, exitCode, "USAGE", err.Error(), nil, nil, nil)
 		return exitCode
 	}
 	if cwd == "" {
 		cwd, err = os.Getwd()
 		if err != nil {
-			writeFailure(stderr, 1, "CWD_FAILED", fmt.Sprintf("Failed to determine current directory: %v", err), nil, nil)
+			writeFailure(stderr, 1, "CWD_FAILED", fmt.Sprintf("Failed to determine current directory: %v", err), nil, nil, nil)
 			return 1
 		}
 	}
 
-	hunks, err := parsePatch(patch)
+	hunks, skipped, err := parsePatch(patch)
 	if err != nil {
+		if len(skipped) > 0 {
+			writePartialFailure(stderr, "no valid file operations remain in the patch", nil, skipped)
+			return 1
+		}
 		if parseErr, ok := errors.AsType[*parseFailure](err); ok {
-			writeFailure(stderr, 1, "INVALID_PATCH", parseErr.message, parseErr.hunk, nil)
+			writeFailure(stderr, 1, "INVALID_PATCH", parseErr.message, parseErr.hunk, nil, nil)
 		} else {
-			writeFailure(stderr, 1, "INVALID_PATCH", err.Error(), nil, nil)
+			writeFailure(stderr, 1, "INVALID_PATCH", err.Error(), nil, nil, nil)
 		}
 		return 1
 	}
-	affected, _, err := applyHunks(cwd, hunks)
+	affected, applied, err := applyHunks(cwd, hunks)
 	if err != nil {
 		if applyErr, ok := errors.AsType[*applyFailure](err); ok {
-			writeFailure(stderr, 1, applyErr.code, applyErr.message, applyErr.hunk, applyErr.applied)
+			writeFailure(stderr, 1, applyErr.code, applyErr.message, applyErr.hunk, applyErr.applied, skipped)
 		} else {
-			writeFailure(stderr, 1, "APPLY_FAILED", err.Error(), nil, nil)
+			writeFailure(stderr, 1, "APPLY_FAILED", err.Error(), nil, nil, skipped)
 		}
+		return 1
+	}
+	if len(skipped) > 0 {
+		writePartialFailure(stderr, fmt.Sprintf("partial apply: %d skipped", len(skipped)), applied, skipped)
 		return 1
 	}
 	writeSuccess(stdout, affected)
@@ -121,11 +135,28 @@ func writeSuccess(writer io.Writer, affected affectedPaths) {
 	}
 }
 
-func writeFailure(writer io.Writer, exitCode int, code, message string, hunk *hunkReference, applied []appliedChange) {
+func writeFailure(writer io.Writer, exitCode int, code, message string, hunk *hunkReference, applied []appliedChange, skipped []skippedHunk) {
 	payload := failurePayload{
 		OK: false, ExitCode: exitCode,
 		Error:         errorPayload{Code: code, Message: message, Hunk: hunk},
 		AppliedPrefix: applied,
+		Skipped:       skipped,
+	}
+	if payload.AppliedPrefix == nil {
+		payload.AppliedPrefix = []appliedChange{}
+	}
+	encoder := json.NewEncoder(writer)
+	encoder.SetEscapeHTML(false)
+	_ = encoder.Encode(payload)
+}
+
+func writePartialFailure(writer io.Writer, message string, applied []appliedChange, skipped []skippedHunk) {
+	payload := failurePayload{
+		OK:            false,
+		ExitCode:      1,
+		Error:         errorPayload{Code: "PARTIAL_APPLY", Message: message},
+		AppliedPrefix: applied,
+		Skipped:       skipped,
 	}
 	if payload.AppliedPrefix == nil {
 		payload.AppliedPrefix = []appliedChange{}

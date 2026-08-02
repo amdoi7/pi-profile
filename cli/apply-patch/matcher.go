@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"strings"
 )
 
 type replacement struct {
@@ -103,17 +104,61 @@ func computeReplacements(lines [][]byte, path string, chunks []updateChunk) ([]r
 		found := true
 		if oldCount > 0 {
 			start, found = seekUpdate(lines, chunk.lines, lineIndex, chunk.isEndOfFile)
+			if !found {
+				if trimmed, trimmedCount, ok := trimTrailingEmptyLine(chunk.lines); ok {
+					start, found = seekUpdate(lines, trimmed, lineIndex, chunk.isEndOfFile)
+					if found {
+						chunk.lines = trimmed
+						oldCount = trimmedCount
+					}
+				}
+			}
 		} else if chunk.hasContext {
 			start = lineIndex
 		}
 		if !found {
-			message := fmt.Sprintf("Failed to find expected lines in %s", path)
+			message := fmt.Sprintf("Failed to find expected lines in %s:\n%s", path, expectedLinesText(chunk.lines))
 			return nil, &matchFailure{message: message, chunkIndex: chunk.index}
 		}
 		changes = append(changes, replacement{start: start, oldCount: oldCount, lines: chunk.lines})
 		lineIndex = start + oldCount
 	}
 	return changes, nil
+}
+
+func expectedLinesText(lines []updateLine) string {
+	var builder strings.Builder
+	for _, line := range lines {
+		if line.prefix == '+' {
+			continue
+		}
+		builder.WriteString(line.text)
+		builder.WriteByte('\n')
+	}
+	return strings.TrimSuffix(builder.String(), "\n")
+}
+
+// trimTrailingEmptyLine retries a failed match without the trailing empty old
+// line that represents the terminating newline of a replaced region, mirroring
+// the Codex matcher. A trailing empty new line is dropped together with it.
+func trimTrailingEmptyLine(lines []updateLine) ([]updateLine, int, bool) {
+	lastOld := -1
+	for i := len(lines) - 1; i >= 0; i-- {
+		if lines[i].prefix != '+' {
+			lastOld = i
+			break
+		}
+	}
+	if lastOld == -1 || lines[lastOld].text != "" {
+		return nil, 0, false
+	}
+	trimmed := append([]updateLine(nil), lines[:lastOld]...)
+	for i := lastOld + 1; i < len(lines); i++ {
+		if !(lines[i].prefix == '+' && lines[i].text == "") {
+			trimmed = append(trimmed, lines[i])
+		}
+	}
+	return trimmed, matchedLineCount(trimmed), true
 }
 
 func matchedLineCount(lines []updateLine) int {
