@@ -1,8 +1,8 @@
 {
   "lastChangelogVersion": "0.83.0",
-  "defaultProvider": "deepseek",
-  "defaultModel": "deepseek-v4-flash",
-  "defaultThinkingLevel": "max",
+  "defaultProvider": "kimi-coding",
+  "defaultModel": "k3-256k",
+  "defaultThinkingLevel": "high",
   "packages": [
     {
       "source": "git:github.com/HazAT/glimpse",
