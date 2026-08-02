@@ -37,8 +37,6 @@ Escalate only when a decision affects:
 - Keep plans and reasoning internal. Report only concise progress for
   long-running work.
 
-## Edit Tool Cheat Hint
-
 - Cross-file mechanical edits: scope with `rg -l` and verify the match set
   before running; use `sg` instead of regex for syntax-aware shapes
   (identifiers, calls, AST).
