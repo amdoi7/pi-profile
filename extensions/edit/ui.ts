@@ -25,7 +25,7 @@ function isChangeStats(value: unknown): boolean {
 		typeof value.changedLines === "number";
 }
 
-function isResultGroup(value: unknown): boolean {
+function isFileResult(value: unknown): boolean {
 	if (!isRecord(value) || typeof value.path !== "string") return false;
 	if (value.status === "failed") {
 		return typeof value.error === "string";
@@ -39,8 +39,7 @@ function isResultGroup(value: unknown): boolean {
 function isRenderedResultPayload(value: unknown): value is ResultToolViewModel {
 	return isRecord(value) &&
 		value.kind === "result" &&
-		typeof value.summary === "string" &&
-		isResultGroup(value.group);
+		isFileResult(value.file);
 }
 
 export function renderCallTitle(theme: Theme, config: SharedToolRenderConfig = {}): string {
@@ -102,47 +101,47 @@ export function renderToolTextResult(
 	return text;
 }
 
-function renderResultGroupTitle(
-	group: ResultToolViewModel["group"],
+function renderFileResultTitle(
+	file: ResultToolViewModel["file"],
 	theme: Theme,
 	context: ToolRenderContext,
 	config: SharedToolRenderConfig,
 ): Text {
-	const summary = group.status === "applied"
-		? renderDiffSummary(group.changeStats, theme)
+	const summary = file.status === "applied"
+		? renderDiffSummary(file.changeStats, theme)
 		: theme.fg("error", "failed");
 	return new Text(
-		`${renderCallTitle(theme, config)} file ${renderCwdFilePathLink(group.path, group.path, context.cwd, theme)}` +
+		`${renderCallTitle(theme, config)} file ${renderCwdFilePathLink(file.path, file.path, context.cwd, theme)}` +
 		`${theme.fg("muted", " · ")}${summary}`,
 		0,
 		0,
 	);
 }
 
-function renderResultGroupBody(
-	group: ResultToolViewModel["group"],
+function renderFileResultBody(
+	file: ResultToolViewModel["file"],
 	theme: Theme,
 ): Text {
-	if (group.status === "failed") {
-		return new Text(theme.fg("error", group.error), 0, 0);
+	if (file.status === "failed") {
+		return new Text(theme.fg("error", file.error), 0, 0);
 	}
-	const body = group.previewText.length > 0
-		? renderDiff(group.previewText)
-		: theme.fg("toolOutput", group.summary ?? "");
+	const body = file.previewText.length > 0
+		? renderDiff(file.previewText)
+		: theme.fg("toolOutput", file.summary ?? "");
 	return new Text(body, 0, 0);
 }
 
-function renderResultGroup(
-	group: ResultToolViewModel["group"],
+function renderFileResult(
+	file: ResultToolViewModel["file"],
 	theme: Theme,
 	context: ToolRenderContext,
 	config: SharedToolRenderConfig,
 ): Container {
 	const block = new Container();
-	block.addChild(renderResultGroupTitle(group, theme, context, config));
+	block.addChild(renderFileResultTitle(file, theme, context, config));
 	block.addChild(new Spacer(1));
-	block.addChild(renderResultGroupBody(group, theme));
-	if (group.status === "applied" && group.previewTruncated) {
+	block.addChild(renderFileResultBody(file, theme));
+	if (file.status === "applied" && file.previewTruncated) {
 		block.addChild(new Text(renderHiddenFooter(1, "preview chunk", theme), 0, 0));
 	}
 	return block;
@@ -161,6 +160,6 @@ export function renderResultViewModel(
 ): Container {
 	clearPendingCall(context);
 	const container = reusableContainer(context);
-	container.addChild(renderResultGroup(viewModel.group, theme, context, config));
+	container.addChild(renderFileResult(viewModel.file, theme, context, config));
 	return container;
 }

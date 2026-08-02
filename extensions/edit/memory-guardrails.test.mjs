@@ -5,11 +5,11 @@ import os from "node:os";
 import path from "node:path";
 
 import {
-	executeFileGroupEdits,
+	executeFileEdits,
 	generateEditPreview,
 	MAX_EDIT_FILE_SIZE_BYTES,
 } from "./edit-engine.ts";
-import { executeSingleFileEdit } from "./pipeline.ts";
+import { buildOutcomeAgentContent, executeSingleFileEdit } from "./pipeline.ts";
 
 async function makeTempDir(prefix) {
 	return fs.promises.mkdtemp(path.join(os.tmpdir(), prefix));
@@ -27,9 +27,8 @@ test("large file exceeding MAX_EDIT_FILE_SIZE_BYTES is rejected without reading 
 
 	await assert.rejects(
 		() =>
-			executeFileGroupEdits(
+			executeFileEdits(
 				"/fake/big.ts",
-				"big.ts",
 				[{ oldText: "x", newText: "y" }],
 				undefined,
 				{
@@ -44,7 +43,10 @@ test("large file exceeding MAX_EDIT_FILE_SIZE_BYTES is rejected without reading 
 			),
 		(err) => {
 			assert.ok(err instanceof Error);
-			assert.match(err.message, /File too large/);
+			assert.equal(
+				err.message,
+				`File too large: sizeBytes=${MAX_EDIT_FILE_SIZE_BYTES + 1} limitBytes=${MAX_EDIT_FILE_SIZE_BYTES}; use a narrower oldText or a streaming tool.`,
+			);
 			return true;
 		},
 	);
@@ -57,32 +59,44 @@ test("large file exceeding MAX_EDIT_FILE_SIZE_BYTES is rejected without reading 
 test("successful execution outcome carries previewText and changeStats, not a diff string", async () => {
 	const file = await writeTempFile("pi-contract-", "target.ts", "const x = 1;\nconst y = 2;\n");
 
-	const group = await executeSingleFileEdit(
+	const outcome = await executeSingleFileEdit(
 		{ path: file, edits: [{ oldText: "const x = 1;", newText: "const x = 99;" }] },
 		process.cwd(),
 	);
 
-	assert.equal(group.status, "applied");
-	if (group.status !== "applied") throw new Error("expected applied");
+	assert.equal(outcome.status, "applied");
+	if (outcome.status !== "applied") throw new Error("expected applied");
 
 	// New contract: previewText and changeStats present
-	assert.ok(typeof group.previewText === "string", "previewText must be a string");
-	assert.ok(typeof group.changeStats === "object", "changeStats must be present");
+	assert.ok(typeof outcome.previewText === "string", "previewText must be a string");
+	assert.ok(typeof outcome.changeStats === "object", "changeStats must be present");
 
-	assert.ok(!("diff" in group), "diff field must not exist on success outcome");
+	assert.ok(!("diff" in outcome), "diff field must not exist on success outcome");
+	assert.ok(!("canonicalPath" in outcome), "canonicalPath must not leak from execution");
+	assert.ok(!("edits" in outcome), "edit input must not be echoed in the outcome");
+	assert.ok(!("editCount" in outcome), "editCount must not be retained when the input already contains it");
 });
 
 test("failed execution outcome carries errorKind for recoverable edit errors", async () => {
 	const file = await writeTempFile("pi-contract-", "target.ts", "const x = 1;\n");
 
-	const group = await executeSingleFileEdit(
+	const outcome = await executeSingleFileEdit(
 		{ path: file, edits: [{ oldText: "missing text", newText: "replacement" }] },
 		process.cwd(),
 	);
 
-	assert.equal(group.status, "failed");
-	if (group.status !== "failed") throw new Error("expected failed");
-	assert.equal(group.errorKind, "NOT_FOUND");
+	assert.equal(outcome.status, "failed");
+	if (outcome.status !== "failed") throw new Error("expected failed");
+	assert.equal(outcome.errorKind, "NOT_FOUND");
+	assert.equal(outcome.error, "oldText was not found. Re-read the file and copy oldText exactly, including whitespace.");
+	assert.deepEqual(JSON.parse(buildOutcomeAgentContent(outcome)), {
+		status: "failed",
+		path: file,
+		error: {
+			kind: "NOT_FOUND",
+			message: "oldText was not found. Re-read the file and copy oldText exactly, including whitespace.",
+		},
+	});
 });
 
 test("generateEditPreview produces only the changed window, not the whole file", () => {

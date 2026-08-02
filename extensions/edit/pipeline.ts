@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { type } from "arktype";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
-	executeFileGroupEdits,
+	executeFileEdits,
 	isEditToolError,
 	type FileEditOperation,
 	type RecoverableEditErrorKind,
@@ -14,7 +14,7 @@ import type { ChangeStats } from "./preview.ts";
 const editOperationSchema = type({
 	oldText: "string",
 	newText: "string",
-	"expectedOccurrences?": "number.integer>=1",
+	"replaceAll?": "boolean",
 }).onDeepUndeclaredKey("reject");
 
 // One file per call ({ path, edits }), matching pi's built-in edit tool so
@@ -33,9 +33,6 @@ export type EditOutcome =
 	| {
 			status: "applied";
 			path: string;
-			canonicalPath: string;
-			edits: FileEditOperation[];
-			editCount: number;
 			previewText: string;
 			previewStartLine?: number;
 			previewTruncated: boolean;
@@ -45,9 +42,6 @@ export type EditOutcome =
 	| {
 			status: "failed";
 			path: string;
-			canonicalPath: string;
-			edits: FileEditOperation[];
-			editCount: number;
 			error: string;
 			errorKind?: RecoverableEditErrorKind;
 	  };
@@ -58,7 +52,7 @@ export type CallToolViewModel = {
 	edits: FileEditOperation[];
 };
 
-export type ResultToolViewGroup =
+export type FileResultView =
 	| {
 			path: string;
 			status: "applied";
@@ -72,13 +66,11 @@ export type ResultToolViewGroup =
 			path: string;
 			status: "failed";
 			error: string;
-			errorKind?: RecoverableEditErrorKind;
 	  };
 
 export type ResultToolViewModel = {
 	kind: "result";
-	summary: string;
-	group: ResultToolViewGroup;
+	file: FileResultView;
 };
 
 export type ToolViewModel =
@@ -86,12 +78,12 @@ export type ToolViewModel =
 	| CallToolViewModel
 	| ResultToolViewModel;
 
-function resolvePath(filePath: string, cwd: string): string {
+function resolveFilePath(filePath: string, cwd: string): string {
 	return path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
 }
 
 export function canonicalizePath(filePath: string, cwd: string): string {
-	const resolvedPath = resolvePath(filePath, cwd);
+	const resolvedPath = resolveFilePath(filePath, cwd);
 	try {
 		return fs.realpathSync.native(resolvedPath);
 	} catch {
@@ -99,12 +91,8 @@ export function canonicalizePath(filePath: string, cwd: string): string {
 	}
 }
 
-function cloneEdits(edits: FileEditOperation[]): FileEditOperation[] {
-	return edits.slice();
-}
-
-export function parseEditRequest(args: unknown): EditRequest {
-	return editRequestSchema.assert(normalizeLegacyShapes(args));
+export function parseEditRequest(input: unknown): EditRequest {
+	return editRequestSchema.assert(normalizeEditInput(input));
 }
 
 /**
@@ -115,36 +103,36 @@ export function parseEditRequest(args: unknown): EditRequest {
  *   session history predating the grouped-contract removal
  * Anything else is left untouched so the schema rejects it loudly.
  */
-function normalizeLegacyShapes(args: unknown): unknown {
-	if (!args || typeof args !== "object") {
-		return args;
+function normalizeEditInput(input: unknown): unknown {
+	if (!input || typeof input !== "object") {
+		return input;
 	}
-	const obj = args as Record<string, unknown>;
+	const request = input as Record<string, unknown>;
 
-	if (typeof obj.edits === "string") {
+	if (typeof request.edits === "string") {
 		try {
-			const parsed = JSON.parse(obj.edits);
+			const parsed = JSON.parse(request.edits);
 			if (Array.isArray(parsed)) {
-				return { ...obj, edits: parsed };
+				return { ...request, edits: parsed };
 			}
 		} catch {
 			// fall through to the schema error for a non-array edits
 		}
 	}
 
-	if (Array.isArray(obj.files) && !("path" in obj)) {
-		if (obj.files.length !== 1) {
+	if (Array.isArray(request.files) && !("path" in request)) {
+		if (request.files.length !== 1) {
 			throw new Error(
-				`edit accepts one file per call ({ path, edits }); received ${obj.files.length} files in the legacy "files" wrapper — make one call per file`,
+				`edit accepts one file per call ({ path, edits }); received ${request.files.length} files in the legacy "files" wrapper — make one call per file`,
 			);
 		}
-		const file = obj.files[0];
-		if (file && typeof file === "object") {
-			return file;
+		const legacyFile = request.files[0];
+		if (legacyFile && typeof legacyFile === "object") {
+			return legacyFile;
 		}
 	}
 
-	return args;
+	return input;
 }
 
 export function buildCallToolViewModel(args: unknown): ToolViewModel {
@@ -153,7 +141,7 @@ export function buildCallToolViewModel(args: unknown): ToolViewModel {
 		return {
 			kind: "call",
 			path: request.path,
-			edits: cloneEdits(request.edits),
+			edits: request.edits.slice(),
 		};
 	} catch (error) {
 		return { kind: "invalid", message: error instanceof Error ? error.message : String(error) };
@@ -173,16 +161,13 @@ export async function executeSingleFileEdit(
 	cwd: string,
 	signal?: AbortSignal,
 ): Promise<EditOutcome> {
-	const canonicalPath = canonicalizePath(request.path, cwd);
+	const targetPath = canonicalizePath(request.path, cwd);
 
 	try {
-		const result = await executeFileGroupEdits(canonicalPath, request.path, request.edits, signal);
+		const result = await executeFileEdits(targetPath, request.edits, signal);
 
 		const outcome: EditOutcome = {
 			path: request.path,
-			canonicalPath,
-			edits: request.edits,
-			editCount: request.edits.length,
 			status: "applied",
 			previewText: result.previewText,
 			previewTruncated: result.previewTruncated,
@@ -200,15 +185,12 @@ export async function executeSingleFileEdit(
 			throw error instanceof Error ? error : new Error(String(error));
 		}
 
-		const baseError = error instanceof Error ? error : new Error(String(error));
+		const failure = error instanceof Error ? error : new Error(String(error));
 		return {
 			path: request.path,
-			canonicalPath,
-			edits: request.edits,
-			editCount: request.edits.length,
 			status: "failed",
-			error: baseError.message,
-			errorKind: isEditToolError(baseError) ? baseError.kind : undefined,
+			error: failure.message,
+			errorKind: isEditToolError(failure) ? failure.kind : undefined,
 		};
 	}
 }
@@ -251,13 +233,12 @@ export function buildOutcomeAgentContent(outcome: EditOutcome): string {
 	return JSON.stringify(agentOutcome);
 }
 
-function buildResultToolViewGroup(outcome: EditOutcome): ResultToolViewGroup {
+function buildFileResultView(outcome: EditOutcome): FileResultView {
 	if (outcome.status === "failed") {
 		return {
 			path: outcome.path,
 			status: "failed",
 			error: outcome.error,
-			errorKind: outcome.errorKind,
 		};
 	}
 	return {
@@ -274,7 +255,6 @@ function buildResultToolViewGroup(outcome: EditOutcome): ResultToolViewGroup {
 export function buildOutcomeUiDetails(outcome: EditOutcome): ResultToolViewModel {
 	return {
 		kind: "result",
-		summary: outcome.status === "applied" ? "Applied." : "Failed.",
-		group: buildResultToolViewGroup(outcome),
+		file: buildFileResultView(outcome),
 	};
 }

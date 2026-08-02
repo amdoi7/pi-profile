@@ -127,32 +127,31 @@ function buildSingleFileSuccessGroup() {
 	};
 }
 
-function buildAgentResult(group) {
+function buildAgentResult(fileResult) {
 	return {
 		content: [{
 			type: "text",
 			text: JSON.stringify({
-				status: group.status,
-				path: group.path,
+				status: fileResult.status,
+				path: fileResult.path,
 			}),
 		}],
 		details: {
 			kind: "result",
-			summary: "",
-			group: group.status === "applied"
+			file: fileResult.status === "applied"
 				? {
-					path: group.path,
+					path: fileResult.path,
 					status: "applied",
-					previewText: group.previewText ?? "",
-					previewStartLine: group.firstChangedLine,
+					previewText: fileResult.previewText ?? "",
+					previewStartLine: fileResult.firstChangedLine,
 					previewTruncated: false,
-					changeStats: group.changeStats ?? { additions: 1, deletions: 1, changedLines: 2 },
-					summary: `Edited ${group.path}.`,
+					changeStats: fileResult.changeStats ?? { additions: 1, deletions: 1, changedLines: 2 },
+					summary: `Edited ${fileResult.path}.`,
 				}
 				: {
-					path: group.path,
+					path: fileResult.path,
 					status: "failed",
-					error: group.error.message,
+					error: fileResult.error.message,
 				},
 		},
 	};
@@ -214,6 +213,26 @@ test("result file header and diff have exactly one blank line between them", asy
 
 	assert.equal(diffIndex - headerIndex, 2, output);
 	assert.equal(lines[headerIndex + 1], "");
+});
+
+test("failed result shows the path only in its header", async () => {
+	initTheme("dark");
+	const tool = await loadRegisteredEditTool();
+	const output = renderText(tool.renderResult(
+		buildAgentResult({
+			path: "src/example.ts",
+			status: "failed",
+			error: {
+				message: "oldText was not found. Re-read the file and copy oldText exactly, including whitespace.",
+			},
+		}),
+		{ expanded: true },
+		createTheme(),
+		createRenderContext(),
+	));
+
+	assert.equal(countOccurrences(output, "src/example.ts"), 1, output);
+	assert.match(output, /oldText was not found/);
 });
 
 test("raw result fallback replaces a prior structured Container without throwing", async () => {

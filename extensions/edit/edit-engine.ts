@@ -5,7 +5,7 @@ import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 export type FileEditOperation = {
 	oldText: string;
 	newText: string;
-	expectedOccurrences?: number;
+	replaceAll?: boolean;
 };
 
 export type AppliedEditsResult = {
@@ -38,25 +38,11 @@ export type RecoverableEditErrorKind = "NOT_FOUND" | "DUPLICATE_MATCH" | "NO_CHA
 
 export class EditToolError extends Error {
 	readonly kind: RecoverableEditErrorKind;
-	readonly displayPath?: string;
-	readonly editIndex?: number;
-	readonly occurrences?: number;
 
-	constructor(
-		message: string,
-		kind: RecoverableEditErrorKind,
-		details: {
-			displayPath?: string;
-			editIndex?: number;
-			occurrences?: number;
-		} = {},
-	) {
+	constructor(message: string, kind: RecoverableEditErrorKind) {
 		super(message);
 		this.name = "EditToolError";
 		this.kind = kind;
-		this.displayPath = details.displayPath;
-		this.editIndex = details.editIndex;
-		this.occurrences = details.occurrences;
 	}
 }
 
@@ -157,77 +143,49 @@ function findAllMatchIndices(content: string, needle: string): number[] {
 	return indices;
 }
 
-function getNotFoundError(path: string, editIndex: number, totalEdits: number): EditToolError {
-	const ref = totalEdits === 1 ? "the text" : `edits[${editIndex}]`;
+function replacementPrefix(editIndex: number): string {
+	return editIndex === 0 ? "" : `replacement ${editIndex + 1}: `;
+}
+
+function getNotFoundError(editIndex: number): EditToolError {
 	return new EditToolError(
-		`NOT_FOUND ${ref} in ${path}. oldText must match the file content exactly, including whitespace; line endings and curly quotes are normalized before matching. Re-read the file and copy oldText character-for-character from the read output — never write it from memory, paraphrase it, or "fix" the original text. Common causes: indentation/whitespace differences, quote style changes, or a paraphrased oldText.`,
+		`${replacementPrefix(editIndex)}oldText was not found. Re-read the file and copy oldText exactly, including whitespace.`,
 		"NOT_FOUND",
-		{
-			displayPath: path,
-			editIndex: totalEdits === 1 ? undefined : editIndex,
-		},
 	);
 }
 
-function getDuplicateError(path: string, editIndex: number, totalEdits: number, occurrences: number): EditToolError {
-	const ref = totalEdits === 1 ? "the text" : `edits[${editIndex}]`;
+function getDuplicateError(editIndex: number, occurrences: number): EditToolError {
 	return new EditToolError(
-		`DUPLICATE_MATCH ${ref} in ${path} (${occurrences} occurrences). oldText is not unique.`,
+		`${replacementPrefix(editIndex)}oldText matched ${occurrences} locations. Add context or set replaceAll: true to replace all matches.`,
 		"DUPLICATE_MATCH",
-		{
-			displayPath: path,
-			editIndex: totalEdits === 1 ? undefined : editIndex,
-			occurrences,
-		},
 	);
 }
 
-function getEmptyOldTextError(path: string, editIndex: number, totalEdits: number): Error {
-	if (totalEdits === 1) {
-		return new Error(`oldText must not be empty in ${path}.`);
-	}
-	return new Error(`edits[${editIndex}].oldText must not be empty in ${path}.`);
+function getEmptyOldTextError(editIndex: number): Error {
+	return new Error(`${replacementPrefix(editIndex)}oldText must not be empty.`);
 }
 
-function getInvalidExpectedOccurrencesError(path: string, editIndex: number, totalEdits: number): Error {
-	if (totalEdits === 1) {
-		return new Error(`expectedOccurrences must be a positive integer in ${path}.`);
-	}
-	return new Error(`edits[${editIndex}].expectedOccurrences must be a positive integer in ${path}.`);
-}
-
-function getNoChangeError(path: string, totalEdits: number): EditToolError {
-	if (totalEdits === 1) {
-		return new EditToolError(
-			`No changes made to ${path}. The replacement produced identical content. This may mean the patch is already applied.`,
-			"NO_CHANGE",
-			{ displayPath: path },
-		);
-	}
+function getNoChangeError(): EditToolError {
 	return new EditToolError(
-		`No changes made to ${path}. The replacements produced identical content. This may mean the patch is already applied.`,
+		"Replacement is identical; the patch may already be applied.",
 		"NO_CHANGE",
-		{ displayPath: path },
 	);
 }
 
 function resolveEditMatches(
 	content: string,
 	oldText: string,
-	expectedOccurrencesWasExplicit: boolean,
-	path: string,
+	replaceAll: boolean,
 	editIndex: number,
-	totalEdits: number,
 	// Pre-normalized content passed in to avoid re-normalizing per edit.
 	normalizedContentForFuzzy?: { content: string },
 ): ResolvedMatch[] {
 	const exactMatches = findAllMatchIndices(content, oldText);
 	if (exactMatches.length > 0) {
-		if (!expectedOccurrencesWasExplicit && exactMatches.length > 1) {
-			throw getDuplicateError(path, editIndex, totalEdits, exactMatches.length);
+		if (!replaceAll && exactMatches.length > 1) {
+			throw getDuplicateError(editIndex, exactMatches.length);
 		}
-		// Explicit expectedOccurrences means "replace all occurrences";
-		// the count is a declaration, not a constraint.
+		// replaceAll explicitly applies the replacement to every exact match.
 		return exactMatches.map((matchIndex) => ({
 			matchIndex,
 			actualOldText: oldText,
@@ -238,12 +196,12 @@ function resolveEditMatches(
 	const normalizedOldText = normalizeForFuzzyMatch(oldText);
 	const fuzzyMatches = findAllMatchIndices(fuzzyContent, normalizedOldText);
 	if (fuzzyMatches.length === 0) {
-		throw getNotFoundError(path, editIndex, totalEdits);
+		throw getNotFoundError(editIndex);
 	}
-	if (!expectedOccurrencesWasExplicit && fuzzyMatches.length > 1) {
-		throw getDuplicateError(path, editIndex, totalEdits, fuzzyMatches.length);
+	if (!replaceAll && fuzzyMatches.length > 1) {
+		throw getDuplicateError(editIndex, fuzzyMatches.length);
 	}
-	// Explicit expectedOccurrences means "replace all occurrences".
+	// replaceAll explicitly applies the replacement to every fuzzy match.
 
 	return fuzzyMatches.map((matchIndex) => ({
 		matchIndex,
@@ -314,15 +272,12 @@ function preserveQuoteStyle(oldText: string, actualOldText: string, newText: str
 	return result;
 }
 
-export function applyEditsToNormalizedContent(normalizedContent: string, edits: FileEditOperation[], path: string): AppliedEditsResult {
+export function applyEditsToNormalizedContent(normalizedContent: string, edits: FileEditOperation[]): AppliedEditsResult {
 	// Validate edit invariants upfront before any allocation.
 	for (let index = 0; index < edits.length; index += 1) {
 		const edit = edits[index]!;
 		if (edit.oldText.length === 0) {
-			throw getEmptyOldTextError(path, index, edits.length);
-		}
-		if (edit.expectedOccurrences !== undefined && (!Number.isInteger(edit.expectedOccurrences) || edit.expectedOccurrences < 1)) {
-			throw getInvalidExpectedOccurrencesError(path, index, edits.length);
+			throw getEmptyOldTextError(index);
 		}
 	}
 
@@ -346,10 +301,8 @@ export function applyEditsToNormalizedContent(normalizedContent: string, edits: 
 		const resolvedMatches = resolveEditMatches(
 			normalizedContent,
 			oldText,
-			edit.expectedOccurrences !== undefined,
-			path,
+			edit.replaceAll === true,
 			index,
-			edits.length,
 			getFuzzyContent(),
 		);
 		for (const resolvedMatch of resolvedMatches) {
@@ -370,7 +323,7 @@ export function applyEditsToNormalizedContent(normalizedContent: string, edits: 
 		const previous = matchedEdits[index - 1]!;
 		const current = matchedEdits[index]!;
 		if (previous.matchIndex + previous.matchLength > current.matchIndex) {
-			throw new Error(`edits[${previous.editIndex}] and edits[${current.editIndex}] overlap in ${path}. Merge them into one edit or target disjoint regions.`);
+			throw new Error(`replacement ${current.editIndex + 1} overlaps replacement ${previous.editIndex + 1}. Merge them into one edit or target disjoint regions.`);
 		}
 	}
 
@@ -387,26 +340,28 @@ export function applyEditsToNormalizedContent(normalizedContent: string, edits: 
 	segments.push(normalizedContent.substring(cursor));
 	const newContent = segments.join("");
 	if (newContent === normalizedContent) {
-		throw getNoChangeError(path, edits.length);
+		throw getNoChangeError();
 	}
 	// matchedEdits already has matchIndex/matchLength/newText — reuse as MatchedEditSpan[].
 	return { newContent, matchedSpans: matchedEdits };
 }
 
-function formatAccessError(displayPath: string, error: unknown): Error {
+function formatAccessError(error: unknown): Error {
 	if (error instanceof Error) {
 		const errorWithCode = error as Error & { code?: string };
 		if (errorWithCode.code === "ENOENT") {
-			return new Error(`File not found: ${displayPath}`);
+			return new Error("File not found.");
+		}
+		if (errorWithCode.code === "EACCES" || errorWithCode.code === "EPERM") {
+			return new Error("File must be readable and writable. Check permissions.");
 		}
 		return error;
 	}
 	return new Error(String(error));
 }
 
-export async function executeFileGroupEdits(
+export async function executeFileEdits(
 	absolutePath: string,
-	displayPath: string,
 	edits: FileEditOperation[],
 	signal?: AbortSignal,
 	operations: EditEngineOperations = defaultEditEngineOperations,
@@ -419,7 +374,7 @@ export async function executeFileGroupEdits(
 			const fileStat = await operations.stat(absolutePath);
 			if (fileStat.size > MAX_EDIT_FILE_SIZE_BYTES) {
 				throw new Error(
-					`File too large to edit: ${displayPath} is ${fileStat.size} bytes (limit ${MAX_EDIT_FILE_SIZE_BYTES}). Use a narrower oldText or a streaming tool.`,
+					`File too large: sizeBytes=${fileStat.size} limitBytes=${MAX_EDIT_FILE_SIZE_BYTES}; use a narrower oldText or a streaming tool.`,
 				);
 			}
 		} catch (error) {
@@ -430,7 +385,7 @@ export async function executeFileGroupEdits(
 		try {
 			await operations.access(absolutePath);
 		} catch (error) {
-			throw formatAccessError(displayPath, error);
+			throw formatAccessError(error);
 		}
 		throwIfAborted(signal);
 
@@ -443,7 +398,7 @@ export async function executeFileGroupEdits(
 
 		// Resolve, validate, apply, and return spans in one call.
 		// applyEditsToNormalizedContent is the single source of truth for match logic.
-		const { newContent, matchedSpans } = applyEditsToNormalizedContent(normalizedContent, edits, displayPath);
+		const { newContent, matchedSpans } = applyEditsToNormalizedContent(normalizedContent, edits);
 		throwIfAborted(signal);
 
 		await operations.writeFile(absolutePath, bom + restoreLineEndings(newContent, originalEnding));
@@ -455,7 +410,7 @@ export async function executeFileGroupEdits(
 			previewStartLine: preview.previewStartLine,
 			previewTruncated: preview.previewTruncated,
 			changeStats: preview.changeStats,
-			summary: `updated ${displayPath} (${matchedSpans.length} replacement${matchedSpans.length === 1 ? "" : "s"} from ${edits.length} edit${edits.length === 1 ? "" : "s"})`,
+			summary: `updated ${matchedSpans.length} replacement${matchedSpans.length === 1 ? "" : "s"}`,
 		};
 	});
 }

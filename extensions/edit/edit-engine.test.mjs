@@ -8,7 +8,7 @@ import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import {
 	applyEditsToNormalizedContent,
 	EditToolError,
-	executeFileGroupEdits,
+	executeFileEdits,
 	generateEditPreview,
 } from "./edit-engine.ts";
 
@@ -32,9 +32,8 @@ test("uses the SDK mutation queue shared with built-in write", async () => {
 	await outerStarted;
 
 	let editReadStarted = false;
-	const editMutation = executeFileGroupEdits(
+	const editMutation = executeFileEdits(
 		file,
-		"target.txt",
 		[{ oldText: "before", newText: "after" }],
 		undefined,
 		{
@@ -61,7 +60,6 @@ test("quote fallback preserves unrelated typography and replacement quote style"
 	const { newContent } = applyEditsToNormalizedContent(
 		original,
 		[{ oldText: 'message: "old value"\n', newText: 'message: "new value"\n' }],
-		"demo.txt",
 	);
 
 	assert.equal(
@@ -70,42 +68,67 @@ test("quote fallback preserves unrelated typography and replacement quote style"
 	);
 });
 
-test("non-quote fuzzy mismatches fail with NOT_FOUND guidance on exact whitespace matching", async () => {
+test("not-found diagnostics omit the known path and first replacement index", async () => {
 	const original = ['title: “keep me”', 'needle   ', 'footer — untouched', ''].join("\n");
 	const file = await writeTempFile("pi-edit-engine-fuzzy-", "story.txt", original);
 
 	await assert.rejects(
-		() => executeFileGroupEdits(file, 'story.txt', [{ oldText: 'needle\nfooter - untouched\n', newText: 'replaced\nfooter - untouched\n' }]),
+		() => executeFileEdits(file, [{ oldText: 'needle\nfooter - untouched\n', newText: 'replaced\nfooter - untouched\n' }]),
 		(error) => {
 			assert.ok(error instanceof EditToolError);
 			assert.equal(error.kind, 'NOT_FOUND');
-			assert.ok(
-				error.message.startsWith('NOT_FOUND the text in story.txt. oldText must match the file content exactly, including whitespace; line endings and curly quotes are normalized before matching.'),
+			assert.equal(
 				error.message,
+				"oldText was not found. Re-read the file and copy oldText exactly, including whitespace.",
 			);
-			assert.match(error.message, /Re-read the file and copy oldText character-for-character/);
+			assert.doesNotMatch(error.message, /story\.txt|edits\[0\]/);
 			return true;
 		},
 	);
 	assert.equal(await fs.promises.readFile(file, "utf-8"), original);
 });
 
+test("not-found diagnostics identify a later replacement without repeating the path", () => {
+	assert.throws(
+		() => applyEditsToNormalizedContent(
+			"first\n",
+			[
+				{ oldText: "first", newText: "updated" },
+				{ oldText: "missing", newText: "replacement" },
+			],
+		),
+		(error) => {
+			assert.ok(error instanceof EditToolError);
+			assert.equal(error.kind, "NOT_FOUND");
+			assert.equal(
+				error.message,
+				"replacement 2: oldText was not found. Re-read the file and copy oldText exactly, including whitespace.",
+			);
+			assert.doesNotMatch(error.message, /story\.txt|edits\[/);
+			return true;
+		},
+	);
+});
+
 test("LF oldText matches CRLF file content and preserves the original line endings", async () => {
 	const file = await writeTempFile("pi-edit-engine-crlf-", "win.txt", 'alpha\r\nbeta\r\nomega\r\n');
 
-	const result = await executeFileGroupEdits(file, 'win.txt', [{ oldText: 'alpha\nbeta\n', newText: 'alpha\ngamma\n' }]);
+	const result = await executeFileEdits(file, [{ oldText: 'alpha\nbeta\n', newText: 'alpha\ngamma\n' }]);
 
-	assert.match(result.summary, /updated win\.txt/);
+	assert.equal(result.summary, "updated 1 replacement");
 	assert.equal(await fs.promises.readFile(file, "utf-8"), 'alpha\r\ngamma\r\nomega\r\n');
 });
 
-test("overlapping exact matches are rejected with a DUPLICATE_MATCH error prefix", () => {
+test("duplicate matches report their count and recovery", () => {
 	assert.throws(
-		() => applyEditsToNormalizedContent('aaaa', [{ oldText: 'aaa', newText: 'bbb' }], 'demo.txt'),
+		() => applyEditsToNormalizedContent('aaaa', [{ oldText: 'aaa', newText: 'bbb' }]),
 		(error) => {
 			assert.ok(error instanceof EditToolError);
 			assert.equal(error.kind, 'DUPLICATE_MATCH');
-			assert.match(error.message, /DUPLICATE_MATCH .*\(2 occurrences\)/);
+			assert.equal(
+				error.message,
+				"oldText matched 2 locations. Add context or set replaceAll: true to replace all matches.",
+			);
 			return true;
 		},
 	);
@@ -115,60 +138,46 @@ test("exact unique match wins over fuzzy-equivalent quote variants elsewhere", (
 	const { newContent } = applyEditsToNormalizedContent(
 		'x: “v”\nx: "v"\n',
 		[{ oldText: 'x: “v”\n', newText: 'x: “w”\n' }],
-		'demo.txt',
 	);
 
 	assert.equal(newContent, 'x: “w”\nx: "v"\n');
 });
 
-test("explicit expectedOccurrences replaces every exact occurrence", () => {
+test("replaceAll replaces every exact occurrence", () => {
 	const { newContent, matchedSpans } = applyEditsToNormalizedContent(
 		'const oldName = oldName + oldName;\n',
-		[{ oldText: 'oldName', newText: 'newName', expectedOccurrences: 3 }],
-		'demo.ts',
+		[{ oldText: 'oldName', newText: 'newName', replaceAll: true }],
 	);
 
 	assert.equal(newContent, 'const newName = newName + newName;\n');
 	assert.equal(matchedSpans.length, 3);
 });
 
-test("explicit expectedOccurrences replaces all when the actual count differs", () => {
-	// expectedOccurrences is a declaration of intent ("replace all"), not a
-	// constraint: fewer actual matches still replace everything found.
-	const { newContent, matchedSpans } = applyEditsToNormalizedContent(
-		'const oldName = oldName;\n',
-		[{ oldText: 'oldName', newText: 'newName', expectedOccurrences: 3 }],
-		'demo.ts',
-	);
-
-	assert.equal(newContent, 'const newName = newName;\n');
-	assert.equal(matchedSpans.length, 2);
-});
-
-test("implicit single occurrence keeps duplicate-match guidance", () => {
+test("replaceAll false keeps duplicate-match guidance", () => {
 	assert.throws(
 		() => applyEditsToNormalizedContent(
 			'const oldName = oldName;\n',
-			[{ oldText: 'oldName', newText: 'newName' }],
-			'demo.ts',
+			[{ oldText: 'oldName', newText: 'newName', replaceAll: false }],
 		),
 		(error) => {
 			assert.ok(error instanceof EditToolError);
 			assert.equal(error.kind, 'DUPLICATE_MATCH');
-			assert.match(error.message, /oldText is not unique/);
+			assert.equal(
+				error.message,
+				"oldText matched 2 locations. Add context or set replaceAll: true to replace all matches.",
+			);
 			return true;
 		},
 	);
 });
 
-test("access errors are surfaced instead of being mislabeled as file not found", async () => {
+test("permission errors omit the known path and name the required access", async () => {
 	const error = new Error("Permission denied");
 	error.code = "EACCES";
 
 	await assert.rejects(
-		() => executeFileGroupEdits(
+		() => executeFileEdits(
 			"/tmp/locked.txt",
-			"locked.txt",
 			[{ oldText: 'hello', newText: 'world' }],
 			undefined,
 			{
@@ -179,7 +188,37 @@ test("access errors are surfaced instead of being mislabeled as file not found",
 				writeFile: async () => {},
 			},
 		),
-		/Permission denied/,
+		(error) => {
+			assert.ok(error instanceof Error);
+			assert.equal(error.message, "File must be readable and writable. Check permissions.");
+			return true;
+		},
+	);
+});
+
+test("missing file diagnostics omit the known path", async () => {
+	const error = new Error("Missing file");
+	error.code = "ENOENT";
+
+	await assert.rejects(
+		() => executeFileEdits(
+			"/tmp/missing.txt",
+			[{ oldText: "hello", newText: "world" }],
+			undefined,
+			{
+				stat: async () => ({ size: 0 }),
+				access: async () => {
+					throw error;
+				},
+				readFile: async () => "hello\n",
+				writeFile: async () => {},
+			},
+		),
+		(failure) => {
+			assert.ok(failure instanceof Error);
+			assert.equal(failure.message, "File not found.");
+			return true;
+		},
 	);
 });
 
@@ -187,15 +226,14 @@ test("identical replacement fails closed as a structured no-change edit error", 
 	const file = await writeTempFile("pi-edit-no-change-", "target.ts", "const answer = 42;\n");
 
 	await assert.rejects(
-		() => executeFileGroupEdits(
+		() => executeFileEdits(
 			file,
-			"target.ts",
 			[{ oldText: "const answer = 42;", newText: "const answer = 42;" }],
 		),
 		(error) => {
 			assert.ok(error instanceof EditToolError);
 			assert.equal(error.kind, "NO_CHANGE");
-			assert.match(error.message, /No changes made/);
+			assert.equal(error.message, "Replacement is identical; the patch may already be applied.");
 			return true;
 		},
 	);
@@ -211,7 +249,6 @@ test("preview line numbers describe complete before and after lines when edits s
 			{ oldText: "oldLeft", newText: "newLeft" },
 			{ oldText: "oldRight", newText: "newRight" },
 		],
-		"sample.ts",
 	);
 
 	const preview = generateEditPreview(oldContent, newContent);
@@ -274,7 +311,6 @@ test("preview keeps unchanged lines as context inside a replaced block", () => {
 	const { newContent } = applyEditsToNormalizedContent(
 		oldContent,
 		[{ oldText, newText }],
-		"sample.go",
 	);
 	const preview = generateEditPreview(oldContent, newContent);
 

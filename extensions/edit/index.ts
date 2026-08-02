@@ -1,13 +1,11 @@
 /**
- * File-grouped edit extension.
+ * Single-file exact edit extension.
  *
  * Contract:
- * - accepts { files: [{path, edits[]}] }
- * - the file list may contain one file or many files; minimum length is 1
- * - each file entry carries one path plus that file's edits[]
- * - the same physical file may appear more than once and is merged after canonicalization
- * - files are canonicalized before execution so aliases resolve to the same physical file
- * - each file group is atomic and isolated from every other file group
+ * - accepts { path, edits }
+ * - each call atomically modifies one file
+ * - multiple disjoint replacements for that file share edits[]
+ * - multiple files use parallel tool calls
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -34,13 +32,11 @@ export default function (pi: ExtensionAPI) {
         label: "edit",
         renderShell: "default",
         description:
-            "Exact text replacements in existing files. Use for small in-place edits with known oldText. Not for create, delete, move, or full rewrite.",
+            "Exact text replacements in existing files. Use for small in-place edits with known oldText.",
         promptSnippet: "Exact file edits",
         promptGuidelines: [
-            "Copy oldText verbatim from the latest read output — exact whitespace and quotes, never from memory.",
-            "Keep oldText short (1-3 lines) and unique; set expectedOccurrences to replace all occurrences.",
-            "One file per call; multiple files = parallel calls.",
-            "Bulk edits across many files: use bash (perl/sed) instead.",
+            "For edit, copy oldText verbatim from the latest read output.",
+            "For edit, keep oldText short (1-3 lines) and unique; replaceAll: true replaces all matches.",
         ],
         parameters: editRequestParameters,
         prepareArguments: parseEditRequest,

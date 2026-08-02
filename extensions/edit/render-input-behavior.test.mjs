@@ -21,20 +21,29 @@ test("parseEditRequest returns a ready request for a valid single-file edit", ()
 	assert.equal(resolution.edits.length, 2);
 });
 
-test("parseEditRequest accepts positive expectedOccurrences", () => {
+test("parseEditRequest accepts replaceAll", () => {
 	const resolution = parseEditRequest(makeArgs("/tmp/demo.ts", [
-		{ oldText: "before", newText: "after", expectedOccurrences: 2 },
+		{ oldText: "before", newText: "after", replaceAll: true },
 	]));
 
-	assert.equal(resolution.edits[0]?.expectedOccurrences, 2);
+	assert.equal(resolution.edits[0]?.replaceAll, true);
 });
 
-test("parseEditRequest rejects non-positive expectedOccurrences", () => {
+test("parseEditRequest rejects removed expectedOccurrences", () => {
 	assert.throws(() =>
 		parseEditRequest(makeArgs("/tmp/demo.ts", [
-			{ oldText: "before", newText: "after", expectedOccurrences: 0 },
+			{ oldText: "before", newText: "after", expectedOccurrences: 2 },
 		])),
-	/must be at least 1/,
+	/expectedOccurrences must be removed/,
+	);
+});
+
+test("parseEditRequest rejects non-boolean replaceAll", () => {
+	assert.throws(() =>
+		parseEditRequest(makeArgs("/tmp/demo.ts", [
+			{ oldText: "before", newText: "after", replaceAll: "yes" },
+		])),
+	/replaceAll must be boolean/,
 	);
 });
 
