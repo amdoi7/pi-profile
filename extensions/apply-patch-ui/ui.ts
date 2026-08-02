@@ -1,38 +1,58 @@
+import { readFileSync } from "node:fs";
+
 import { renderDiff, type AgentToolResult, type Theme, type ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
 import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 
-import { renderDiffSummary, renderHiddenFooter } from "../_shared/code-preview.ts";
+import { renderDiffSummary, renderShellCommandCall } from "../_shared/code-preview.ts";
 import { renderCwdFilePathLink } from "../_shared/file-link.ts";
-import { generateFinalDiff, type FinalDiff } from "../_shared/final-diff.ts";
+import { generateFinalDiff } from "../_shared/final-diff.ts";
+import { trailingCommandAfterApplyPatches, type ParsedPatch, type PatchOperation } from "./patch-command.ts";
 import {
-	EphemeralPatchRuns,
-	snapshotContent,
-	type EphemeralPatchRun,
-	type SnapshotDiagnostic,
-} from "./ephemeral-patch-runs.ts";
-import type { ParsedPatch, PatchOperation } from "./patch-command.ts";
+	changeMatchesOperation,
+	parseRenderedResultPayload,
+	operationKindWord,
+	type ApplyPatchBatchFileDiff,
+	type ApplyPatchUnapplied,
+	type ApplyPatchFileDiff,
+	type ApplyPatchSingleResultViewModel,
+	type ApplyPatchResultViewModel,
+	type BeforeSnapshots,
+	PATCH_DIFF_CONTEXT_LINES,
+} from "./view-model.ts";
 import {
 	failureMatchesPatch,
 	parseApplyPatchFailure,
+	parseElapsedSeconds,
 	parseSuccessfulChanges,
 	resultText,
 	successMatchesPatch,
-	type AppliedChange,
+	trailingAfterFailure,
+	trailingAfterSuccess,
 	type ApplyPatchFailure,
+	parseApplyPatchResultSequence,
 	type SuccessfulChange,
 } from "./patch-result.ts";
 
+// 耗时显示阈值：正常本地 apply_patch 是毫秒级文件写，远低于 1s；
+// 超过 2s 说明大 patch / 慢盘 / 锁竞争，值得作为诊断信号显示（tripwire，正常流量不触发）。
+const ELAPSED_SHOW_THRESHOLD_S = 2;
+
+// 后续命令输出（pytest 等）预览：总量沿用 20 行，首尾各半以同时保留失败标题与 summary。
+const TRAILING_PREVIEW_LINES = 20;
+
 export type PatchRenderContext = {
+	args: { command: string };
 	cwd: string;
 	expanded: boolean;
-	lastComponent?: unknown;
-	toolCallId: string;
-	state: Record<string, unknown>;
 	isError: boolean;
+	state: Record<string, unknown>;
+	lastComponent?: unknown;
+	/** execute 前捕获的 before 快照（行号 diff 用）；undefined = 未捕获（非 TUI / 未识别）。 */
+	beforeSnapshots?: BeforeSnapshots;
 };
 
 type ApplyPatchRenderState = {
-	ephemeralRun?: EphemeralPatchRun | null;
+	pendingCallComponent?: Container;
 };
 
 function operationStats(operation: PatchOperation) {
@@ -48,15 +68,107 @@ function renderOperationPath(operation: PatchOperation, theme: Theme, context: P
 	return `${source}${theme.fg("muted", " -> ")}${destination}`;
 }
 
-function renderOperationHeader(operation: PatchOperation, theme: Theme, context: PatchRenderContext): string {
-	const label = operation.destination ? "move" : operation.kind;
-	const stats = operationStats(operation);
-	const summary = stats.changedLines > 0 ? ` ${theme.fg("muted", "·")} ${renderDiffSummary(stats, theme)}` : "";
-	return [
-		theme.fg("toolTitle", theme.bold("apply_patch")),
-		theme.fg("muted", label),
+/**
+ * 一行一个操作，edit 风格：`apply_patch <Kind> file <path> · N changed · +A · -D`。
+ * confirmed=false 时 Kind muted（计划，未发生）；true 时 success（CLI 已确认）。
+ */
+function renderOperationRow(
+	operation: PatchOperation,
+	theme: Theme,
+	context: PatchRenderContext,
+	options: { confirmed: boolean; indent: boolean },
+): string {
+	const word = theme.fg(options.confirmed ? "success" : "muted", operationKindWord(operation));
+	const parts = [
+		`${options.indent ? "  " : ""}${theme.fg("toolTitle", theme.bold("apply_patch"))}`,
+		word,
+		"file",
 		renderOperationPath(operation, theme, context),
-	].join(" ") + summary;
+	];
+	const stats = operationStats(operation);
+	if (stats.changedLines > 0) parts.push(renderDiffSummary(stats, theme));
+	return parts.join(" ");
+}
+
+function indentText(text: string, spaces: number): string {
+	const prefix = " ".repeat(spaces);
+	return text.split("\n").map((line) => `${prefix}${line}`).join("\n");
+}
+
+/**
+ * 意图 diff：patch 内容即实际变更。apply_patch 是原子精确应用（update 按行替换），
+ * CLI 确认成功后文件内容与 patch lines 一致——无需文件快照对比。
+ */
+function renderOperationLines(container: Container, operation: PatchOperation, theme: Theme): void {
+	if (operation.lines.length === 0) return;
+	const rendered = operation.lines.map((line) => {
+		const color = line.prefix === "+" ? "success" : line.prefix === "-" ? "error" : "dim";
+		return theme.fg(color, `${line.prefix}${line.text}`);
+	}).join("\n");
+	container.addChild(new Text(indentText(rendered, 2), 0, 0));
+}
+
+/**
+ * 行号 diff：before 来自 execute 前快照，after 实时读取当前文件。
+ * 快照缺失（渲染时文件不可读）时回退意图 diff。
+ */
+function renderOperationDiff(
+	container: Container,
+	operation: PatchOperation,
+	context: PatchRenderContext,
+	theme: Theme,
+): void {
+	const snapshots = context.beforeSnapshots;
+	const beforeSnapshot = snapshots?.get(operation.path);
+	if (!beforeSnapshot) {
+		renderOperationLines(container, operation, theme);
+		return;
+	}
+	if (!snapshots) return;
+	const afterPath = operation.destination ?? operation.path;
+	const afterSnapshot = snapshots.get(afterPath);
+	let after: string | null = null;
+	if (afterSnapshot) {
+		try {
+			after = readFileSync(afterSnapshot.absolutePath, "utf8");
+		} catch {
+			// 文件不存在（delete 目标等）：after 为 null。
+		}
+	}
+	const diff = generateFinalDiff(beforeSnapshot.before ?? "", after ?? "", PATCH_DIFF_CONTEXT_LINES);
+	if (diff.text.length === 0) {
+		renderOperationLines(container, operation, theme);
+		return;
+	}
+	container.addChild(new Spacer(1));
+	appendDiffPreview(container, diff.text, diff.truncated, theme);
+}
+
+function appendDiffPreview(container: Container, diffText: string, truncated: boolean, theme: Theme): void {
+	container.addChild(new Text(indentText(renderDiff(diffText), 2), 0, 0));
+	if (truncated) container.addChild(new Text(theme.fg("warning", "... diff truncated at tool output limit"), 0, 0));
+}
+
+function renderTrailing(
+	container: Container,
+	trailing: string,
+	expanded: boolean,
+	theme: Theme,
+	command = "",
+): void {
+	const lines = trailing.split("\n");
+	container.addChild(new Spacer(1));
+	if (command) container.addChild(new Text(renderShellCommandCall({ command }, theme), 0, 0));
+	if (expanded || lines.length <= TRAILING_PREVIEW_LINES) {
+		container.addChild(new Text(theme.fg("toolOutput", lines.join("\n")), 0, 0));
+		return;
+	}
+	const head = Math.ceil(TRAILING_PREVIEW_LINES / 2);
+	const tail = TRAILING_PREVIEW_LINES - head;
+	const skipped = lines.length - TRAILING_PREVIEW_LINES;
+	container.addChild(new Text(theme.fg("toolOutput", lines.slice(0, head).join("\n")), 0, 0));
+	container.addChild(new Text(theme.fg("muted", `... ${skipped} output lines hidden in middle, expand to view`), 0, 0));
+	container.addChild(new Text(theme.fg("toolOutput", lines.slice(-tail).join("\n")), 0, 0));
 }
 
 export function renderPendingApplyPatch(
@@ -65,96 +177,239 @@ export function renderPendingApplyPatch(
 	context: PatchRenderContext,
 ): Container {
 	const container = new Container();
+	const multiple = patch.operations.length > 1;
 	for (const operation of patch.operations) {
-		container.addChild(new Text(renderOperationHeader(operation, theme, context), 0, 0));
+		container.addChild(new Text(renderOperationRow(operation, theme, context, { confirmed: false, indent: multiple }), 0, 0));
+		for (const chunk of operation.chunks ?? []) {
+			if (chunk.lines.some((line) => line.prefix === "+" || line.prefix === "-")) continue;
+			container.addChild(new Text(
+				theme.fg("warning", `  chunk ${chunk.index} · no +/- lines · must contain an insertion or deletion`),
+				0,
+				0,
+			));
+		}
+	}
+	// edit 模式：pending 容器登记到 state，结果渲染时 clearPendingCall 清掉，避免重复。
+	renderState(context).pendingCallComponent = container;
+	return container;
+}
+
+// ============================================================================
+// edit 模式渲染：reusableContainer + view model 消费
+// ============================================================================
+
+function reusableContainer(context: PatchRenderContext): Container {
+	const container = context.lastComponent instanceof Container ? context.lastComponent : new Container();
+	container.clear();
+	return container;
+}
+
+function renderState(context: PatchRenderContext): ApplyPatchRenderState {
+	return context.state as ApplyPatchRenderState;
+}
+
+export function clearPendingCall(context: PatchRenderContext): void {
+	renderState(context).pendingCallComponent?.clear();
+}
+
+/** 每文件结果块（edit 结构）：标题行 + Spacer + diff 预览 + 截断 footer。 */
+function renderFileResult(
+	file: ApplyPatchFileDiff,
+	theme: Theme,
+	context: PatchRenderContext,
+	patchCount = 1,
+): Container {
+	const block = new Container();
+	const displayPath = file.destination ? `${file.path}${theme.fg("muted", " -> ")}${file.destination}` : file.path;
+	const linkTarget = file.destination ?? file.path;
+	const count = patchCount > 1 ? theme.fg("muted", ` · ${patchCount} patches`) : "";
+	block.addChild(new Text(
+		`${theme.fg("toolTitle", theme.bold("apply_patch"))} ${theme.fg("success", file.kind)} file ` +
+		`${renderCwdFilePathLink(displayPath, linkTarget, context.cwd, theme)}` +
+		`${theme.fg("muted", " · ")}${renderDiffSummary(file.changeStats, theme)}${count}`,
+		0,
+		0,
+	));
+	for (const scope of file.astScopes ?? []) {
+		block.addChild(new Text(theme.fg("muted", `scope L${scope.startLine}-L${scope.endLine} · ${scope.label}`), 0, 0));
+	}
+	if (file.astDiagnostic) block.addChild(new Text(theme.fg("warning", file.astDiagnostic), 0, 0));
+	if (file.diffText.length > 0) {
+		block.addChild(new Spacer(1));
+		appendDiffPreview(block, file.diffText, file.diffTruncated, theme);
+	}
+	return block;
+}
+
+function aggregateSuccessfulFiles(files: ApplyPatchFileDiff[]): ApplyPatchBatchFileDiff[] {
+	const aggregated = new Map<string, ApplyPatchBatchFileDiff>();
+	for (const file of files) {
+		const key = JSON.stringify([file.kind, file.path, file.destination]);
+		const current = aggregated.get(key);
+		if (!current) {
+			aggregated.set(key, { ...file, patchCount: 1 });
+			continue;
+		}
+		current.changeStats = {
+			additions: current.changeStats.additions + file.changeStats.additions,
+			deletions: current.changeStats.deletions + file.changeStats.deletions,
+			changedLines: current.changeStats.changedLines + file.changeStats.changedLines,
+		};
+		current.diffText = [current.diffText, file.diffText].filter(Boolean).join("\n");
+		current.diffTruncated = current.diffTruncated || file.diffTruncated;
+		current.patchCount += 1;
+	}
+	return [...aggregated.values()];
+}
+
+function renderUnappliedRow(
+	item: ApplyPatchUnapplied,
+	theme: Theme,
+	context: PatchRenderContext,
+): Text {
+	const displayPath = item.destination ? `${item.path} -> ${item.destination}` : item.path;
+	return new Text(
+		`  ${theme.fg("muted", item.kind)} file ${renderCwdFilePathLink(displayPath, item.destination ?? item.path, context.cwd, theme)}`,
+		0,
+		0,
+	);
+}
+
+function renderFailureViewModel(
+	container: Container,
+	viewModel: Extract<ApplyPatchSingleResultViewModel, { success: false }>,
+	theme: Theme,
+	context: PatchRenderContext,
+): void {
+	container.addChild(new Text(
+		`${theme.fg("toolTitle", theme.bold("apply_patch"))} ${theme.fg("error", `failed ${viewModel.error.code}`)}`,
+		0,
+		0,
+	));
+	container.addChild(new Text(theme.fg("error", viewModel.error.message), 0, 0));
+	if (viewModel.error.path) {
+		const chunk = viewModel.error.chunkIndex === undefined ? "" : ` ${theme.fg("muted", `· chunk ${viewModel.error.chunkIndex}`)}`;
+		container.addChild(new Text(
+			`${theme.fg("error", "failed update")} ${renderCwdFilePathLink(viewModel.error.path, viewModel.error.path, context.cwd, theme)}${chunk}`,
+			0,
+			0,
+		));
+	}
+	if (viewModel.applied.length > 0) {
+		container.addChild(new Spacer(1));
+		container.addChild(new Text(theme.fg("success", "applied:"), 0, 0));
+		for (const file of viewModel.applied) {
+			container.addChild(renderFileResult(file, theme, context));
+		}
+	}
+	if (viewModel.unapplied.length > 0) {
+		container.addChild(new Spacer(1));
+		container.addChild(new Text(theme.fg("muted", "unapplied:"), 0, 0));
+		for (const item of viewModel.unapplied) {
+			container.addChild(renderUnappliedRow(item, theme, context));
+		}
+	}
+}
+
+function renderSingleResultViewModel(
+	container: Container,
+	viewModel: ApplyPatchSingleResultViewModel,
+	theme: Theme,
+	context: PatchRenderContext,
+): void {
+	if (viewModel.success) {
+		for (const file of viewModel.files) container.addChild(renderFileResult(file, theme, context));
+		return;
+	}
+	renderFailureViewModel(container, viewModel, theme, context);
+}
+
+/** 结果渲染主入口（edit 模式）：消费 tool_result 注入的结构化 view model。 */
+export function renderResultViewModel(
+	viewModel: ApplyPatchResultViewModel,
+	options: ToolRenderResultOptions,
+	theme: Theme,
+	context: PatchRenderContext,
+): Container {
+	clearPendingCall(context);
+	const container = reusableContainer(context);
+	if (viewModel.kind === "apply-patch-batch-result" && options.expanded) {
+		viewModel.results.forEach((result, index) => {
+			if (index > 0) container.addChild(new Spacer(1));
+			renderSingleResultViewModel(container, result, theme, context);
+		});
+	} else if (viewModel.kind === "apply-patch-batch-result" && viewModel.finalFiles) {
+		for (const file of viewModel.finalFiles) {
+			container.addChild(renderFileResult(file, theme, context, file.patchCount));
+		}
+	} else if (viewModel.kind === "apply-patch-batch-result") {
+		const successfulFiles: ApplyPatchFileDiff[] = [];
+		let hasRendered = false;
+		const flushSuccessfulFiles = () => {
+			if (successfulFiles.length === 0) return;
+			if (hasRendered) container.addChild(new Spacer(1));
+			for (const file of aggregateSuccessfulFiles(successfulFiles)) {
+				container.addChild(renderFileResult(file, theme, context, file.patchCount));
+			}
+			successfulFiles.length = 0;
+			hasRendered = true;
+		};
+		for (const result of viewModel.results) {
+			if (result.success) {
+				successfulFiles.push(...result.files);
+				continue;
+			}
+			flushSuccessfulFiles();
+			if (hasRendered) container.addChild(new Spacer(1));
+			renderFailureViewModel(container, result, theme, context);
+			hasRendered = true;
+		}
+		flushSuccessfulFiles();
+	} else {
+		renderSingleResultViewModel(container, viewModel, theme, context);
+	}
+	if (viewModel.trailing.trim().length > 0) {
+		renderTrailing(container, viewModel.trailing, options.expanded, theme, trailingCommandAfterApplyPatches(context.args.command));
 	}
 	return container;
 }
 
-function resultPathLine(change: SuccessfulChange | AppliedChange, theme: Theme, context: PatchRenderContext): string {
-	const status = "status" in change ? change.status : change.operation === "add" ? "A" : change.operation === "delete" ? "D" : "M";
-	const verb = status === "A" ? "added" : status === "D" ? "deleted" : "modified";
-	return `${theme.fg("muted", verb)} ${renderCwdFilePathLink(change.path, change.path, context.cwd, theme)}`;
+export function parseRenderedResultPayloadFromDetails(details: unknown): ApplyPatchResultViewModel | undefined {
+	return parseRenderedResultPayload(details);
 }
 
-function operationFinalDiff(run: EphemeralPatchRun, operation: PatchOperation): FinalDiff | undefined {
-	const oldContent = snapshotContent(run, "before", operation.path);
-	const finalPath = operation.destination ?? operation.path;
-	const newContent = snapshotContent(run, "after", finalPath);
-	if (oldContent === undefined || newContent === undefined) return undefined;
-	return generateFinalDiff(oldContent, newContent);
-}
-
-function diagnosticText(diagnostic: SnapshotDiagnostic): string {
-	return [
-		`code=${diagnostic.code}`,
-		`path=${JSON.stringify(diagnostic.path)}`,
-		`phase=${diagnostic.phase}`,
-		`message=${JSON.stringify(diagnostic.message)}`,
-		`remediation=${JSON.stringify(diagnostic.remediation)}`,
-	].join(" ");
-}
-
-function renderConfirmedOperationDiffs(
-	container: Container,
-	operations: readonly PatchOperation[],
-	run: EphemeralPatchRun,
-	theme: Theme,
-	context: PatchRenderContext,
-): void {
-	for (const operation of operations) {
-		container.addChild(new Spacer(1));
-		const diff = operationFinalDiff(run, operation);
-		if (!diff) {
-			container.addChild(new Text(renderOperationHeader(operation, theme, context), 0, 0));
-			continue;
-		}
-		const label = operation.destination ? "move" : operation.kind;
-		container.addChild(new Text(
-			[
-				theme.fg("toolTitle", theme.bold("apply_patch")),
-				theme.fg("muted", label),
-				renderOperationPath(operation, theme, context),
-				theme.fg("muted", "·"),
-				renderDiffSummary(diff.stats, theme),
-			].join(" "),
-			0,
-			0,
-		));
-		if (diff.text.length > 0) {
-			container.addChild(new Spacer(1));
-			container.addChild(new Text(renderDiff(diff.text), 0, 0));
-		}
-		if (diff.truncated) {
-			container.addChild(new Text(renderHiddenFooter(1, "diff preview", theme), 0, 0));
-		}
-	}
-	for (const diagnostic of run.diagnostics) {
-		container.addChild(new Text(theme.fg("warning", diagnosticText(diagnostic)), 0, 0));
-	}
-}
+// ============================================================================
+// isPartial 流式回退：text 解析渲染（bash 长尾期间及时显示）
+// ============================================================================
 
 function renderSuccess(
 	patch: ParsedPatch,
 	changes: SuccessfulChange[],
-	run: EphemeralPatchRun | undefined,
 	options: ToolRenderResultOptions,
 	text: string,
 	theme: Theme,
 	context: PatchRenderContext,
 ): Container {
 	const container = new Container();
-	const count = patch.operations.length;
-	container.addChild(new Text(
-		`${theme.fg("toolTitle", theme.bold("apply_patch"))} ${theme.fg("success", `applied ${count} operation${count === 1 ? "" : "s"}`)}`,
-		0,
-		0,
-	));
-	if (run) renderConfirmedOperationDiffs(container, patch.operations, run, theme, context);
-	else for (const change of changes) container.addChild(new Text(resultPathLine(change, theme, context), 0, 0));
+	const multiple = patch.operations.length > 1;
+	for (const change of changes) {
+		const operation = patch.operations.find((op) => changeMatchesOperation(change, op));
+		if (!operation) continue;
+		container.addChild(new Text(renderOperationRow(operation, theme, context, { confirmed: true, indent: multiple }), 0, 0));
+		renderOperationDiff(container, operation, context, theme);
+	}
 	if (options.expanded) {
 		container.addChild(new Spacer(1));
 		container.addChild(new Text(theme.fg("dim", text), 0, 0));
+		return container;
+	}
+	const elapsed = parseElapsedSeconds(text);
+	if (elapsed !== undefined && elapsed > ELAPSED_SHOW_THRESHOLD_S) {
+		container.addChild(new Text(theme.fg("muted", `elapsed ${elapsed.toFixed(1)}s`), 0, 0));
+	}
+	const trailing = trailingAfterSuccess(text);
+	if (trailing.trim().length > 0) {
+		renderTrailing(container, trailing, false, theme, trailingCommandAfterApplyPatches(context.args.command));
 	}
 	return container;
 }
@@ -162,7 +417,6 @@ function renderSuccess(
 function renderFailure(
 	patch: ParsedPatch,
 	failure: ApplyPatchFailure,
-	run: EphemeralPatchRun | undefined,
 	options: ToolRenderResultOptions,
 	text: string,
 	theme: Theme,
@@ -183,49 +437,77 @@ function renderFailure(
 		container.addChild(new Text(`${theme.fg("error", `failed ${operation}`)}${path}${chunk}`, 0, 0));
 	}
 	if (failure.appliedPrefix.length > 0) {
-		container.addChild(new Text(theme.fg("warning", `applied before failure ${failure.appliedPrefix.length}`), 0, 0));
-		if (run) {
-			const operations = failure.appliedPrefix.map((change) => patch.operations[change.index]!);
-			renderConfirmedOperationDiffs(container, operations, run, theme, context);
-		} else {
-			for (const change of failure.appliedPrefix) {
-				container.addChild(new Text(resultPathLine(change, theme, context), 0, 0));
-			}
+		container.addChild(new Spacer(1));
+		container.addChild(new Text(theme.fg("success", "applied:"), 0, 0));
+		container.addChild(new Spacer(1));
+		for (const change of failure.appliedPrefix) {
+			const operation = patch.operations[change.index]!;
+			container.addChild(new Text(renderOperationRow(operation, theme, context, { confirmed: true, indent: true }), 0, 0));
+			renderOperationDiff(container, operation, context, theme);
+		}
+	}
+	const appliedIndexes = new Set(failure.appliedPrefix.map((change) => change.index));
+	const unapplied = patch.operations.filter((operation) => !appliedIndexes.has(operation.index));
+	if (unapplied.length > 0) {
+		container.addChild(new Spacer(1));
+		container.addChild(new Text(theme.fg("muted", "unapplied:"), 0, 0));
+		container.addChild(new Spacer(1));
+		for (const operation of unapplied) {
+			container.addChild(new Text(renderOperationRow(operation, theme, context, { confirmed: false, indent: true }), 0, 0));
 		}
 	}
 	if (options.expanded) {
 		container.addChild(new Spacer(1));
 		container.addChild(new Text(theme.fg("dim", text), 0, 0));
+		return container;
+	}
+	const trailing = trailingAfterFailure(text);
+	if (trailing.trim().length > 0) {
+		renderTrailing(container, trailing, false, theme, trailingCommandAfterApplyPatches(context.args.command));
 	}
 	return container;
 }
 
-export function ephemeralRunForContext(
-	runs: EphemeralPatchRuns,
-	context: PatchRenderContext,
-): EphemeralPatchRun | undefined {
-	const state = context.state as ApplyPatchRenderState;
-	if (state.ephemeralRun === undefined) state.ephemeralRun = runs.take(context.toolCallId) ?? null;
-	return state.ephemeralRun ?? undefined;
-}
-
+/** isPartial 流式回退：无 view model（tool_result 未触发）时解析文本渲染。 */
 export function renderApplyPatchResult(
-	patch: ParsedPatch,
+	patches: ParsedPatch[],
 	result: AgentToolResult<unknown>,
 	options: ToolRenderResultOptions,
 	theme: Theme,
 	context: PatchRenderContext,
-	run?: EphemeralPatchRun,
 ): Container | undefined {
 	const text = resultText(result);
-	if (!context.isError) {
-		const changes = parseSuccessfulChanges(text);
-		return changes && successMatchesPatch(patch, changes)
-			? renderSuccess(patch, changes, run, options, text, theme, context)
-			: undefined;
+	if (patches.length > 1) {
+		const sequence = parseApplyPatchResultSequence(text);
+		if (!sequence || sequence.results.length !== patches.length) return undefined;
+		const container = new Container();
+		for (const [index, parsed] of sequence.results.entries()) {
+			if (index > 0) container.addChild(new Spacer(1));
+			const patch = patches[index]!;
+			const matches = parsed.success
+				? successMatchesPatch(patch, parsed.changes)
+				: failureMatchesPatch(patch, parsed.failure);
+			if (!matches) return undefined;
+			container.addChild(parsed.success
+				? renderSuccess(patch, parsed.changes, options, parsed.text, theme, context)
+				: renderFailure(patch, parsed.failure, options, parsed.text, theme, context));
+		}
+		if (sequence.trailing.trim().length > 0) {
+			renderTrailing(container, sequence.trailing, options.expanded, theme, trailingCommandAfterApplyPatches(context.args.command));
+		}
+		return container;
 	}
+	const patch = patches[0];
+	if (!patch) return undefined;
+	// 失败识别不依赖 isError：apply_patch 失败后后续命令（echo/cat 等）可能让 bash
+	// 整体 exit 0（isError=false），但 CLI 失败 JSON 仍是事实，必须渲染失败 UI。
 	const failure = parseApplyPatchFailure(text);
-	return failure && failureMatchesPatch(patch, failure)
-		? renderFailure(patch, failure, run, options, text, theme, context)
+	if (failure && failureMatchesPatch(patch, failure)) {
+		return renderFailure(patch, failure, options, text, theme, context);
+	}
+	if (context.isError) return undefined;
+	const changes = parseSuccessfulChanges(text);
+	return changes && successMatchesPatch(patch, changes)
+		? renderSuccess(patch, changes, options, text, theme, context)
 		: undefined;
 }

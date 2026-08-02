@@ -5,12 +5,18 @@ export type PatchLine = {
 	text: string;
 };
 
+export type PatchChunk = {
+	index: number;
+	lines: PatchLine[];
+};
+
 export type PatchOperation = {
 	index: number;
 	kind: "add" | "delete" | "update";
 	path: string;
 	destination?: string;
 	lines: PatchLine[];
+	chunks?: PatchChunk[];
 };
 
 export type ParsedPatch = {
@@ -64,47 +70,56 @@ function parseOperationHeader(line: string): { kind: PatchOperation["kind"]; pat
 function parseAddOperation(lines: string[], start: number, index: number, path: string) {
 	const patchLines: PatchLine[] = [];
 	let cursor = start;
-	while (cursor < lines.length - 1 && !OPERATION_HEADER.test(lines[cursor] ?? "")) {
+	while (cursor < lines.length && lines[cursor] !== "*** End Patch" && !OPERATION_HEADER.test(lines[cursor] ?? "")) {
 		const line = lines[cursor] ?? "";
-		if (!line.startsWith("+")) return undefined;
-		patchLines.push({ prefix: "+", text: line.slice(1) });
+		if (line.startsWith("+")) patchLines.push({ prefix: "+", text: line.slice(1) });
 		cursor += 1;
 	}
-	if (patchLines.length === 0) return undefined;
 	return { operation: { index, kind: "add" as const, path, lines: patchLines }, cursor };
 }
 
 function parseUpdateOperation(lines: string[], start: number, index: number, path: string) {
 	const patchLines: PatchLine[] = [];
+	const chunks: PatchChunk[] = [];
 	let cursor = start;
+	let chunkLines: PatchLine[] | undefined;
 	let destination: string | undefined;
 	if ((lines[cursor] ?? "").startsWith("*** Move to: ")) {
-		destination = (lines[cursor] ?? "").slice("*** Move to: ".length);
-		if (destination.length === 0 || destination !== destination.trim()) return undefined;
+		const candidate = (lines[cursor] ?? "").slice("*** Move to: ".length);
+		if (candidate.length > 0 && candidate === candidate.trim()) destination = candidate;
 		cursor += 1;
 	}
-	while (cursor < lines.length - 1 && !OPERATION_HEADER.test(lines[cursor] ?? "")) {
+	while (cursor < lines.length && lines[cursor] !== "*** End Patch" && !OPERATION_HEADER.test(lines[cursor] ?? "")) {
 		const line = lines[cursor] ?? "";
-		if (line === "@@" || line.startsWith("@@ ") || line === "*** End of File") {
+		if (line === "@@" || line.startsWith("@@ ")) {
+			if (chunkLines !== undefined) chunks.push({ index: chunks.length, lines: chunkLines });
+			chunkLines = [];
 			cursor += 1;
 			continue;
 		}
-		if (line.length === 0 || ![" ", "+", "-"].includes(line[0] ?? "")) return undefined;
-		patchLines.push({ prefix: line[0] as PatchLine["prefix"], text: line.slice(1) });
+		if (line !== "*** End of File" && line.length > 0 && [" ", "+", "-"].includes(line[0] ?? "")) {
+			const patchLine = { prefix: line[0] as PatchLine["prefix"], text: line.slice(1) };
+			patchLines.push(patchLine);
+			chunkLines ??= [];
+			chunkLines.push(patchLine);
+		}
 		cursor += 1;
 	}
-	if (!destination && !patchLines.some((line) => line.prefix !== " ")) return undefined;
-	return { operation: { index, kind: "update" as const, path, destination, lines: patchLines }, cursor };
+	if (chunkLines !== undefined) chunks.push({ index: chunks.length, lines: chunkLines });
+	return { operation: { index, kind: "update" as const, path, destination, lines: patchLines, chunks }, cursor };
 }
 
 function parsePatchEnvelope(source: string): ParsedPatch | undefined {
 	const lines = normalizeLines(source);
-	if (lines[0] !== "*** Begin Patch" || lines.at(-1) !== "*** End Patch") return undefined;
+	if (lines[0] !== "*** Begin Patch") return undefined;
 	const operations: PatchOperation[] = [];
 	let cursor = 1;
-	while (cursor < lines.length - 1) {
+	while (cursor < lines.length && lines[cursor] !== "*** End Patch") {
 		const header = parseOperationHeader(lines[cursor] ?? "");
-		if (!header) return undefined;
+		if (!header) {
+			cursor += 1;
+			continue;
+		}
 		if (header.kind === "delete") {
 			operations.push({ index: operations.length, kind: "delete", path: header.path, lines: [] });
 			cursor += 1;
@@ -121,18 +136,21 @@ function parsePatchEnvelope(source: string): ParsedPatch | undefined {
 }
 
 function resolveWorkingDirectory(command: string, initialCwd: string): string {
-	const lines = normalizeLines(command);
-	for (const line of lines) {
-		const match = line.match(/^[ \t]*cd[ \t]+(\S+)[ \t]*&&/);
-		if (match) return path.resolve(initialCwd, match[1]);
+	// 取第一个 apply_patch 调用行之前的最后一个 cd（支持行首与 && 链中的 cd）。
+	// 例：`rm -rf X && printf ... && cd Y && apply_patch <<'PATCH'` → Y。
+	let resolved = initialCwd;
+	for (const line of normalizeLines(command)) {
+		const cd = line.match(/(?:^|&&)[ \t]*cd[ \t]+(\S+)/);
+		if (cd) resolved = path.resolve(resolved, cd[1]);
+		if (/(?:^[ \t]*apply_patch[ \t]+|[ \t]*&&[ \t]*apply_patch[ \t]+)<</.test(line)) break;
 	}
-	return initialCwd;
+	return resolved;
 }
 
-export function parseApplyPatches(command: string, initialCwd: string): { patch: ParsedPatch; cwd: string }[] {
+export function parseApplyPatches(command: string, initialCwd: string): { patch: ParsedPatch; cwd: string; endLine: number }[] {
 	const cwd = resolveWorkingDirectory(command, initialCwd);
 	const lines = normalizeLines(command);
-	const patches: { patch: ParsedPatch; cwd: string }[] = [];
+	const patches: { patch: ParsedPatch; cwd: string; endLine: number }[] = [];
 	let cursor = 0;
 	while (cursor < lines.length) {
 		const line = lines[cursor] ?? "";
@@ -156,13 +174,20 @@ export function parseApplyPatches(command: string, initialCwd: string): { patch:
 		const envelope = lines.slice(cursor + 1, end).join("\n");
 		const patch = parsePatchEnvelope(envelope);
 		if (patch) {
-			patches.push({ patch, cwd });
+			patches.push({ patch, cwd, endLine: end });
 			cursor = end + 1;
 		} else {
 			cursor++;
 		}
 	}
 	return patches;
+}
+
+export function trailingCommandAfterApplyPatches(command: string): string {
+	const patches = parseApplyPatches(command, process.cwd());
+	if (patches.length === 0) return "";
+	const lastEndLine = Math.max(...patches.map((entry) => entry.endLine));
+	return normalizeLines(command).slice(lastEndLine + 1).join("\n").trim();
 }
 
 export function parseStandaloneApplyPatch(command: string): ParsedPatch | undefined {

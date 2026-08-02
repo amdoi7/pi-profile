@@ -1,4 +1,3 @@
-import type { AgentToolResult } from "@earendil-works/pi-coding-agent";
 import type { ParsedPatch, PatchOperation } from "./patch-command.ts";
 
 export type AppliedChange = {
@@ -28,6 +27,15 @@ export type SuccessfulChange = {
 	path: string;
 };
 
+export type ParsedApplyPatchResult =
+	| { success: true; changes: SuccessfulChange[]; text: string }
+	| { success: false; failure: ApplyPatchFailure; text: string };
+
+export type ParsedApplyPatchResultSequence = {
+	results: ParsedApplyPatchResult[];
+	trailing: string;
+};
+
 function normalizeLines(text: string): string[] {
 	const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 	return normalized.endsWith("\n") ? normalized.slice(0, -1).split("\n") : normalized.split("\n");
@@ -37,11 +45,39 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
 }
 
-export function resultText(result: AgentToolResult<unknown>): string {
+export function resultText(result: { content: Array<{ type: string; text?: string }> }): string {
 	return result.content
-		.filter((item): item is { type: "text"; text: string } => item.type === "text")
+		.filter((item): item is { type: "text"; text: string } => item.type === "text" && typeof item.text === "string")
 		.map((item) => item.text)
 		.join("\n");
+}
+
+export function parseElapsedSeconds(text: string): number | undefined {
+	const match = text.match(/Elapsed\s+([\d.]+)\s*s/);
+	if (!match) return undefined;
+	const seconds = Number(match[1]);
+	return Number.isFinite(seconds) ? seconds : undefined;
+}
+
+// 结果之后的后续命令输出（如 apply_patch 后的 uv run pytest），供 trailing 渲染。
+// 成功：文件列表之后的全部内容（排除 CLI 的 Elapsed 行，耗时由独立行表达）。
+// 失败：JSON 行之后的全部内容。
+const ELAPSED_LINE = /^Elapsed\s+[\d.]+\s*s$/;
+
+export function trailingAfterSuccess(text: string): string {
+	const lines = normalizeLines(text);
+	const headerIndex = lines.findIndex((line) => line === "Success. Updated the following files:");
+	if (headerIndex === -1) return "";
+	let cursor = headerIndex + 1;
+	while (cursor < lines.length && /^[AMD] .+$/.test(lines[cursor] ?? "")) cursor += 1;
+	return lines.slice(cursor).filter((line) => !ELAPSED_LINE.test(line)).join("\n");
+}
+
+export function trailingAfterFailure(text: string): string {
+	const lines = normalizeLines(text);
+	const jsonIndex = lines.findIndex((line) => line.trim().startsWith("{"));
+	if (jsonIndex === -1) return "";
+	return lines.slice(jsonIndex + 1).join("\n");
 }
 
 export function parseSuccessfulChanges(text: string): SuccessfulChange[] | undefined {
@@ -62,6 +98,30 @@ export function parseSuccessfulChanges(text: string): SuccessfulChange[] | undef
 		changes.push({ status: match[1] as SuccessfulChange["status"], path: match[2] });
 	}
 	return changes.length > 0 ? changes : undefined;
+}
+
+/** Parse consecutive apply_patch invocations at the start of one shell result. */
+export function parseApplyPatchResultSequence(text: string): ParsedApplyPatchResultSequence | undefined {
+	const lines = normalizeLines(text);
+	const results: ParsedApplyPatchResult[] = [];
+	let cursor = 0;
+	while (cursor < lines.length) {
+		const failure = parseApplyPatchFailure(lines[cursor] ?? "");
+		if (failure) {
+			results.push({ success: false, failure, text: lines[cursor] ?? "" });
+			cursor += 1;
+			continue;
+		}
+		if (lines[cursor] !== "Success. Updated the following files:") break;
+		const start = cursor;
+		cursor += 1;
+		while (cursor < lines.length && /^[AMD] .+$/.test(lines[cursor] ?? "")) cursor += 1;
+		const resultBlock = lines.slice(start, cursor).join("\n");
+		const changes = parseSuccessfulChanges(resultBlock);
+		if (!changes) return undefined;
+		results.push({ success: true, changes, text: resultBlock });
+	}
+	return results.length > 0 ? { results, trailing: lines.slice(cursor).join("\n") } : undefined;
 }
 
 function parseAppliedChange(value: unknown): AppliedChange | undefined {

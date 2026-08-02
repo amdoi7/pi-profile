@@ -34,14 +34,17 @@ async function loadRegisteredTool() {
 	const moduleUrl = `${pathToFileURL(path.join(tempToolDir, "index.ts")).href}?t=${Date.now()}`;
 	const extensionModule = await import(moduleUrl);
 	let registeredTool;
+	const handlers = {};
 	extensionModule.default({
 		registerTool(definition) {
 			registeredTool = definition;
 		},
-		on() {},
+		on(event, handler) {
+			(handlers[event] ??= []).push(handler);
+		},
 	});
 	assert.ok(registeredTool, "apply-patch-ui did not register a bash override");
-	return registeredTool;
+	return { tool: registeredTool, handlers };
 }
 
 function createTheme() {
@@ -69,6 +72,30 @@ function createContext(command, overrides = {}) {
 		isError: false,
 		...overrides,
 	};
+}
+
+async function runWithEvents(toolCallId, command, tool, handlers, { cwd = process.cwd() } = {}) {
+	// tool_call：捕获 before 快照
+	for (const handler of handlers["tool_call"] ?? []) {
+		await handler({ toolName: "bash", toolCallId, input: { command } }, { cwd, mode: "tui" });
+	}
+	const result = await tool.execute(
+		toolCallId,
+		{ command },
+		undefined,
+		undefined,
+		createExecutionContext(cwd),
+	);
+	// tool_result：注入结构化 view model
+	let details;
+	for (const handler of handlers["tool_result"] ?? []) {
+		const outcome = await handler(
+			{ toolName: "bash", toolCallId, input: { command }, content: result.content, isError: false },
+			{ cwd },
+		);
+		if (outcome?.details) details = outcome.details;
+	}
+	return { ...result, details };
 }
 
 function createExecutionContext(cwd) {
@@ -122,7 +149,7 @@ const MULTI_OPERATION_COMMAND = `apply_patch <<'PATCH'
 PATCH`;
 
 test("canonical heredoc renders compact pending operation headers", async () => {
-	const tool = await loadRegisteredTool();
+	const { tool } = await loadRegisteredTool();
 	const output = renderText(
 		tool.renderCall(
 			{ command: MULTI_OPERATION_COMMAND },
@@ -132,25 +159,25 @@ test("canonical heredoc renders compact pending operation headers", async () => 
 	);
 
 	assertAppearsInOrder(output, [
-		"apply_patch add src/new.ts",
-		"apply_patch update src/old.ts",
-		"apply_patch move src/from.ts -> src/to.ts",
-		"apply_patch delete src/dead.ts",
+		"apply_patch Add file src/new.ts",
+		"apply_patch Update file src/old.ts",
+		"apply_patch Move file src/from.ts -> src/to.ts",
+		"apply_patch Delete file src/dead.ts",
 	]);
 	assert.doesNotMatch(output, /\*\*\* Begin Patch/);
 });
 
 test("single-quoted apply_patch invocation uses the compact pending renderer", async () => {
 	const command = "apply_patch '*** Begin Patch\n*** Add File: note.txt\n+it'\\''s ready\n*** End Patch'";
-	const tool = await loadRegisteredTool();
+	const { tool } = await loadRegisteredTool();
 	const output = renderText(tool.renderCall({ command }, createTheme(), createContext(command)));
 
-	assert.match(output, /apply_patch add note\.txt/);
+	assert.match(output, /apply_patch Add file note\.txt/);
 	assert.doesNotMatch(output, /^\$ apply_patch /);
 });
 
 test("completed TUI row replaces the raw patch call with the confirmed result UI", async () => {
-	const tool = await loadRegisteredTool();
+	const { tool } = await loadRegisteredTool();
 	const row = new ToolExecutionComponent(
 		"bash",
 		"completed-row",
@@ -173,17 +200,16 @@ test("completed TUI row replaces the raw patch call with the confirmed result UI
 
 	const output = stripTerminalFormatting(row.render(120).join("\n"));
 	assertAppearsInOrder(output, [
-		"apply_patch applied 4 operations",
-		"added src/new.ts",
-		"modified src/old.ts",
-		"modified src/to.ts",
-		"deleted src/dead.ts",
+		"apply_patch Add file src/new.ts",
+		"apply_patch Update file src/old.ts",
+		"apply_patch Move file src/from.ts -> src/to.ts",
+		"apply_patch Delete file src/dead.ts",
 	]);
 	assert.doesNotMatch(output, /\$ apply_patch|\*\*\* Begin Patch/);
 });
 
 test("successful result renders confirmed affected paths", async () => {
-	const tool = await loadRegisteredTool();
+	const { tool } = await loadRegisteredTool();
 	const context = createContext(MULTI_OPERATION_COMMAND, { executionStarted: true });
 	const output = renderText(tool.renderResult(
 		{
@@ -199,16 +225,19 @@ test("successful result renders confirmed affected paths", async () => {
 	));
 
 	assertAppearsInOrder(output, [
-		"apply_patch applied 4 operations",
-		"added src/new.ts",
-		"modified src/old.ts",
-		"modified src/to.ts",
-		"deleted src/dead.ts",
+		"apply_patch Add file src/new.ts",
+		"apply_patch Update file src/old.ts",
+		"apply_patch Move file src/from.ts -> src/to.ts",
+		"apply_patch Delete file src/dead.ts",
 	]);
+	// 完成态：CLI 确认成功，patch 内容即实际变更（意图 diff）。
+	assert.match(output, /\+export const created = true;/);
+	assert.match(output, /-export const old = true;/);
+	assert.match(output, /\+export const old = false;/);
 });
 
 test("successful result followed by unrelated command output is still rendered", async () => {
-	const tool = await loadRegisteredTool();
+	const { tool } = await loadRegisteredTool();
 	const mixedOutput = "Success. Updated the following files:\nA src/new.ts\nM src/old.ts\nM src/to.ts\nD src/dead.ts\nFAILED tests/integration/test_identity_access_api.py::test_grant_admin_updates_existing_grant_and_rejects_identical_regrant\n1 failed, 1 warning in 0.71s";
 	const output = renderText(tool.renderResult(
 		{
@@ -221,13 +250,101 @@ test("successful result followed by unrelated command output is still rendered",
 	));
 
 	assertAppearsInOrder(output, [
-		"apply_patch applied 4 operations",
-		"added src/new.ts",
-		"modified src/old.ts",
-		"modified src/to.ts",
-		"deleted src/dead.ts",
+		"apply_patch Add file src/new.ts",
+		"apply_patch Update file src/old.ts",
+		"apply_patch Move file src/from.ts -> src/to.ts",
+		"apply_patch Delete file src/dead.ts",
 	]);
-	assert.doesNotMatch(output, /FAILED/);
+	// 超长行（123 字符）被 pi-tui 按宽度 wrap，断言分片段而非整行。
+	assert.match(output, /FAILED/);
+	assert.match(output, /test_identity_access_api\.py/);
+	assert.match(output, /1 failed, 1 warning in 0\.71s/);
+});
+
+test("partial result renders the apply_patch block once the complete result is recognized", async () => {
+	const { tool } = await loadRegisteredTool();
+	const mixedOutput = "Success. Updated the following files:\nA src/new.ts\nM src/old.ts\nM src/to.ts\nD src/dead.ts\n\nFAILED tests/integration/test_identity_access_api.py::test_grant_admin\n1 failed in 0.71s";
+	const output = renderText(tool.renderResult(
+		{
+			content: [{ type: "text", text: mixedOutput }],
+			details: undefined,
+		},
+		{ expanded: false, isPartial: true },
+		createTheme(),
+		createContext(MULTI_OPERATION_COMMAND, { executionStarted: true }),
+	));
+
+	assertAppearsInOrder(output, [
+		"apply_patch Add file src/new.ts",
+		"FAILED tests/integration/test_identity_access_api.py",
+	]);
+	assert.match(output, /\+export const created = true;/);
+	assert.match(output, /-export const old = true;/);
+	assert.doesNotMatch(output, /^\$ apply_patch/);
+});
+
+test("partial result with incomplete changes retains the built-in bash renderer", async () => {
+	const { tool } = await loadRegisteredTool();
+	const partialOutput = "Success. Updated the following files:\nA src/new.ts";
+	const output = renderText(tool.renderResult(
+		{
+			content: [{ type: "text", text: partialOutput }],
+			details: undefined,
+		},
+		{ expanded: false, isPartial: true },
+		createTheme(),
+		createContext(MULTI_OPERATION_COMMAND, { executionStarted: true }),
+	));
+
+	assert.match(output, /Success\. Updated the following files:/);
+	assert.doesNotMatch(output, /apply_patch applied/);
+});
+
+test("partial result collapses trailing output beyond the preview window", async () => {
+	const { tool } = await loadRegisteredTool();
+	const pytestLines = Array.from({ length: 30 }, (_, index) => `test_case_${index} passed`).join("\n");
+	const mixedOutput = `Success. Updated the following files:\nA src/new.ts\nM src/old.ts\nM src/to.ts\nD src/dead.ts\n\n${pytestLines}`;
+	const output = renderText(tool.renderResult(
+		{
+			content: [{ type: "text", text: mixedOutput }],
+			details: undefined,
+		},
+		{ expanded: false, isPartial: true },
+		createTheme(),
+		createContext(MULTI_OPERATION_COMMAND, { executionStarted: true }),
+	));
+
+	assert.match(output, /test_case_29 passed/);
+	assert.match(output, /test_case_0 passed/);
+	assert.match(output, /11 output lines hidden in middle, expand to view/);
+	assert.doesNotMatch(output, /test_case_15 passed/);
+});
+
+test("successful result omits the redundant summary for a single operation", async () => {
+	const command = `apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: src/only.ts
+@@
+-before
++after
+*** End Patch
+PATCH`;
+	const { tool } = await loadRegisteredTool();
+	const output = renderText(tool.renderResult(
+		{
+			content: [{
+				type: "text",
+				text: "Success. Updated the following files:\nM src/only.ts",
+			}],
+			details: undefined,
+		},
+		{ expanded: false, isPartial: false },
+		createTheme(),
+		createContext(command, { executionStarted: true }),
+	));
+
+	assert.match(output, /apply_patch Update file src\/only\.ts/);
+	assert.doesNotMatch(output, /applied 1 operation/);
 });
 
 test("successful result follows the CLI A-M-D grouping instead of patch order", async () => {
@@ -241,7 +358,7 @@ test("successful result follows the CLI A-M-D grouping instead of patch order", 
 +created
 *** End Patch
 PATCH`;
-	const tool = await loadRegisteredTool();
+	const { tool } = await loadRegisteredTool();
 	const output = renderText(tool.renderResult(
 		{
 			content: [{
@@ -256,10 +373,94 @@ PATCH`;
 	));
 
 	assertAppearsInOrder(output, [
-		"apply_patch applied 2 operations",
-		"added created.txt",
-		"modified existing.txt",
+		"apply_patch Add file created.txt",
+		"apply_patch Update file existing.txt",
 	]);
+});
+
+test("successful result renders elapsed time above the threshold", async () => {
+	const { tool } = await loadRegisteredTool();
+	const output = renderText(tool.renderResult(
+		{
+			content: [{
+				type: "text",
+				text: "Success. Updated the following files:\nA src/new.ts\nM src/old.ts\nM src/to.ts\nD src/dead.ts\n\nElapsed 30.1s",
+			}],
+			details: undefined,
+		},
+		{ expanded: false, isPartial: false },
+		createTheme(),
+		createContext(MULTI_OPERATION_COMMAND, { executionStarted: true }),
+	));
+
+	assertAppearsInOrder(output, [
+		"apply_patch Add file src/new.ts",
+		"elapsed 30.1s",
+	]);
+});
+
+test("successful result omits elapsed time below the threshold", async () => {
+	const { tool } = await loadRegisteredTool();
+	const output = renderText(tool.renderResult(
+		{
+			content: [{
+				type: "text",
+				text: "Success. Updated the following files:\nA src/new.ts\nM src/old.ts\nM src/to.ts\nD src/dead.ts\n\nElapsed 0.3s",
+			}],
+			details: undefined,
+		},
+		{ expanded: false, isPartial: false },
+		createTheme(),
+		createContext(MULTI_OPERATION_COMMAND, { executionStarted: true }),
+	));
+
+	assert.doesNotMatch(output, /elapsed/);
+});
+
+test("failure JSON with a successful overall exit still renders the failure UI", async () => {
+	// apply_patch 失败后后续命令（echo 等）让 bash 整体 exit 0（isError=false）：
+	// 失败 JSON 仍是事实，必须渲染失败 UI，后续输出归入 trailing。
+	const command = `cd /tmp/workspace && apply_patch <<'PATCH'
+*** Begin Patch
+*** Add File: first.txt
++first
+*** Update File: missing.txt
+@@
+-before
++after
+*** End Patch
+PATCH
+echo "exit=$?"`;
+	const failure = {
+		ok: false,
+		exitCode: 1,
+		error: {
+			code: "FILE_NOT_FOUND",
+			message: "resolve file to update missing.txt: no such file or directory",
+			hunk: { index: 1, operation: "update", path: "missing.txt" },
+		},
+		appliedPrefix: [{ index: 0, operation: "add", path: "first.txt" }],
+	};
+	const { tool } = await loadRegisteredTool();
+	const output = renderText(tool.renderResult(
+		{
+			content: [{ type: "text", text: `${JSON.stringify(failure)}\nexit=1` }],
+			details: undefined,
+		},
+		{ expanded: false, isPartial: false },
+		createTheme(),
+		createContext(command, { executionStarted: true, isError: false }),
+	));
+
+	assertAppearsInOrder(output, [
+		"apply_patch failed FILE_NOT_FOUND",
+		"applied:",
+		"apply_patch Add file first.txt",
+		"unapplied:",
+		"apply_patch Update file missing.txt",
+		"exit=1",
+	]);
+	assert.doesNotMatch(output, /"ok":false/);
 });
 
 test("failed result renders appliedPrefix and the failed hunk", async () => {
@@ -283,7 +484,7 @@ PATCH`;
 		},
 		appliedPrefix: [{ index: 0, operation: "add", path: "first.txt" }],
 	};
-	const tool = await loadRegisteredTool();
+	const { tool } = await loadRegisteredTool();
 	const output = renderText(tool.renderResult(
 		{
 			content: [{ type: "text", text: `${JSON.stringify(failure)}\n\nCommand exited with code 1` }],
@@ -298,142 +499,357 @@ PATCH`;
 		"apply_patch failed CONTEXT_NOT_FOUND",
 		"Failed to find expected lines in missing.txt",
 		"failed update missing.txt · chunk 0",
-		"applied before failure 1",
-		"added first.txt",
+		"applied:",
+		"apply_patch Add file first.txt",
+		"unapplied:",
+		"apply_patch Update file missing.txt",
 	]);
+});
+
+test("context-only update renders the locally recognized operation and chunk", async () => {
+	const command = `apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: src/context-only.ts
+@@
+ export const unchanged = true;
+*** End Patch
+PATCH`;
+	const { tool } = await loadRegisteredTool();
+	const output = renderText(tool.renderCall({ command }, createTheme(), createContext(command)));
+
+	assertAppearsInOrder(output, [
+		"apply_patch Update file src/context-only.ts",
+		"chunk 0 · no +/- lines · must contain an insertion or deletion",
+	]);
+	assert.doesNotMatch(output, /^\$ apply_patch/);
+});
+
+test("mixed update renders only the context-only chunk warning", async () => {
+	const command = `apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: src/mixed.ts
+@@
+-export const before = true;
++export const after = true;
+@@
+ export const contextOnly = true;
+*** End Patch
+PATCH`;
+	const { tool } = await loadRegisteredTool();
+	const output = renderText(tool.renderCall({ command }, createTheme(), createContext(command)));
+
+	assert.match(output, /apply_patch Update file src\/mixed\.ts 2 changed · \+1 · -1/);
+	assert.equal(output.match(/no \+\/- lines/g)?.length, 1);
+	assert.match(output, /chunk 1 · no \+\/- lines · must contain an insertion or deletion/);
+});
+
+test("context-only CLI failure uses the compact result renderer", async () => {
+	const command = `apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: src/context-only.ts
+@@
+ export const unchanged = true;
+*** End Patch
+PATCH`;
+	const failure = {
+		ok: false,
+		exitCode: 1,
+		error: {
+			code: "INVALID_PATCH",
+			message: "Invalid patch hunk on line 4: Update hunk must contain an insertion or deletion",
+			hunk: { index: 0, operation: "update", path: "src/context-only.ts", chunkIndex: 0 },
+		},
+		appliedPrefix: [],
+	};
+	const { tool } = await loadRegisteredTool();
+	const output = renderText(tool.renderResult(
+		{ content: [{ type: "text", text: JSON.stringify(failure) }], details: undefined },
+		{ expanded: false, isPartial: false },
+		createTheme(),
+		createContext(command, { executionStarted: true, isError: true }),
+	));
+
+	assertAppearsInOrder(output, [
+		"apply_patch failed INVALID_PATCH",
+		"Update hunk must contain an insertion or deletion",
+		"failed update src/context-only.ts · chunk 0",
+	]);
+	assert.doesNotMatch(output, /^\$ apply_patch/);
 });
 
 test("compound shell commands with cd prefix are recognized as apply_patch", async () => {
 	const command = `cd nested && ${MULTI_OPERATION_COMMAND}`;
-	const tool = await loadRegisteredTool();
+	const { tool } = await loadRegisteredTool();
 	const output = renderText(tool.renderCall({ command }, createTheme(), createContext(command)));
 
 	assertAppearsInOrder(output, [
-		"apply_patch add src/new.ts",
-		"apply_patch update src/old.ts",
-		"apply_patch move src/from.ts -> src/to.ts",
-		"apply_patch delete src/dead.ts",
+		"apply_patch Add file src/new.ts",
+		"apply_patch Update file src/old.ts",
+		"apply_patch Move file src/from.ts -> src/to.ts",
+		"apply_patch Delete file src/dead.ts",
 	]);
 	assert.doesNotMatch(output, /^\$ cd nested && apply_patch/);
 });
 
 test("apply_patch heredoc followed by additional shell commands is recognized", async () => {
 	const command = `${MULTI_OPERATION_COMMAND}\nuv run pytest -q`;
-	const tool = await loadRegisteredTool();
+	const { tool } = await loadRegisteredTool();
 	const output = renderText(tool.renderCall({ command }, createTheme(), createContext(command)));
 
 	assertAppearsInOrder(output, [
-		"apply_patch add src/new.ts",
-		"apply_patch update src/old.ts",
-		"apply_patch move src/from.ts -> src/to.ts",
-		"apply_patch delete src/dead.ts",
+		"apply_patch Add file src/new.ts",
+		"apply_patch Update file src/old.ts",
+		"apply_patch Move file src/from.ts -> src/to.ts",
+		"apply_patch Delete file src/dead.ts",
 	]);
 	assert.doesNotMatch(output, /uv run pytest/);
 });
 
 test("multiple apply_patch heredocs after cd prefix and trailing test command are recognized", async () => {
 	const command = `cd nested && ${MULTI_OPERATION_COMMAND}\n${MULTI_OPERATION_COMMAND}\nuv run pytest -q`;
-	const tool = await loadRegisteredTool();
+	const { tool } = await loadRegisteredTool();
 	const output = renderText(tool.renderCall({ command }, createTheme(), createContext(command)));
 
-	assert.equal(output.match(/apply_patch add/g)?.length, 2);
-	assert.equal(output.match(/apply_patch update/g)?.length, 2);
+	assert.equal(output.match(/apply_patch Add file src\/new\.ts/g)?.length, 2);
+	assert.equal(output.match(/apply_patch Update file src\/old\.ts/g)?.length, 2);
 	assert.doesNotMatch(output, /uv run pytest/);
 });
 
-test("ephemeral execution preserves the bash result and renders confirmed final line-number diff", async (t) => {
+test("multiple apply_patch results render each invocation independently", async () => {
+	const updatePatch = (file, lines) => [
+		"apply_patch <<'PATCH'",
+		"*** Begin Patch",
+		`*** Update File: ${file}`,
+		"@@",
+		...lines,
+		"*** End Patch",
+		"PATCH",
+	].join("\n");
+	const command = [
+		updatePatch("src/first.ts", [" context only"]),
+		updatePatch("src/second.ts", ["-before", "+after"]),
+		updatePatch("src/third.ts", [" context only"]),
+		"uv run pytest -q",
+	].join("\n");
+	const failures = ["src/first.ts", "src/third.ts"].map((file, index) => JSON.stringify({
+		ok: false,
+		exitCode: 1,
+		error: {
+			code: "INVALID_PATCH",
+			message: `Invalid patch hunk ${index + 1}: Update hunk must contain an insertion or deletion`,
+			hunk: { index: 0, operation: "update", path: file, chunkIndex: 0 },
+		},
+		appliedPrefix: [],
+	}));
+	const resultText = [
+		failures[0],
+		"Success. Updated the following files:",
+		"M src/second.ts",
+		failures[1],
+		"ERROR: not found: test_missing",
+		"Command exited with code 4",
+	].join("\n");
+	const { tool, handlers } = await loadRegisteredTool();
+	let details;
+	for (const handler of handlers["tool_result"] ?? []) {
+		const outcome = await handler(
+			{ toolName: "bash", toolCallId: "batch-result", input: { command }, content: [{ type: "text", text: resultText }], isError: true },
+			{ cwd: "/tmp/pi-apply-patch-ui-workspace" },
+		);
+		if (outcome?.details) details = outcome.details;
+	}
+	const output = renderText(tool.renderResult(
+		{ content: [{ type: "text", text: resultText }], details },
+		{ expanded: false, isPartial: false },
+		createTheme(),
+		createContext(command, { executionStarted: true, isError: true }),
+	));
+
+	assertAppearsInOrder(output, [
+		"failed update src/first.ts · chunk 0",
+		"Update file src/first.ts",
+		"apply_patch Update file src/second.ts · 2 changed · +1 · -1",
+		"failed update src/third.ts · chunk 0",
+		"Update file src/third.ts",
+		"ERROR: not found: test_missing",
+	]);
+	assert.doesNotMatch(output, /\{"ok":false|Success\. Updated the following files:/);
+});
+
+test("consecutive successful patches to one file render as one aggregated file result", async () => {
+	const updatePatch = (before, after) => [
+		"apply_patch <<'PATCH'",
+		"*** Begin Patch",
+		"*** Update File: src/repeated.ts",
+		"@@",
+		`-${before}`,
+		`+${after}`,
+		"*** End Patch",
+		"PATCH",
+	].join("\n");
+	const transitions = [
+		["one", "two"],
+		["two", "three"],
+		["three", "four"],
+		["four", "five"],
+		["five", "six"],
+		["six", "seven"],
+	];
+	const command = [...transitions.map(([before, after]) => updatePatch(before, after)), "npm test"].join("\n");
+	const success = "Success. Updated the following files:\nM src/repeated.ts";
+	const resultText = `${transitions.map(() => success).join("\n")}\nFAIL src/repeated.test.ts`;
+	const { tool, handlers } = await loadRegisteredTool();
+	let details;
+	for (const handler of handlers["tool_result"] ?? []) {
+		const outcome = await handler(
+			{ toolName: "bash", toolCallId: "repeated-success", input: { command }, content: [{ type: "text", text: resultText }], isError: true },
+			{ cwd: "/tmp/pi-apply-patch-ui-workspace" },
+		);
+		if (outcome?.details) details = outcome.details;
+	}
+	const output = renderText(tool.renderResult(
+		{ content: [{ type: "text", text: resultText }], details },
+		{ expanded: false, isPartial: false },
+		createTheme(),
+		createContext(command, { executionStarted: true, isError: true }),
+	));
+
+	assert.match(output, /apply_patch Update file src\/repeated\.ts · 12 changed · \+6 · -6 · 6 patches/);
+	assert.equal(output.match(/apply_patch Update file src\/repeated\.ts/g)?.length, 1);
+	assert.match(output, /FAIL src\/repeated\.test\.ts/);
+	assert.doesNotMatch(output, /Success\. Updated the following files:/);
+
+	const expanded = renderText(tool.renderResult(
+		{ content: [{ type: "text", text: resultText }], details },
+		{ expanded: true, isPartial: false },
+		createTheme(),
+		createContext(command, { executionStarted: true, isError: true, expanded: true }),
+	));
+	assert.equal(expanded.match(/apply_patch Update file src\/repeated\.ts/g)?.length, 6);
+});
+
+
+
+
+test("completed result renders concrete line numbers from the before snapshot", async (t) => {
 	const workspace = await fs.promises.mkdtemp(path.join(process.cwd(), ".apply-patch-ui-test-"));
 	t.after(() => fs.promises.rm(workspace, { recursive: true, force: true }));
-	const file = path.join(workspace, "target.ts");
-	await fs.promises.writeFile(file, "const left = oldLeft + oldRight;\nnext();\n", "utf8");
-	const relativePath = path.relative(process.cwd(), file);
-	const command = `apply_patch <<'PATCH'
+	await fs.promises.writeFile(path.join(workspace, "target.ts"), "const left = oldLeft + oldRight;\nnext();\n", "utf8");
+	const command = `cd ${workspace} && apply_patch <<'PATCH'
 *** Begin Patch
-*** Update File: ${relativePath}
+*** Update File: target.ts
 @@
 -const left = oldLeft + oldRight;
 +const left = newLeft + newRight;
 *** End Patch
 PATCH`;
-	const toolCallId = "ephemeral-final-diff";
-	const tool = await loadRegisteredTool();
+	const toolCallId = "line-number-check";
+	const { tool, handlers } = await loadRegisteredTool();
+	const result = await runWithEvents(toolCallId, command, tool, handlers);
 
-	const result = await tool.execute(
-		toolCallId,
-		{ command },
-		undefined,
-		undefined,
-		createExecutionContext(process.cwd()),
-	);
-
-	assert.deepEqual(result, {
-		content: [{
-			type: "text",
-			text: `Success. Updated the following files:\nM ${relativePath}\n`,
-		}],
-		details: undefined,
-	});
-	assert.equal(
-		await fs.promises.readFile(file, "utf8"),
-		"const left = newLeft + newRight;\nnext();\n",
-	);
-
-	const renderContext = createContext(command, { toolCallId, executionStarted: true });
 	const output = renderText(tool.renderResult(
 		result,
 		{ expanded: false, isPartial: false },
 		createTheme(),
-		renderContext,
+		createContext(command, { toolCallId, executionStarted: true }),
 	));
 	assert.match(output, /-1 const left = oldLeft \+ oldRight;/);
 	assert.match(output, /\+1 const left = newLeft \+ newRight;/);
 	assert.match(output, / 2 next\(\);/);
-
-	const rerendered = renderText(tool.renderResult(
-		result,
-		{ expanded: false, isPartial: false },
-		createTheme(),
-		renderContext,
-	));
-	assert.match(rerendered, /-1 const left = oldLeft \+ oldRight;/);
-
-	const historical = renderText(tool.renderResult(
-		result,
-		{ expanded: false, isPartial: false },
-		createTheme(),
-		createContext(command, { toolCallId, executionStarted: true }),
-	));
-	assert.match(historical, /modified .*target\.ts/);
-	assert.doesNotMatch(historical, /oldLeft|newLeft/);
 });
-
-test("ephemeral final diff maps add, move, and delete operations to their before and after paths", async (t) => {
+test("completed result labels the smallest enclosing AST control scope", async (t) => {
 	const workspace = await fs.promises.mkdtemp(path.join(process.cwd(), ".apply-patch-ui-test-"));
 	t.after(() => fs.promises.rm(workspace, { recursive: true, force: true }));
-	const relativeDir = path.relative(process.cwd(), workspace);
-	await fs.promises.writeFile(path.join(workspace, "move-from.txt"), "before\n", "utf8");
-	await fs.promises.writeFile(path.join(workspace, "delete.txt"), "dead\n", "utf8");
-	const command = `apply_patch <<'PATCH'
-*** Begin Patch
-*** Add File: ${relativeDir}/added.txt
-+created
-*** Update File: ${relativeDir}/move-from.txt
-*** Move to: ${relativeDir}/move-to.txt
-@@
--before
-+after
-*** Delete File: ${relativeDir}/delete.txt
-*** End Patch
-PATCH`;
-	const toolCallId = "ephemeral-all-operation-kinds";
-	const tool = await loadRegisteredTool();
-	const result = await tool.execute(
-		toolCallId,
-		{ command },
-		undefined,
-		undefined,
-		createExecutionContext(process.cwd()),
+	await fs.promises.writeFile(
+		path.join(workspace, "scope.ts"),
+		"function decide(value: boolean) {\n  const ready = true\n  if (value) {\n    oldCall()\n  }\n  return ready\n}\n",
+		"utf8",
 	);
+	const command = `cd ${workspace} && apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: scope.ts
+@@
+-    oldCall()
++    newCall()
+*** End Patch
+PATCH`;
+	const toolCallId = "ast-scope";
+	const { tool, handlers } = await loadRegisteredTool();
+	const result = await runWithEvents(toolCallId, command, tool, handlers);
+	const output = renderText(tool.renderResult(
+		result,
+		{ expanded: false, isPartial: false },
+		createTheme(),
+		createContext(command, { toolCallId, executionStarted: true }),
+	));
+
+	assert.match(output, /scope L3-L5 · if \(value\) \{/);
+	assert.match(output, /  2   const ready = true/);
+	assert.match(output, /  6   return ready/);
+});
+test("collapsed batch renders the final file diff instead of concatenated intermediate diffs", async (t) => {
+	const workspace = await fs.promises.mkdtemp(path.join(process.cwd(), ".apply-patch-ui-test-"));
+	t.after(() => fs.promises.rm(workspace, { recursive: true, force: true }));
+	await fs.promises.writeFile(path.join(workspace, "state.txt"), "one\n", "utf8");
+	const updatePatch = (before, after) => [
+		"apply_patch <<'PATCH'",
+		"*** Begin Patch",
+		"*** Update File: state.txt",
+		"@@",
+		`-${before}`,
+		`+${after}`,
+		"*** End Patch",
+		"PATCH",
+	].join("\n");
+	const command = `cd ${workspace} && ${updatePatch("one", "two")}\n${updatePatch("two", "three")}\nprintf 'checks done\\n'`;
+	const toolCallId = "batch-final-diff";
+	const { tool, handlers } = await loadRegisteredTool();
+	const result = await runWithEvents(toolCallId, command, tool, handlers);
+	const collapsed = renderText(tool.renderResult(
+		result,
+		{ expanded: false, isPartial: false },
+		createTheme(),
+		createContext(command, { toolCallId, executionStarted: true }),
+	));
+
+	assert.match(collapsed, /apply_patch Update file state\.txt · 2 changed · \+1 · -1 · 2 patches/);
+	assert.match(collapsed, /-1 one/);
+	assert.match(collapsed, /\+1 three/);
+	assert.doesNotMatch(collapsed, /two/);
+	assert.match(collapsed, /\$ printf/);
+	assert.match(collapsed, /checks done/);
+
+	const expanded = renderText(tool.renderResult(
+		result,
+		{ expanded: true, isPartial: false },
+		createTheme(),
+		createContext(command, { toolCallId, executionStarted: true, expanded: true }),
+	));
+	assert.match(expanded, /two/);
+});
+
+test("collapsed diffs keep two context lines around every change group", async (t) => {
+	const workspace = await fs.promises.mkdtemp(path.join(process.cwd(), ".apply-patch-ui-test-"));
+	t.after(() => fs.promises.rm(workspace, { recursive: true, force: true }));
+	const lines = Array.from({ length: 30 }, (_, i) => `line ${i}`).join("\n");
+	await fs.promises.writeFile(path.join(workspace, "big.txt"), `${lines}\n`, "utf8");
+	const command = `cd ${workspace} && apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: big.txt
+@@
+-line 0
++line zero
+@@
+-line 10
++line ten
+@@
+-line 20
++line twenty
+*** End Patch
+PATCH`;
+	const toolCallId = "diff-collapse";
+	const { tool, handlers } = await loadRegisteredTool();
+	const result = await runWithEvents(toolCallId, command, tool, handlers);
 
 	const output = renderText(tool.renderResult(
 		result,
@@ -441,67 +857,37 @@ PATCH`;
 		createTheme(),
 		createContext(command, { toolCallId, executionStarted: true }),
 	));
-	assertAppearsInOrder(output, [
-		`apply_patch add ${relativeDir}/added.txt`,
-		"+1 created",
-		`apply_patch move ${relativeDir}/move-from.txt -> ${relativeDir}/move-to.txt`,
-		"-1 before",
-		"+1 after",
-		`apply_patch delete ${relativeDir}/delete.txt`,
-		"-1 dead",
-	]);
-});
-
-test("ephemeral partial failure renders only confirmed applied-prefix diffs", async (t) => {
-	const workspace = await fs.promises.mkdtemp(path.join(process.cwd(), ".apply-patch-ui-test-"));
-	t.after(() => fs.promises.rm(workspace, { recursive: true, force: true }));
-	const relativeDir = path.relative(process.cwd(), workspace);
-	const command = `apply_patch <<'PATCH'
-*** Begin Patch
-*** Add File: ${relativeDir}/first.txt
-+first
-*** Update File: ${relativeDir}/missing.txt
-@@
--before
-+after
-*** End Patch
-PATCH`;
-	const toolCallId = "ephemeral-partial-failure";
-	const tool = await loadRegisteredTool();
-	let executionError;
-	try {
-		await tool.execute(
-			toolCallId,
-			{ command },
-			undefined,
-			undefined,
-			createExecutionContext(process.cwd()),
-		);
-	} catch (error) {
-		executionError = error;
-	}
-	assert.ok(executionError instanceof Error);
-	assert.match(executionError.message, /"code":"FILE_NOT_FOUND"/);
-	assert.match(executionError.message, /Command exited with code 1/);
-
-	const output = renderText(tool.renderResult(
-		{ content: [{ type: "text", text: executionError.message }], details: undefined },
-		{ expanded: false, isPartial: false },
-		createTheme(),
-		createContext(command, { toolCallId, executionStarted: true, isError: true }),
-	));
-	assert.match(output, /failed FILE_NOT_FOUND/);
-	assert.match(output, /applied before failure 1/);
-	assert.match(output, new RegExp(`apply_patch add ${relativeDir}/first\\.txt`));
-	assert.match(output, /\+1 first/);
-	assert.doesNotMatch(output, /\+1 after/);
+	assert.match(output, /- 1 line 0/);
+	assert.match(output, /\+ 1 line zero/);
+	assert.match(output, /  9 line 8/);
+	assert.match(output, / 10 line 9/);
+	assert.match(output, /-11 line 10/);
+	assert.match(output, /\+11 line ten/);
+	assert.match(output, / 12 line 11/);
+	assert.match(output, / 13 line 12/);
+	assert.match(output, /-21 line 20/);
+	assert.match(output, /\+21 line twenty/);
+	assert.doesNotMatch(output, /more diff lines/);
 });
 
 test("ordinary shell commands retain the built-in bash renderer", async () => {
 	const command = "printf 'ok'";
-	const tool = await loadRegisteredTool();
+	const { tool } = await loadRegisteredTool();
 	const output = renderText(tool.renderCall({ command }, createTheme(), createContext(command)));
 
 	assert.match(output, /^\$ printf/);
 	assert.doesNotMatch(output, /apply_patch applied/);
+});
+
+
+
+test("executing render clears the pending call slot", async () => {
+	const { tool } = await loadRegisteredTool();
+	const output = renderText(tool.renderCall(
+		{ command: MULTI_OPERATION_COMMAND },
+		createTheme(),
+		createContext(MULTI_OPERATION_COMMAND, { executionStarted: true }),
+	));
+	assert.doesNotMatch(output, /apply_patch 4 operations/);
+	assert.doesNotMatch(output, /^\$ apply_patch/);
 });

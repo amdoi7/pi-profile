@@ -64,8 +64,8 @@ export function renderDiffSummary(
 	theme: PreviewTheme,
 ): string {
 	if (!stats) return "";
-	const additions = Number.isFinite(stats.additions) ? stats.additions : 0;
-	const deletions = Number.isFinite(stats.deletions) ? stats.deletions : 0;
+	const additions = typeof stats.additions === "number" && Number.isFinite(stats.additions) ? stats.additions : 0;
+	const deletions = typeof stats.deletions === "number" && Number.isFinite(stats.deletions) ? stats.deletions : 0;
 	const changedLines = Number.isFinite(stats.changedLines) ? stats.changedLines : additions + deletions;
 	return [
 		theme.fg("muted", `${changedLines} changed`),
