@@ -32,7 +32,7 @@
     "./extensions/btw",
     "./extensions/session-breakdown",
     "./extensions/command-policy",
-    "./extensions/pi-sub-watch"
+    "./extensions/pi-sub-ui"
   ],
   "skills": [
     "./extensions/memory/skills",

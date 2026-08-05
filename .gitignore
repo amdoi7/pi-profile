@@ -13,6 +13,7 @@
 
 # Locally built tools
 /bin/apply_patch
+/bin/pi-sub
 
 # Runtime state, local caches, and cloned repositories
 /git/
