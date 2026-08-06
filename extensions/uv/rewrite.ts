@@ -29,12 +29,11 @@ type ShellLine = {
 
 export function getBlockedCommandMessage(command: string): string | null {
 	const segmentStart = String.raw`(?:^|\n|[;|&]{1,2})\s*`;
-	const rtkPrefix = String.raw`(?:(?:\S+/)?rtk\s+(?:proxy\s+)?)?`;
 	const commandPathPrefix = String.raw`(?:\S+/)?`;
-	const pipCommandPattern = new RegExp(String.raw`${segmentStart}${rtkPrefix}${commandPathPrefix}pip\s*(?:$|\s)`, "m");
-	const pip3CommandPattern = new RegExp(String.raw`${segmentStart}${rtkPrefix}${commandPathPrefix}pip3\s*(?:$|\s)`, "m");
-	const poetryCommandPattern = new RegExp(String.raw`${segmentStart}${rtkPrefix}${commandPathPrefix}poetry\s*(?:$|\s)`, "m");
-	const pythonPrefix = String.raw`${segmentStart}${rtkPrefix}${commandPathPrefix}python(?:3(?:\.\d+)?)?\b[^\n;|&]*`;
+	const pipCommandPattern = new RegExp(String.raw`${segmentStart}${commandPathPrefix}pip\s*(?:$|\s)`, "m");
+	const pip3CommandPattern = new RegExp(String.raw`${segmentStart}${commandPathPrefix}pip3\s*(?:$|\s)`, "m");
+	const poetryCommandPattern = new RegExp(String.raw`${segmentStart}${commandPathPrefix}poetry\s*(?:$|\s)`, "m");
+	const pythonPrefix = String.raw`${segmentStart}${commandPathPrefix}python(?:3(?:\.\d+)?)?\b[^\n;|&]*`;
 	const pythonPipPattern = new RegExp(`${pythonPrefix}(?:\\s-m\\s*pip\\b|\\s-mpip\\b)`, "m");
 	const pythonVenvPattern = new RegExp(`${pythonPrefix}(?:\\s-m\\s*venv\\b|\\s-mvenv\\b)`, "m");
 	const pythonPyCompilePattern = new RegExp(`${pythonPrefix}(?:\\s-m\\s*py_compile\\b|\\s-mpy_compile\\b)`, "m");

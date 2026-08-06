@@ -1,4 +1,3 @@
-import { computeRewriteDecision } from "../rtk/rewrite.ts";
 import { computeUvRewriteDecision, getBlockedCommandMessage } from "../uv/rewrite.ts";
 
 export type CommandDecision =
@@ -8,13 +7,11 @@ export type CommandDecision =
 
 type CommandPolicies = {
   getBlockedMessage(command: string): string | null | undefined;
-  rewriteRtk(command: string): string | null;
   rewriteUv(command: string): string | null;
 };
 
 const defaultPolicies: CommandPolicies = {
   getBlockedMessage: getBlockedCommandMessage,
-  rewriteRtk: computeRewriteDecision,
   rewriteUv: computeUvRewriteDecision,
 };
 
@@ -27,8 +24,7 @@ export function evaluateCommand(
     return { kind: "block", command: originalCommand, reason: initialBlock };
   }
 
-  const rtkCommand = policies.rewriteRtk(originalCommand) ?? originalCommand;
-  const executedCommand = policies.rewriteUv(rtkCommand) ?? rtkCommand;
+  const executedCommand = policies.rewriteUv(originalCommand) ?? originalCommand;
   const finalBlock = policies.getBlockedMessage(executedCommand);
   if (finalBlock) {
     return { kind: "block", command: executedCommand, reason: finalBlock };

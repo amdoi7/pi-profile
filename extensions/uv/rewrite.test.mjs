@@ -46,9 +46,3 @@ test("blocks Python package-manager and environment bypasses", () => {
   assert.match(getBlockedCommandMessage("python3 -m venv .venv") ?? "", /python -m venv.*disabled/);
   assert.match(getBlockedCommandMessage("python3 -m py_compile app.py") ?? "", /py_compile.*disabled/);
 });
-
-test("detects bypasses after RTK rewrite", () => {
-  assert.match(getBlockedCommandMessage("rtk pip install ruff") ?? "", /pip is disabled/);
-  assert.match(getBlockedCommandMessage("rtk proxy pip install ruff") ?? "", /pip is disabled/);
-  assert.match(getBlockedCommandMessage("rtk python -m pip install black") ?? "", /python -m pip.*disabled/);
-});

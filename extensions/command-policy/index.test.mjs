@@ -11,26 +11,21 @@ test("evaluates command policies in one explicit pipeline", () => {
       calls.push(["deny", command]);
       return null;
     },
-    rewriteRtk(command) {
-      calls.push(["rtk", command]);
-      return "python app.py && rtk cargo test";
-    },
     rewriteUv(command) {
       calls.push(["uv", command]);
-      return "uv run python app.py && rtk cargo test";
+      return "uv run python app.py && cargo test";
     },
   });
 
   assert.deepEqual(calls, [
     ["deny", "python app.py && cargo test"],
-    ["rtk", "python app.py && cargo test"],
-    ["uv", "python app.py && rtk cargo test"],
-    ["deny", "uv run python app.py && rtk cargo test"],
+    ["uv", "python app.py && cargo test"],
+    ["deny", "uv run python app.py && cargo test"],
   ]);
   assert.deepEqual(decision, {
     kind: "rewrite",
     originalCommand: "python app.py && cargo test",
-    executedCommand: "uv run python app.py && rtk cargo test",
+    executedCommand: "uv run python app.py && cargo test",
   });
 });
 
