@@ -237,6 +237,12 @@ class BtwOverlay extends Container implements Focusable {
 	private readonly onSubmitCallback: (value: string) => void;
 	private readonly onDismissCallback: () => void;
 	private _focused = false;
+	/** 距 transcript 底部的滚动行数；0 = 显示最新（底部对齐）。 */
+	private scrollOffset = 0;
+	/** 上次渲染的 transcript 行数（新内容追加时保持阅读位置）。 */
+	private lastTranscriptLength = 0;
+	/** 上次渲染的 transcript 视口高度（滚动键的翻页步长）。 */
+	private lastTranscriptHeight = 0;
 
 	get focused(): boolean {
 		return this._focused;
@@ -279,7 +285,30 @@ class BtwOverlay extends Container implements Focusable {
 			this.onDismissCallback();
 			return;
 		}
+		if (this.handleScrollInput(data)) return;
 		this.input.handleInput(data);
+	}
+
+	/** ↑/↓/PgUp/PgDn 滚动 transcript；不可滚动时返回 false（键交给输入框）。 */
+	private handleScrollInput(data: string): boolean {
+		const up = this.keybindings.matches(data, "tui.editor.cursorUp");
+		const down = this.keybindings.matches(data, "tui.editor.cursorDown");
+		const pageUp = this.keybindings.matches(data, "tui.altScreen.pageUp");
+		const pageDown = this.keybindings.matches(data, "tui.altScreen.pageDown");
+		if (!up && !down && !pageUp && !pageDown) return false;
+		const maxScroll = Math.max(0, this.lastTranscriptLength - this.lastTranscriptHeight);
+		if (maxScroll === 0) return false;
+		if (up) {
+			this.scrollOffset = Math.min(this.scrollOffset + 1, maxScroll);
+		} else if (down) {
+			this.scrollOffset = Math.max(0, this.scrollOffset - 1);
+		} else if (pageUp) {
+			this.scrollOffset = Math.min(this.scrollOffset + this.lastTranscriptHeight, maxScroll);
+		} else {
+			this.scrollOffset = Math.max(0, this.scrollOffset - this.lastTranscriptHeight);
+		}
+		this.tui.requestRender();
+		return true;
 	}
 
 	setDraft(value: string): void {
@@ -312,10 +341,22 @@ class BtwOverlay extends Container implements Focusable {
 		const transcriptHeight = Math.max(6, dialogHeight - chromeHeight);
 
 		const transcript = this.getTranscript(innerWidth, this.theme);
-		const visibleTranscript = transcript.slice(-transcriptHeight);
+		// 新内容追加时保持阅读位置：offset 随底部下移（offset=0 时跟随最新）。
+		if (this.scrollOffset > 0 && transcript.length > this.lastTranscriptLength) {
+			this.scrollOffset += transcript.length - this.lastTranscriptLength;
+		}
+		this.lastTranscriptLength = transcript.length;
+		this.lastTranscriptHeight = transcriptHeight;
+		this.scrollOffset = Math.min(this.scrollOffset, Math.max(0, transcript.length - transcriptHeight));
+		const windowEnd = transcript.length - this.scrollOffset;
+		const windowStart = Math.max(0, windowEnd - transcriptHeight);
+		const visibleTranscript = transcript.slice(windowStart, windowEnd);
 		const transcriptPadding = Math.max(0, transcriptHeight - visibleTranscript.length);
 
 		const status = this.getStatus();
+		const statusLine = this.scrollOffset > 0
+			? `${this.theme.fg("dim", `↑ ${this.scrollOffset} `)}${this.theme.fg("warning", status)}`
+			: this.theme.fg("warning", status);
 
 		const previousFocused = this.input.focused;
 		this.input.focused = false;
@@ -337,7 +378,7 @@ class BtwOverlay extends Container implements Focusable {
 		}
 
 		lines.push(this.theme.fg("borderMuted", `├${"─".repeat(innerWidth)}┤`));
-		lines.push(this.frameLine(this.theme.fg("warning", status), innerWidth));
+		lines.push(this.frameLine(statusLine, innerWidth));
 		lines.push(
 			`${this.theme.fg("borderMuted", "│")}${inputLine}${this.theme.fg("borderMuted", "│")}`,
 		);
@@ -425,7 +466,8 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const lines: string[] = [];
-		for (const item of thread.slice(-6)) {
+		// 全量 thread：overlay 内可滚动查看完整上下文（BtwOverlay 维护滚动窗口）。
+		for (const item of thread) {
 			const userText = item.question.trim().split("\n")[0];
 			lines.push(theme.fg("accent", theme.bold("You: ")) + truncateToWidth(userText, width - 5, "…"));
 			lines.push("");
