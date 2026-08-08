@@ -1,6 +1,4 @@
-import { readFileSync } from "node:fs";
-
-import { type AgentToolResult, type Theme, type ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
+import { type Theme, type ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
 import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 
 import { renderDiffSummary, renderShellCommandCall } from "../_shared/code-preview.ts";
@@ -12,32 +10,15 @@ import {
 	type FileMutationRenderItem,
 } from "../_shared/file-mutation-view.ts";
 import { renderCwdFilePathLink } from "../_shared/file-link.ts";
-import { displayDiffFromLines, generateFinalDiff } from "../_shared/final-diff.ts";
-import { operationByIndex, trailingCommandAfterApplyPatches, type ParsedPatch, type PatchOperation } from "./patch-command.ts";
+import { trailingCommandAfterApplyPatches, type ParsedPatch, type PatchOperation } from "./patch-command.ts";
 import {
-	changeMatchesOperation,
 	parseRenderedResultPayload,
 	operationKindWord,
 	type ApplyPatchUnapplied,
 	type ApplyPatchFileDiff,
 	type ApplyPatchSingleResultViewModel,
 	type ApplyPatchResultViewModel,
-	type BeforeSnapshots,
-	PATCH_DIFF_CONTEXT_LINES,
 } from "./view-model.ts";
-import {
-	failureMatchesPatch,
-	parseApplyPatchFailure,
-	parseElapsedSeconds,
-	parseSuccessfulChanges,
-	resultText,
-	successMatchesPatch,
-	trailingAfterFailure,
-	trailingAfterSuccess,
-	type ApplyPatchFailure,
-	parseApplyPatchResultSequence,
-	type SuccessfulChange,
-} from "./patch-result.ts";
 
 // 耗时显示阈值：正常本地 apply_patch 是毫秒级文件写，远低于 1s；
 // 超过 2s 说明大 patch / 慢盘 / 锁竞争，值得作为诊断信号显示（tripwire，正常流量不触发）。
@@ -53,9 +34,19 @@ export type PatchRenderContext = {
 	isError: boolean;
 	state: Record<string, unknown>;
 	lastComponent?: unknown;
-	/** execute 前捕获的 before 快照（行号 diff 用）；undefined = 未捕获（非 TUI / 未识别）。 */
-	beforeSnapshots?: BeforeSnapshots;
 };
+
+/** 从 trailing 中分离 CLI 的 Elapsed 行（耗时由独立行表达，不进 trailing 预览）。 */
+function splitElapsedLine(trailing: string): { elapsed?: number; trailing: string } {
+	const lines = trailing.split("\n");
+	const filtered = lines.filter((line) => !/^Elapsed\s+[\d.]+\s*s$/.test(line));
+	const match = trailing.match(/Elapsed\s+([\d.]+)\s*s/);
+	const seconds = match ? Number(match[1]) : NaN;
+	return {
+		elapsed: Number.isFinite(seconds) ? seconds : undefined,
+		trailing: filtered.join("\n"),
+	};
+}
 
 function operationStats(operation: PatchOperation) {
 	const additions = operation.lines.filter((line) => line.prefix === "+").length;
@@ -78,12 +69,11 @@ function renderOperationRow(
 	operation: PatchOperation,
 	theme: Theme,
 	context: PatchRenderContext,
-	options: { confirmed: boolean; indent: boolean },
+	options: { indent: boolean },
 ): string {
-	const word = theme.fg(options.confirmed ? "success" : "muted", operationKindWord(operation));
 	const parts = [
 		`${options.indent ? "  " : ""}${theme.fg("toolTitle", theme.bold("apply_patch"))}`,
-		word,
+		theme.fg("muted", operationKindWord(operation)),
 		"file",
 		renderOperationPath(operation, theme, context),
 	];
@@ -92,55 +82,15 @@ function renderOperationRow(
 	return parts.join(" ");
 }
 
-function operationIntentPreview(operation: PatchOperation): DiffPreview | undefined {
-	if (operation.lines.length === 0) return undefined;
-	return {
-		display: displayDiffFromLines(operation.lines),
-		truncated: false,
-	};
-}
-
-/**
- * 行号 diff：before 来自 execute 前快照，after 实时读取当前文件。
- * 快照缺失（渲染时文件不可读）时回退意图 diff。
- */
-function operationPreview(
-	operation: PatchOperation,
-	context: PatchRenderContext,
-): DiffPreview | undefined {
-	const snapshots = context.beforeSnapshots;
-	const beforeSnapshot = snapshots?.get(operation.path);
-	if (!beforeSnapshot || !snapshots) return operationIntentPreview(operation);
-	const afterPath = operation.destination ?? operation.path;
-	const afterSnapshot = snapshots.get(afterPath);
-	let after: string | null = null;
-	if (afterSnapshot) {
-		try {
-			after = readFileSync(afterSnapshot.absolutePath, "utf8");
-		} catch {
-			// 文件不存在（delete 目标等）：after 为 null。
-		}
-	}
-	const diff = generateFinalDiff(beforeSnapshot.before ?? "", after ?? "", PATCH_DIFF_CONTEXT_LINES);
-	if (diff.stats.changedLines === 0) return operationIntentPreview(operation);
-	return { display: diff.display, truncated: diff.truncated };
-}
-
 function operationRenderItem(
 	operation: PatchOperation,
 	theme: Theme,
 	context: PatchRenderContext,
-	options: { confirmed: boolean; indent: boolean; preview: boolean },
+	options: { indent: boolean },
 ): FileMutationRenderItem {
-	const preview = options.preview ? operationPreview(operation, context) : undefined;
-	const title = renderOperationRow(operation, theme, context, options);
-	if (!options.confirmed) {
-		return { title, outcome: "pending" };
-	}
 	return {
-		title,
-		outcome: "applied",
-		previews: preview ? [preview] : [],
+		title: renderOperationRow(operation, theme, context, options),
+		outcome: "pending",
 	};
 }
 
@@ -175,7 +125,7 @@ export function renderPendingApplyPatch(
 	const multiple = patch.operations.length > 1;
 	for (const operation of patch.operations) {
 		appendFileMutationBatch(container, [
-			operationRenderItem(operation, theme, context, { confirmed: false, indent: multiple, preview: false }),
+			operationRenderItem(operation, theme, context, { indent: multiple }),
 		], theme);
 		for (const chunk of operation.chunks ?? []) {
 			if (chunk.lines.some((line) => line.prefix === "+" || line.prefix === "-")) continue;
@@ -376,8 +326,15 @@ export function renderResultViewModel(
 	} else {
 		renderSingleResultViewModel(container, viewModel, options, theme, context);
 	}
-	if (viewModel.trailing.trim().length > 0) {
-		renderTrailing(container, viewModel.trailing, options.expanded, theme, trailingCommandAfterApplyPatches(context.args.command));
+	// 耗时独立行（CLI 的 Elapsed）只对成功结果展示；失败/批量的 trailing 原样保留。
+	const trailingInfo = viewModel.kind === "apply-patch-result" && viewModel.success
+		? splitElapsedLine(viewModel.trailing)
+		: { elapsed: undefined, trailing: viewModel.trailing };
+	if (trailingInfo.elapsed !== undefined && trailingInfo.elapsed > ELAPSED_SHOW_THRESHOLD_S) {
+		container.addChild(new Text(theme.fg("muted", `elapsed ${trailingInfo.elapsed.toFixed(1)}s`), 0, 0));
+	}
+	if (trailingInfo.trailing.trim().length > 0) {
+		renderTrailing(container, trailingInfo.trailing, options.expanded, theme, trailingCommandAfterApplyPatches(context.args.command));
 	}
 	return container;
 }
@@ -386,156 +343,3 @@ export function parseRenderedResultPayloadFromDetails(details: unknown): ApplyPa
 	return parseRenderedResultPayload(details);
 }
 
-// ============================================================================
-// isPartial 流式回退：text 解析渲染（bash 长尾期间及时显示）
-// ============================================================================
-
-function renderSuccess(
-	patch: ParsedPatch,
-	changes: SuccessfulChange[],
-	options: ToolRenderResultOptions,
-	text: string,
-	theme: Theme,
-	context: PatchRenderContext,
-): Container {
-	const container = new Container();
-	const multiple = patch.operations.length > 1;
-	const items: FileMutationRenderItem[] = [];
-	for (const change of changes) {
-		const operation = patch.operations.find((op) => changeMatchesOperation(change, op));
-		if (!operation) continue;
-		items.push(operationRenderItem(operation, theme, context, { confirmed: true, indent: multiple, preview: true }));
-	}
-	appendFileMutationBatch(container, items, theme);
-	if (options.expanded) {
-		container.addChild(new Spacer(1));
-		container.addChild(new Text(theme.fg("dim", text), 0, 0));
-		return container;
-	}
-	const elapsed = parseElapsedSeconds(text);
-	if (elapsed !== undefined && elapsed > ELAPSED_SHOW_THRESHOLD_S) {
-		container.addChild(new Text(theme.fg("muted", `elapsed ${elapsed.toFixed(1)}s`), 0, 0));
-	}
-	const trailing = trailingAfterSuccess(text);
-	if (trailing.trim().length > 0) {
-		renderTrailing(container, trailing, false, theme, trailingCommandAfterApplyPatches(context.args.command));
-	}
-	return container;
-}
-
-function renderFailure(
-	patch: ParsedPatch,
-	failure: ApplyPatchFailure,
-	options: ToolRenderResultOptions,
-	text: string,
-	theme: Theme,
-	context: PatchRenderContext,
-): Container {
-	const container = new Container();
-	container.addChild(new Text(
-		`${theme.fg("toolTitle", theme.bold("apply_patch"))} ${theme.fg("error", `failed ${failure.error.code}`)}`,
-		0,
-		0,
-	));
-	container.addChild(new Text(theme.fg("error", failure.error.message), 0, 0));
-	const hunk = failure.error.hunk;
-	if (hunk) {
-		const operation = hunk.operation ?? "operation";
-		const path = hunk.path ? ` ${renderCwdFilePathLink(hunk.path, hunk.path, context.cwd, theme)}` : "";
-		const chunk = hunk.chunkIndex === undefined ? "" : ` ${theme.fg("muted", `· chunk ${hunk.chunkIndex}`)}`;
-		container.addChild(new Text(`${theme.fg("error", `failed ${operation}`)}${path}${chunk}`, 0, 0));
-	}
-	if (failure.appliedPrefix.length > 0) {
-		container.addChild(new Spacer(1));
-		container.addChild(new Text(theme.fg("success", "applied:"), 0, 0));
-		container.addChild(new Spacer(1));
-		appendFileMutationBatch(
-			container,
-			failure.appliedPrefix.map((change) => operationRenderItem(
-				operationByIndex(patch, change.index)!,
-				theme,
-				context,
-				{ confirmed: true, indent: true, preview: true },
-			)),
-			theme,
-		);
-	}
-	if (failure.skipped.length > 0) {
-		container.addChild(new Spacer(1));
-		container.addChild(new Text(theme.fg("error", "skipped:"), 0, 0));
-		container.addChild(new Spacer(1));
-		for (const skip of failure.skipped) {
-			const operation = skip.operation ? `${skip.operation[0]!.toUpperCase()}${skip.operation.slice(1)}` : "Operation";
-			const path = skip.path ? ` ${renderCwdFilePathLink(skip.path, skip.path, context.cwd, theme)}` : "";
-			container.addChild(new Text(`  ${theme.fg("error", `${operation} file`)}${path}`, 0, 0));
-			container.addChild(new Text(`    ${theme.fg("muted", skip.message)}`, 0, 0));
-		}
-	}
-	const appliedIndexes = new Set(failure.appliedPrefix.map((change) => change.index));
-	const skippedIndexes = new Set(failure.skipped.map((skip) => skip.index));
-	const unapplied = patch.operations.filter(
-		(operation) => !appliedIndexes.has(operation.index) && !skippedIndexes.has(operation.index),
-	);
-	if (unapplied.length > 0) {
-		container.addChild(new Spacer(1));
-		container.addChild(new Text(theme.fg("muted", "unapplied:"), 0, 0));
-		container.addChild(new Spacer(1));
-		for (const operation of unapplied) {
-			container.addChild(new Text(renderOperationRow(operation, theme, context, { confirmed: false, indent: true }), 0, 0));
-		}
-	}
-	if (options.expanded) {
-		container.addChild(new Spacer(1));
-		container.addChild(new Text(theme.fg("dim", text), 0, 0));
-		return container;
-	}
-	const trailing = trailingAfterFailure(text);
-	if (trailing.trim().length > 0) {
-		renderTrailing(container, trailing, false, theme, trailingCommandAfterApplyPatches(context.args.command));
-	}
-	return container;
-}
-
-/** isPartial 流式回退：无 view model（tool_result 未触发）时解析文本渲染。 */
-export function renderApplyPatchResult(
-	patches: ParsedPatch[],
-	result: AgentToolResult<unknown>,
-	options: ToolRenderResultOptions,
-	theme: Theme,
-	context: PatchRenderContext,
-): Container | undefined {
-	const text = resultText(result);
-	if (patches.length > 1) {
-		const sequence = parseApplyPatchResultSequence(text);
-		if (!sequence || sequence.results.length !== patches.length) return undefined;
-		const container = new Container();
-		for (const [index, parsed] of sequence.results.entries()) {
-			if (index > 0) container.addChild(new Spacer(1));
-			const patch = patches[index]!;
-			const matches = parsed.success
-				? successMatchesPatch(patch, parsed.changes)
-				: failureMatchesPatch(patch, parsed.failure);
-			if (!matches) return undefined;
-			container.addChild(parsed.success
-				? renderSuccess(patch, parsed.changes, options, parsed.text, theme, context)
-				: renderFailure(patch, parsed.failure, options, parsed.text, theme, context));
-		}
-		if (sequence.trailing.trim().length > 0) {
-			renderTrailing(container, sequence.trailing, options.expanded, theme, trailingCommandAfterApplyPatches(context.args.command));
-		}
-		return container;
-	}
-	const patch = patches[0];
-	if (!patch) return undefined;
-	// 失败识别不依赖 isError：apply_patch 失败后后续命令（echo/cat 等）可能让 bash
-	// 整体 exit 0（isError=false），但 CLI 失败 JSON 仍是事实，必须渲染失败 UI。
-	const failure = parseApplyPatchFailure(text);
-	if (failure && failureMatchesPatch(patch, failure)) {
-		return renderFailure(patch, failure, options, text, theme, context);
-	}
-	if (context.isError) return undefined;
-	const changes = parseSuccessfulChanges(text);
-	return changes && successMatchesPatch(patch, changes)
-		? renderSuccess(patch, changes, options, text, theme, context)
-		: undefined;
-}

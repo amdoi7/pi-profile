@@ -1,4 +1,4 @@
-import test from "node:test";
+import { test as baseTest } from "vitest";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -14,16 +14,42 @@ import {
 	resolvePiPackageDir,
 } from "../test-helpers/runtime-paths.mjs";
 
-const sourceDir = extensionDir("apply-patch-ui");
+const sourceDir = extensionDir("bash-ui");
 const piPackageDir = resolvePiPackageDir("@earendil-works/pi-coding-agent");
 const { ToolExecutionComponent } = await import(packageFileUrl(piPackageDir, "dist/index.js"));
 const { initTheme } = await import(packageFileUrl(piPackageDir, "dist/modes/interactive/theme/theme.js"));
 initTheme("dark");
 
+/**
+ * 扩展副本目录单例：所有测试共享（内容只读），进程退出时同步清理。
+ * 曾为每次 loadRegisteredTool 新建目录且从不删除，测试运行后在 /tmp 堆积。
+ */
+let sharedExtensionRoot = null;
+
+/** 临时工作区 fixture：测试结束（含断言失败）自动清理，杜绝 /tmp 残留。 */
+const test = baseTest.extend({
+	temp: async ({}, use) => {
+		const temp = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-bash-ui-temp-"));
+		try {
+			await use(temp);
+		} finally {
+			await fs.promises.rm(temp, { recursive: true, force: true });
+		}
+	},
+});
+
 async function loadRegisteredTool() {
-	const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-apply-patch-ui-"));
-	const tempExtensionDir = path.join(tempRoot, "extension");
-	const tempToolDir = path.join(tempExtensionDir, "apply-patch-ui");
+	if (!sharedExtensionRoot) {
+		sharedExtensionRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-bash-ui-"));
+		process.on("exit", () => {
+			if (sharedExtensionRoot) {
+				fs.rmSync(sharedExtensionRoot, { recursive: true, force: true });
+			}
+		});
+	}
+	const temp = sharedExtensionRoot;
+	const tempExtensionDir = path.join(temp, "extension");
+	const tempToolDir = path.join(tempExtensionDir, "bash-ui");
 	await fs.promises.cp(sourceDir, tempToolDir, { recursive: true });
 	await copySharedFiles(path.join(tempExtensionDir, "_shared"), [
 		"code-preview.ts",
@@ -48,7 +74,7 @@ async function loadRegisteredTool() {
 			(handlers[event] ??= []).push(handler);
 		},
 	});
-	assert.ok(registeredTool, "apply-patch-ui did not register a bash override");
+	assert.ok(registeredTool, "bash-ui did not register a bash override");
 	return { tool: registeredTool, handlers };
 }
 
@@ -68,7 +94,7 @@ function createContext(command, overrides = {}) {
 		invalidate() {},
 		lastComponent: undefined,
 		state: {},
-		cwd: "/tmp/pi-apply-patch-ui-workspace",
+		cwd: "/tmp/pi-bash-ui-workspace",
 		executionStarted: false,
 		argsComplete: true,
 		isPartial: true,
@@ -110,7 +136,7 @@ function createExecutionContext(cwd) {
 		model: undefined,
 		thinkingLevel: undefined,
 		sessionManager: {
-			getSessionId: () => "apply-patch-ui-test",
+			getSessionId: () => "bash-ui-test",
 			getSessionFile: () => undefined,
 		},
 	};
@@ -190,7 +216,7 @@ test("completed TUI row replaces the raw patch call with the confirmed result UI
 		{ showImages: false },
 		tool,
 		{ requestRender() {} },
-		"/tmp/pi-apply-patch-ui-workspace",
+		"/tmp/pi-bash-ui-workspace",
 	);
 	row.setArgsComplete();
 	row.markExecutionStarted();
@@ -425,7 +451,7 @@ test("successful result omits elapsed time below the threshold", async () => {
 test("failure JSON with a successful overall exit still renders the failure UI", async () => {
 	// apply_patch 失败后后续命令（echo 等）让 bash 整体 exit 0（isError=false）：
 	// 失败 JSON 仍是事实，必须渲染失败 UI，后续输出归入 trailing。
-	const command = `cd /tmp/workspace && apply_patch <<'PATCH'
+	const command = `cd /tmp/temp && apply_patch <<'PATCH'
 *** Begin Patch
 *** Add File: first.txt
 +first
@@ -462,7 +488,7 @@ echo "exit=$?"`;
 		"applied:",
 		"apply_patch Add file first.txt",
 		"unapplied:",
-		"apply_patch Update file missing.txt",
+		"Update file missing.txt",
 		"exit=1",
 	]);
 	assert.doesNotMatch(output, /"ok":false/);
@@ -507,7 +533,7 @@ PATCH`;
 		"applied:",
 		"apply_patch Add file first.txt",
 		"unapplied:",
-		"apply_patch Update file missing.txt",
+		"Update file missing.txt",
 	]);
 });
 
@@ -659,7 +685,7 @@ test("multiple apply_patch results render each invocation independently", async 
 	for (const handler of handlers["tool_result"] ?? []) {
 		const outcome = await handler(
 			{ toolName: "bash", toolCallId: "batch-result", input: { command }, content: [{ type: "text", text: resultText }], isError: true },
-			{ cwd: "/tmp/pi-apply-patch-ui-workspace" },
+			{ cwd: "/tmp/pi-bash-ui-workspace" },
 		);
 		if (outcome?.details) details = outcome.details;
 	}
@@ -708,7 +734,7 @@ test("consecutive successful patches to one file render as one aggregated file r
 	for (const handler of handlers["tool_result"] ?? []) {
 		const outcome = await handler(
 			{ toolName: "bash", toolCallId: "repeated-success", input: { command }, content: [{ type: "text", text: resultText }], isError: true },
-			{ cwd: "/tmp/pi-apply-patch-ui-workspace" },
+			{ cwd: "/tmp/pi-bash-ui-workspace" },
 		);
 		if (outcome?.details) details = outcome.details;
 	}
@@ -736,11 +762,9 @@ test("consecutive successful patches to one file render as one aggregated file r
 
 
 
-test("completed result renders concrete line numbers from the before snapshot", async (t) => {
-	const workspace = await fs.promises.mkdtemp(path.join(process.cwd(), ".apply-patch-ui-test-"));
-	t.after(() => fs.promises.rm(workspace, { recursive: true, force: true }));
-	await fs.promises.writeFile(path.join(workspace, "target.ts"), "const left = oldLeft + oldRight;\nnext();\n", "utf8");
-	const command = `cd ${workspace} && apply_patch <<'PATCH'
+test("completed result renders concrete line numbers from the before snapshot", async ({ temp }) => {
+	await fs.promises.writeFile(path.join(temp, "target.ts"), "const left = oldLeft + oldRight;\nnext();\n", "utf8");
+	const command = `cd ${temp} && apply_patch <<'PATCH'
 *** Begin Patch
 *** Update File: target.ts
 @@
@@ -767,12 +791,10 @@ PATCH`;
 	assert.match(output, / 2 2 │ next\(\);/);
 });
 
-test("completed result keeps old and new context coordinates after inserted lines", async (t) => {
-	const workspace = await fs.promises.mkdtemp(path.join(process.cwd(), ".apply-patch-ui-test-"));
-	t.after(() => fs.promises.rm(workspace, { recursive: true, force: true }));
+test("completed result keeps old and new context coordinates after inserted lines", async ({ temp }) => {
 	const source = ["stems = values", "rows = [", "{", "}", ...Array.from({ length: 8 }, (_, index) => `tail${index + 1}`)].join("\n") + "\n";
-	await fs.promises.writeFile(path.join(workspace, "target.py"), source, "utf8");
-	const command = `cd ${workspace} && apply_patch <<'PATCH'
+	await fs.promises.writeFile(path.join(temp, "target.py"), source, "utf8");
+	const command = `cd ${temp} && apply_patch <<'PATCH'
 *** Begin Patch
 *** Update File: target.py
 @@
@@ -799,10 +821,8 @@ PATCH`;
 	assert.match(output, /\.\.\. 8 unchanged lines omitted/);
 });
 
-test("batch renders the final located diff in collapsed and expanded views", async (t) => {
-	const workspace = await fs.promises.mkdtemp(path.join(process.cwd(), ".apply-patch-ui-test-"));
-	t.after(() => fs.promises.rm(workspace, { recursive: true, force: true }));
-	await fs.promises.writeFile(path.join(workspace, "state.txt"), "one\n", "utf8");
+test("batch renders the final located diff in collapsed and expanded views", async ({ temp }) => {
+	await fs.promises.writeFile(path.join(temp, "state.txt"), "one\n", "utf8");
 	const updatePatch = (before, after) => [
 		"apply_patch <<'PATCH'",
 		"*** Begin Patch",
@@ -813,7 +833,7 @@ test("batch renders the final located diff in collapsed and expanded views", asy
 		"*** End Patch",
 		"PATCH",
 	].join("\n");
-	const command = `cd ${workspace} && ${updatePatch("one", "two")}\n${updatePatch("two", "three")}\nprintf 'checks done\\n'`;
+	const command = `cd ${temp} && ${updatePatch("one", "two")}\n${updatePatch("two", "three")}\nprintf 'checks done\\n'`;
 	const toolCallId = "batch-final-diff";
 	const { tool, handlers } = await loadRegisteredTool();
 	const result = await runWithEvents(toolCallId, command, tool, handlers);
@@ -842,12 +862,10 @@ test("batch renders the final located diff in collapsed and expanded views", asy
 	assert.doesNotMatch(expanded, /two/);
 });
 
-test("collapsed diffs keep two context lines around every change group", async (t) => {
-	const workspace = await fs.promises.mkdtemp(path.join(process.cwd(), ".apply-patch-ui-test-"));
-	t.after(() => fs.promises.rm(workspace, { recursive: true, force: true }));
+test("collapsed diffs keep two context lines around every change group", async ({ temp }) => {
 	const lines = Array.from({ length: 30 }, (_, i) => `line ${i}`).join("\n");
-	await fs.promises.writeFile(path.join(workspace, "big.txt"), `${lines}\n`, "utf8");
-	const command = `cd ${workspace} && apply_patch <<'PATCH'
+	await fs.promises.writeFile(path.join(temp, "big.txt"), `${lines}\n`, "utf8");
+	const command = `cd ${temp} && apply_patch <<'PATCH'
 *** Begin Patch
 *** Update File: big.txt
 @@
@@ -921,9 +939,8 @@ async function buildDetailsViaHandlers(toolCallId, command, handlers, text, { cw
 	return details;
 }
 
-test("delete followed by add of the same file renders a single rewrite", async () => {
-	const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-apply-patch-rewrite-"));
-	await fs.promises.writeFile(path.join(tempRoot, "a.txt"), "old content\n");
+test("delete followed by add of the same file renders a single rewrite", async ({ temp }) => {
+	await fs.promises.writeFile(path.join(temp, "a.txt"), "old content\n");
 	const command = `apply_patch <<'PATCH'
 *** Begin Patch
 *** Delete File: a.txt
@@ -933,7 +950,7 @@ test("delete followed by add of the same file renders a single rewrite", async (
 PATCH`;
 	const { tool, handlers } = await loadRegisteredTool();
 	const details = await buildDetailsViaHandlers("rewrite-call", command, handlers,
-		"Success. Updated the following files:\nD a.txt\nA a.txt", { cwd: tempRoot });
+		"Success. Updated the following files:\nD a.txt\nA a.txt", { cwd: temp });
 	const output = renderText(tool.renderResult(
 		{ content: [{ type: "text", text: "Success. Updated the following files:\nD a.txt\nA a.txt" }], details, isError: false },
 		{ expanded: false, isPartial: false },
@@ -943,7 +960,6 @@ PATCH`;
 
 	assert.match(output, /apply_patch Rewrite file a\.txt/);
 	assert.equal(output.match(/apply_patch (?:Delete|Add) file a\.txt/g)?.length ?? 0, 0);
-	await fs.promises.rm(tempRoot, { recursive: true, force: true });
 });
 
 test("failure appliedPrefix renders engine content without before snapshots", async () => {
@@ -976,7 +992,7 @@ PATCH`;
 	for (const handler of handlers["tool_result"] ?? []) {
 		const outcome = await handler(
 			{ toolName: "bash", toolCallId: "content-call", input: { command }, content: [{ type: "text", text: JSON.stringify(failure) }], isError: true },
-			{ cwd: "/tmp/pi-apply-patch-ui-workspace" },
+			{ cwd: "/tmp/pi-bash-ui-workspace" },
 		);
 		if (outcome?.details) details = outcome.details;
 	}
@@ -996,9 +1012,8 @@ PATCH`;
 	]);
 });
 
-test("failure path merges delete and add of the same file into one rewrite", async () => {
-	const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-apply-patch-rewrite-fail-"));
-	await fs.promises.writeFile(path.join(tempRoot, "a.txt"), "old content\n");
+test("failure path merges delete and add of the same file into one rewrite", async ({ temp }) => {
+	await fs.promises.writeFile(path.join(temp, "a.txt"), "old content\n");
 	const command = `apply_patch <<'PATCH'
 *** Begin Patch
 *** Delete File: a.txt
@@ -1020,7 +1035,7 @@ PATCH`;
 		],
 	};
 	const { tool, handlers } = await loadRegisteredTool();
-	const details = await buildDetailsViaHandlers("rewrite-fail-call", command, handlers, JSON.stringify(failure), { cwd: tempRoot, isError: true });
+	const details = await buildDetailsViaHandlers("rewrite-fail-call", command, handlers, JSON.stringify(failure), { cwd: temp, isError: true });
 	const output = renderText(tool.renderResult(
 		{ content: [{ type: "text", text: JSON.stringify(failure) }], details, isError: true },
 		{ expanded: false, isPartial: false },
@@ -1030,7 +1045,6 @@ PATCH`;
 
 	assert.match(output, /apply_patch Rewrite file a\.txt/);
 	assert.equal(output.match(/apply_patch (?:Delete|Add) file a\.txt/g)?.length ?? 0, 0);
-	await fs.promises.rm(tempRoot, { recursive: true, force: true });
 });
 
 test("failure renders skipped operations with reasons", async () => {
@@ -1072,7 +1086,7 @@ PATCH`;
 	for (const handler of handlers["tool_result"] ?? []) {
 		const outcome = await handler(
 			{ toolName: "bash", toolCallId: "skipped-call", input: { command }, content: [{ type: "text", text: JSON.stringify(failure) }], isError: true },
-			{ cwd: "/tmp/pi-apply-patch-ui-workspace" },
+			{ cwd: "/tmp/pi-bash-ui-workspace" },
 		);
 		if (outcome?.details) details = outcome.details;
 	}
@@ -1131,7 +1145,7 @@ PATCH`;
 		command,
 		handlers,
 		JSON.stringify(failure),
-		{ cwd: "/tmp/pi-apply-patch-ui-workspace", isError: true },
+		{ cwd: "/tmp/pi-bash-ui-workspace", isError: true },
 	);
 	const output = renderText(tool.renderResult(
 		{ content: [{ type: "text", text: JSON.stringify(failure) }], details, isError: true },
@@ -1151,9 +1165,8 @@ PATCH`;
 	assert.doesNotMatch(output, /\"ok\":false/);
 });
 
-test("context mismatch renders expected vs actual lines when expanded", async () => {
-	const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-apply-patch-mismatch-"));
-	await fs.promises.writeFile(path.join(tempRoot, "a.txt"), "actual line one\nactual line two\n");
+test("context mismatch renders expected vs actual lines when expanded", async ({ temp }) => {
+	await fs.promises.writeFile(path.join(temp, "a.txt"), "actual line one\nactual line two\n");
 	const command = `apply_patch <<'PATCH'
 *** Begin Patch
 *** Update File: a.txt
@@ -1173,7 +1186,7 @@ PATCH`;
 		appliedPrefix: [],
 	};
 	const { tool, handlers } = await loadRegisteredTool();
-	const details = await buildDetailsViaHandlers("mismatch-call", command, handlers, JSON.stringify(failure), { cwd: tempRoot, isError: true });
+	const details = await buildDetailsViaHandlers("mismatch-call", command, handlers, JSON.stringify(failure), { cwd: temp, isError: true });
 	const output = renderText(tool.renderResult(
 		{ content: [{ type: "text", text: JSON.stringify(failure) }], details, isError: true },
 		{ expanded: true, isPartial: false },
@@ -1188,12 +1201,10 @@ PATCH`;
 		"actual:",
 		"actual line one",
 	]);
-	await fs.promises.rm(tempRoot, { recursive: true, force: true });
 });
 
-test("batch delete then add across invocations merges into one rewrite", async () => {
-	const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-apply-patch-batch-rewrite-"));
-	await fs.promises.writeFile(path.join(tempRoot, "a.txt"), "old\n");
+test("batch delete then add across invocations merges into one rewrite", async ({ temp }) => {
+	await fs.promises.writeFile(path.join(temp, "a.txt"), "old\n");
 	const command = `apply_patch <<'PATCH1'
 *** Begin Patch
 *** Delete File: a.txt
@@ -1207,7 +1218,7 @@ apply_patch <<'PATCH2'
 PATCH2`;
 	const text = "Success. Updated the following files:\nD a.txt\nSuccess. Updated the following files:\nA a.txt";
 	const { tool, handlers } = await loadRegisteredTool();
-	const details = await buildDetailsViaHandlers("batch-rewrite-call", command, handlers, text, { cwd: tempRoot });
+	const details = await buildDetailsViaHandlers("batch-rewrite-call", command, handlers, text, { cwd: temp });
 	const output = renderText(tool.renderResult(
 		{ content: [{ type: "text", text }], details, isError: false },
 		{ expanded: false, isPartial: false },
@@ -1217,5 +1228,95 @@ PATCH2`;
 
 	assert.match(output, /apply_patch Rewrite file a\.txt/);
 	assert.equal(output.match(/apply_patch (?:Delete|Add) file a\.txt/g)?.length ?? 0, 0);
-	await fs.promises.rm(tempRoot, { recursive: true, force: true });
+});
+
+test("multi-chunk single-file patch builds a structured result (CLI dedups per file)", async ({ temp }) => {
+	await fs.promises.writeFile(path.join(temp, "chunks.ts"), "first();\nsecond();\nthird();\n", "utf8");
+	const command = `cd ${temp} && apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: chunks.ts
+@@
+-first();
++firstChanged();
+@@
+-third();
++thirdChanged();
+*** End Patch
+PATCH`;
+	const toolCallId = "multi-chunk-single-file";
+	const { tool, handlers } = await loadRegisteredTool();
+	const result = await runWithEvents(toolCallId, command, tool, handlers);
+	assert.ok(result.details, "tool_result 应注入结构化 view model");
+
+	const output = renderText(tool.renderResult(
+		result,
+		{ expanded: false, isPartial: false },
+		createTheme(),
+		createContext(command, { toolCallId, executionStarted: true }),
+	));
+	assert.equal(output.match(/apply_patch Update file chunks\.ts/g)?.length, 1);
+	assert.match(output, /-1   │ first\(\);/);
+	assert.match(output, /\+  1 │ firstChanged\(\);/);
+	assert.match(output, /-3   │ third\(\);/);
+	assert.match(output, /\+  3 │ thirdChanged\(\);/);
+	assert.doesNotMatch(output, /Success\. Updated the following files:/);
+});
+
+test("streaming renders the patch once and reuses the cached view model on later chunks", async ({ temp }) => {
+	await fs.promises.writeFile(path.join(temp, "stream.ts"), "oldValue;\n", "utf8");
+	const command = `cd ${temp} && apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: stream.ts
+@@
+-oldValue;
++newValue;
+*** End Patch
+PATCH`;
+	const toolCallId = "stream-cache";
+	const { tool, handlers } = await loadRegisteredTool();
+	for (const handler of handlers["tool_call"] ?? []) {
+		await handler({ toolName: "bash", toolCallId, input: { command } }, { cwd: temp, mode: "tui" });
+	}
+	const context = createContext(command, { toolCallId, executionStarted: true, isPartial: true });
+
+	const first = renderText(tool.renderResult(
+		{ content: [{ type: "text", text: "Success. Updated the following files:\nM stream.ts" }], details: undefined },
+		{ expanded: false, isPartial: true },
+		createTheme(),
+		context,
+	));
+	assert.match(first, /apply_patch Update file stream\.ts/);
+	assert.match(first, /-\s+│ oldValue;/);
+
+	// 长尾命令副作用改写了文件：缓存视图不得重读文件（diff 保持构建时的状态）。
+	await fs.promises.writeFile(path.join(temp, "stream.ts"), "rewrittenByTailCommand;\n", "utf8");
+
+	const second = renderText(tool.renderResult(
+		{ content: [{ type: "text", text: "Success. Updated the following files:\nM stream.ts\n\npytest 1 passed" }], details: undefined },
+		{ expanded: false, isPartial: true },
+		createTheme(),
+		context,
+	));
+	assert.match(second, /-\s+│ oldValue;/);
+	assert.doesNotMatch(second, /rewrittenByTailCommand/);
+	assert.match(second, /pytest 1 passed/);
+
+	// tool_result 复用流式缓存（不重建、不重读），trailing 用完整输出刷新。
+	let details;
+	for (const handler of handlers["tool_result"] ?? []) {
+		const outcome = await handler(
+			{ toolName: "bash", toolCallId, input: { command }, content: [{ type: "text", text: "Success. Updated the following files:\nM stream.ts\n\npytest 1 passed" }], isError: false },
+			{ cwd: temp },
+		);
+		if (outcome?.details) details = outcome.details;
+	}
+	const completed = renderText(tool.renderResult(
+		{ content: [{ type: "text", text: "Success. Updated the following files:\nM stream.ts\n\npytest 1 passed" }], details },
+		{ expanded: false, isPartial: false },
+		createTheme(),
+		context,
+	));
+	assert.match(completed, /-\s+│ oldValue;/);
+	assert.doesNotMatch(completed, /rewrittenByTailCommand/);
+	assert.match(completed, /pytest 1 passed/);
 });

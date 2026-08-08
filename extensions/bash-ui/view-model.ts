@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateHead } from "@earendil-works/pi-coding-agent";
 import type { ChangeStats, DisplayDiff } from "../_shared/final-diff.ts";
@@ -17,6 +18,66 @@ import {
 
 /** execute 前捕获的 before 快照（行号 diff 用）；before=null 表示文件不存在。 */
 export type BeforeSnapshots = Map<string, { absolutePath: string; before: string | null }>;
+
+/** 执行后文件内容缓存：absolutePath -> 当前内容（读取失败为 null）。每路径只读一次。 */
+type AfterContents = Map<string, string | null>;
+
+/** 同一 (before, after) 对的 diff 缓存：多 operation 命中同一文件时只算一次。 */
+type DiffCache = Map<string, BuiltFileDiff>;
+
+type BuiltFileDiff = Pick<
+	ApplyPatchFileDiff,
+	"changeStats" | "diffDisplay" | "diffTruncated"
+>;
+
+/** 需要读取 after 内容的绝对路径（按快照去重，每路径一次）。 */
+function collectAfterTargets(
+	patches: ParsedPatch[],
+	before: BeforeSnapshots | undefined,
+): { absolutePath: string }[] {
+	const targets = new Map<string, { absolutePath: string }>();
+	if (!before) return [];
+	for (const patch of patches) {
+		for (const operation of patch.operations) {
+			const afterPath = operation.destination ?? operation.path;
+			const snapshot = before.get(afterPath);
+			if (snapshot && !targets.has(snapshot.absolutePath)) targets.set(snapshot.absolutePath, snapshot);
+		}
+	}
+	return [...targets.values()];
+}
+
+async function collectAfterContentsAsync(
+	patches: ParsedPatch[],
+	before: BeforeSnapshots | undefined,
+): Promise<AfterContents> {
+	const contents: AfterContents = new Map();
+	for (const { absolutePath } of collectAfterTargets(patches, before)) {
+		try {
+			contents.set(absolutePath, await readFile(absolutePath, "utf8"));
+		} catch {
+			// 文件不存在（delete 目标等）：after 为 null。
+			contents.set(absolutePath, null);
+		}
+	}
+	return contents;
+}
+
+/** 流式渲染路径用：同步读取（首次成功解析时一次性，渲染路径不做重复 IO）。 */
+function collectAfterContentsSync(
+	patches: ParsedPatch[],
+	before: BeforeSnapshots | undefined,
+): AfterContents {
+	const contents: AfterContents = new Map();
+	for (const { absolutePath } of collectAfterTargets(patches, before)) {
+		try {
+			contents.set(absolutePath, readFileSync(absolutePath, "utf8"));
+		} catch {
+			contents.set(absolutePath, null);
+		}
+	}
+	return contents;
+}
 
 export const PATCH_DIFF_CONTEXT_LINES = 2;
 
@@ -201,16 +262,13 @@ export function changeMatchesOperation(change: SuccessfulChange, operation: Patc
 	return status === change.status && (operation.destination ?? operation.path) === change.path;
 }
 
-type BuiltFileDiff = Pick<
-	ApplyPatchFileDiff,
-	"changeStats" | "diffDisplay" | "diffTruncated"
->;
-
-async function buildFileDiff(
+function buildFileDiff(
 	before: BeforeSnapshots | undefined,
 	operation: PatchOperation,
+	afterContents: AfterContents,
+	diffCache: DiffCache,
 	content?: AppliedChange,
-): Promise<BuiltFileDiff | undefined> {
+): BuiltFileDiff | undefined {
 	if (content?.oldContent !== undefined && content.newContent !== undefined) {
 		const diff = generateFinalDiff(content.oldContent, content.newContent, PATCH_DIFF_CONTEXT_LINES);
 		if (diff.stats.changedLines === 0) return undefined;
@@ -222,24 +280,21 @@ async function buildFileDiff(
 	}
 	const beforeSnapshot = before?.get(operation.path);
 	if (!beforeSnapshot) return undefined;
-	if (!before) return undefined;
 	const afterPath = operation.destination ?? operation.path;
 	const afterSnapshot = before.get(afterPath);
-	let after: string | null = null;
-	if (afterSnapshot) {
-		try {
-			after = await readFile(afterSnapshot.absolutePath, "utf8");
-		} catch {
-			// 文件不存在（delete 目标等）：after 为 null。
-		}
-	}
-	const diff = generateFinalDiff(beforeSnapshot.before ?? "", after ?? "", PATCH_DIFF_CONTEXT_LINES);
+	if (!afterSnapshot) return undefined;
+	const absolutePath = afterSnapshot.absolutePath;
+	const cached = diffCache.get(absolutePath);
+	if (cached) return cached;
+	const diff = generateFinalDiff(beforeSnapshot.before ?? "", afterContents.get(absolutePath) ?? null, PATCH_DIFF_CONTEXT_LINES);
 	if (diff.stats.changedLines === 0) return undefined;
-	return {
+	const built: BuiltFileDiff = {
 		changeStats: diff.stats,
 		diffDisplay: diff.display,
 		diffTruncated: diff.truncated,
 	};
+	diffCache.set(absolutePath, built);
+	return built;
 }
 
 /** delete 后第一个同 path 的 add 是重写配对（引擎按序应用）。 */
@@ -253,28 +308,44 @@ function findRewritePartner(operations: PatchOperation[], start: number): number
 	return undefined;
 }
 
-async function buildRewriteFileDiff(
+function buildRewriteFileDiff(
 	before: BeforeSnapshots | undefined,
 	deleteOp: PatchOperation,
 	addOp: PatchOperation,
-): Promise<ApplyPatchFileDiff> {
+	afterContents: AfterContents,
+	diffCache: DiffCache,
+): ApplyPatchFileDiff {
 	const oldSnapshot = before?.get(deleteOp.path);
 	const oldContent = oldSnapshot?.before ?? "";
-	let after: string | null = null;
+	let built: BuiltFileDiff;
 	if (oldSnapshot) {
-		try {
-			after = await readFile(oldSnapshot.absolutePath, "utf8");
-		} catch {
-			// 文件不存在：after 为 null。
+		const absolutePath = oldSnapshot.absolutePath;
+		const cached = diffCache.get(absolutePath);
+		if (cached) {
+			built = cached;
+		} else {
+			const diff = generateFinalDiff(oldContent, afterContents.get(absolutePath) ?? null, PATCH_DIFF_CONTEXT_LINES);
+			built = {
+				changeStats: diff.stats,
+				diffDisplay: diff.display,
+				diffTruncated: diff.truncated,
+			};
+			if (diff.stats.changedLines > 0) diffCache.set(absolutePath, built);
 		}
+	} else {
+		const diff = generateFinalDiff(oldContent, "", PATCH_DIFF_CONTEXT_LINES);
+		built = {
+			changeStats: diff.stats,
+			diffDisplay: diff.display,
+			diffTruncated: diff.truncated,
+		};
 	}
-	const diff = generateFinalDiff(oldContent, after ?? "", PATCH_DIFF_CONTEXT_LINES);
 	return {
 		kind: "Rewrite",
 		path: addOp.path,
-		changeStats: diff.stats,
-		diffDisplay: diff.display,
-		diffTruncated: diff.truncated,
+		changeStats: built.changeStats,
+		diffDisplay: built.diffDisplay,
+		diffTruncated: built.diffTruncated,
 	};
 }
 
@@ -294,27 +365,60 @@ function fileDiffOf(
 	};
 }
 
-async function buildSingleResultViewModel(
+/**
+ * CLI 报告顺序：success 输出按文件行列出（一个文件一行，可能异于 patch 顺序），
+ * 视图模型按该顺序渲染；rewrite 条目位于其 D/A 行中更靠前的位置。
+ */
+function reorderFilesByChanges(files: ApplyPatchFileDiff[], changes: SuccessfulChange[]): void {
+	const changeOrder = new Map<string, number>();
+	changes.forEach((change, index) => {
+		const key = `${change.status} ${change.path}`;
+		if (!changeOrder.has(key)) changeOrder.set(key, index);
+	});
+	const position = (file: ApplyPatchFileDiff): number => {
+		if (file.kind === "Rewrite") {
+			const add = changeOrder.get(`A ${file.path}`);
+			const del = changeOrder.get(`D ${file.path}`);
+			if (add === undefined && del === undefined) return Number.MAX_SAFE_INTEGER;
+			return Math.min(add ?? Number.MAX_SAFE_INTEGER, del ?? Number.MAX_SAFE_INTEGER);
+		}
+		// Move 的 CLI 行是目标路径（M <destination>），与其余类型一致按展示路径排序。
+		const displayPath = file.destination ?? file.path;
+		const status = file.kind === "Add" ? "A" : file.kind === "Delete" ? "D" : "M";
+		return changeOrder.get(`${status} ${displayPath}`) ?? Number.MAX_SAFE_INTEGER;
+	};
+	files.sort((a, b) => position(a) - position(b));
+}
+
+function buildSingleResultViewModel(
 	patch: ParsedPatch,
 	parsed: ParsedApplyPatchResult,
 	before: BeforeSnapshots | undefined,
-): Promise<ApplyPatchSingleResultViewModel | undefined> {
+	afterContents: AfterContents,
+	diffCache: DiffCache,
+): ApplyPatchSingleResultViewModel | undefined {
 	if (parsed.success) {
 		if (!successMatchesPatch(patch, parsed.changes)) return undefined;
 		const files: ApplyPatchFileDiff[] = [];
 		const used = new Set<number>();
+		const partners = new Map<number, number>();
+		for (let i = 0; i < patch.operations.length; i++) {
+			const partner = findRewritePartner(patch.operations, i);
+			if (partner !== undefined) partners.set(i, partner);
+		}
 		for (let i = 0; i < patch.operations.length; i++) {
 			if (used.has(i)) continue;
 			const operation = patch.operations[i]!;
-			const partner = findRewritePartner(patch.operations, i);
+			const partner = partners.get(i);
 			if (partner !== undefined) {
 				used.add(i);
 				used.add(partner);
-				files.push(await buildRewriteFileDiff(before, operation, patch.operations[partner]!));
+				files.push(buildRewriteFileDiff(before, operation, patch.operations[partner]!, afterContents, diffCache));
 				continue;
 			}
-			files.push(fileDiffOf(operation, await buildFileDiff(before, operation)));
+			files.push(fileDiffOf(operation, buildFileDiff(before, operation, afterContents, diffCache)));
 		}
+		reorderFilesByChanges(files, parsed.changes);
 		return { kind: "apply-patch-result", success: true, files, trailing: "" };
 	}
 	const failure = parsed.failure;
@@ -324,7 +428,7 @@ async function buildSingleResultViewModel(
 	for (const change of failure.appliedPrefix) {
 		const operation = operationByIndex(patch, change.index);
 		if (!operation) return undefined;
-		appliedDiffs.set(change.index, fileDiffOf(operation, await buildFileDiff(before, operation, change)));
+		appliedDiffs.set(change.index, fileDiffOf(operation, buildFileDiff(before, operation, afterContents, diffCache, change)));
 	}
 	const used = new Set<number>();
 	for (const change of failure.appliedPrefix) {
@@ -337,7 +441,7 @@ async function buildSingleResultViewModel(
 				used.add(partner.index);
 				const deleteOp = operationByIndex(patch, change.index)!;
 				const addOp = operationByIndex(patch, partner.index)!;
-				applied.push(await buildRewriteFileDiff(before, deleteOp, addOp));
+				applied.push(buildRewriteFileDiff(before, deleteOp, addOp, afterContents, diffCache));
 				continue;
 			}
 		}
@@ -402,10 +506,12 @@ type BatchGroup =
 	| { kind: Exclude<ApplyPatchFileDiff["kind"], "Rewrite">; operation: PatchOperation; patchCount: number }
 	| { kind: "Rewrite"; deleteOp: PatchOperation; addOp: PatchOperation; patchCount: number };
 
-async function buildBatchFinalFiles(
+function buildBatchFinalFiles(
 	patches: ParsedPatch[],
 	before: BeforeSnapshots | undefined,
-): Promise<ApplyPatchBatchFileDiff[] | undefined> {
+	afterContents: AfterContents,
+	diffCache: DiffCache,
+): ApplyPatchBatchFileDiff[] | undefined {
 	if (!before) return undefined;
 	const grouped = new Map<string, BatchGroup>();
 	for (const patch of patches) {
@@ -433,11 +539,11 @@ async function buildBatchFinalFiles(
 	const files: ApplyPatchBatchFileDiff[] = [];
 	for (const group of grouped.values()) {
 		if (group.kind === "Rewrite") {
-			const diff = await buildRewriteFileDiff(before, group.deleteOp, group.addOp);
+			const diff = buildRewriteFileDiff(before, group.deleteOp, group.addOp, afterContents, diffCache);
 			files.push({ ...diff, patchCount: group.patchCount });
 			continue;
 		}
-		const diff = await buildFileDiff(before, group.operation);
+		const diff = buildFileDiff(before, group.operation, afterContents, diffCache);
 		if (!diff) return undefined;
 		files.push({ ...fileDiffOf(group.operation, diff), patchCount: group.patchCount });
 	}
@@ -469,16 +575,40 @@ export async function buildResultViewModel(
 	const text = resultText(result);
 	const parsed = parseApplyPatchResultSequence(text);
 	if (!parsed || parsed.results.length !== patches.length) return undefined;
+	const afterContents = await collectAfterContentsAsync(patches, before);
+	return buildResultViewModelCore(patches, parsed, before, afterContents);
+}
+
+/** 流式渲染路径的同步构建：首次成功解析时调用一次（渲染路径不做重复 IO/diff）。 */
+export function buildResultViewModelSync(
+	patches: ParsedPatch[],
+	result: { content: Array<{ type: string; text?: string }>; isError?: boolean },
+	before: BeforeSnapshots | undefined,
+): ApplyPatchResultViewModel | undefined {
+	const text = resultText(result);
+	const parsed = parseApplyPatchResultSequence(text);
+	if (!parsed || parsed.results.length !== patches.length) return undefined;
+	const afterContents = collectAfterContentsSync(patches, before);
+	return buildResultViewModelCore(patches, parsed, before, afterContents);
+}
+
+function buildResultViewModelCore(
+	patches: ParsedPatch[],
+	parsed: ParsedApplyPatchResultSequence,
+	before: BeforeSnapshots | undefined,
+	afterContents: AfterContents,
+): ApplyPatchResultViewModel | undefined {
 	const snapshot = patches.length === 1 ? before : undefined;
+	const diffCache: DiffCache = new Map();
 	const results: ApplyPatchSingleResultViewModel[] = [];
 	for (const [index, patch] of patches.entries()) {
-		const single = await buildSingleResultViewModel(patch, parsed.results[index]!, snapshot);
+		const single = buildSingleResultViewModel(patch, parsed.results[index]!, snapshot, afterContents, diffCache);
 		if (!single) return undefined;
 		results.push(single);
 	}
 	if (results.length === 1) return { ...results[0]!, trailing: parsed.trailing };
 	const finalFiles = results.every((entry) => entry.success)
-		? await buildBatchFinalFiles(patches, before)
+		? buildBatchFinalFiles(patches, before, afterContents, diffCache)
 		: undefined;
 	return { kind: "apply-patch-batch-result", results, finalFiles, trailing: parsed.trailing };
 }

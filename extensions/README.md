@@ -14,7 +14,7 @@
 ### Tool ownership
 
 - `edit/` — grouped exact edits；按文件分组，单文件原子，多文件隔离，并与 built-in `write` 共用 SDK file mutation queue。
-- `apply-patch-ui/` — `bash` adapter；pending call 保持 builtin bash 渲染；只为 canonical standalone `apply_patch` 提供 ephemeral before/after snapshots 与 CLI-confirmed grouped final diff；原样委托 command execution，不改 CLI stdout/stderr/exit code 或 tool result contract。
+- `bash-ui/` — `bash` 工具通用 UI：普通命令 fish 式语义高亮（theme syntax token + 命令存在性检查）；canonical standalone `apply_patch` 语法作为特例走 patch 视图（ephemeral before/after snapshots 与 CLI-confirmed grouped final diff）；原样委托 command execution，不改 CLI stdout/stderr/exit code 或 tool result contract。
 - `command-policy/` — `bash` / `run_experiment` 的唯一 `tool_call` mutation owner；依次执行 uv Python normalization 与 package-manager deny。
 - `uv/` — uv/Python pure rewrite 与 deny policy；不再直接注册 runtime hook。
 

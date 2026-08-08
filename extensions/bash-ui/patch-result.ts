@@ -63,34 +63,6 @@ export function resultText(result: { content: Array<{ type: string; text?: strin
 		.join("\n");
 }
 
-export function parseElapsedSeconds(text: string): number | undefined {
-	const match = text.match(/Elapsed\s+([\d.]+)\s*s/);
-	if (!match) return undefined;
-	const seconds = Number(match[1]);
-	return Number.isFinite(seconds) ? seconds : undefined;
-}
-
-// 结果之后的后续命令输出（如 apply_patch 后的 uv run pytest），供 trailing 渲染。
-// 成功：文件列表之后的全部内容（排除 CLI 的 Elapsed 行，耗时由独立行表达）。
-// 失败：JSON 行之后的全部内容。
-const ELAPSED_LINE = /^Elapsed\s+[\d.]+\s*s$/;
-
-export function trailingAfterSuccess(text: string): string {
-	const lines = normalizeLines(text);
-	const headerIndex = lines.findIndex((line) => line === "Success. Updated the following files:");
-	if (headerIndex === -1) return "";
-	let cursor = headerIndex + 1;
-	while (cursor < lines.length && /^[AMD] .+$/.test(lines[cursor] ?? "")) cursor += 1;
-	return lines.slice(cursor).filter((line) => !ELAPSED_LINE.test(line)).join("\n");
-}
-
-export function trailingAfterFailure(text: string): string {
-	const lines = normalizeLines(text);
-	const jsonIndex = lines.findIndex((line) => line.trim().startsWith("{"));
-	if (jsonIndex === -1) return "";
-	return lines.slice(jsonIndex + 1).join("\n");
-}
-
 export function parseSuccessfulChanges(text: string): SuccessfulChange[] | undefined {
 	const lines = normalizeLines(text);
 	const changes: SuccessfulChange[] = [];
@@ -209,18 +181,20 @@ function expectedSuccessfulChange(operation: PatchOperation): SuccessfulChange {
 	};
 }
 
+/**
+ * CLI 按文件去重输出：一个文件的多 chunk 修改只打一行（如 `M module.ts`）。
+ * 因此按 (status, path) 去重集合匹配，而不是按 operation 一一对应。
+ */
 export function successMatchesPatch(patch: ParsedPatch, changes: SuccessfulChange[]): boolean {
-	const expected = patch.operations.map(expectedSuccessfulChange);
-	if (expected.length !== changes.length) return false;
-	const remaining = [...expected];
+	const expected = new Set(patch.operations.map((operation) => {
+		const change = expectedSuccessfulChange(operation);
+		return `${change.status} ${change.path}`;
+	}));
+	if (expected.size !== changes.length) return false;
 	for (const change of changes) {
-		const index = remaining.findIndex(
-			(c) => c.status === change.status && c.path === change.path,
-		);
-		if (index === -1) return false;
-		remaining.splice(index, 1);
+		if (!expected.has(`${change.status} ${change.path}`)) return false;
 	}
-	return remaining.length === 0;
+	return true;
 }
 
 function appliedChangeMatchesPatch(patch: ParsedPatch, change: AppliedChange): boolean {
