@@ -1,5 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "vitest";
 import { createGitStatusCache } from "./custom-footer-git.ts";
+import customFooterExtension from "./index.ts";
 
 describe("custom footer git status cache", () => {
   test("reuses cached git status while TTL is valid and mtimes are unchanged", () => {
@@ -84,5 +85,51 @@ describe("custom footer git status cache", () => {
     expect(readGitStatus("/plain")).toBeNull();
 
     expect(resolveGitDirCalls).toBe(2);
+  });
+});
+
+describe("custom footer extension statusline", () => {
+  test("renders extension statuses in the statusline", async () => {
+    const handlers = new Map<string, (event: unknown, ctx: any) => unknown>();
+    const pi = {
+      getThinkingLevel: () => "high",
+      on(event: string, handler: (event: unknown, ctx: any) => unknown) {
+        handlers.set(event, handler);
+      },
+    };
+    customFooterExtension(pi as never);
+
+    let footerFactory: any;
+    const ctx = {
+      getContextUsage: () => undefined,
+      model: { id: "test-model" },
+      sessionManager: {
+        getCwd: () => "/tmp",
+        getEntries: () => [],
+      },
+      ui: {
+        setFooter(factory: unknown) {
+          footerFactory = factory;
+        },
+      },
+    };
+    await handlers.get("session_start")?.({ reason: "startup" }, ctx);
+
+    const footer = footerFactory(
+      { requestRender() {} },
+      { fg: (_name: string, text: string) => text },
+      {
+        getExtensionStatuses: () => new Map([["pi-sub", "review running\nimpl queued"]]),
+        onBranchChange: () => () => {},
+      },
+    );
+
+    expect(footer.render(120)).toEqual([
+      "cwd: /tmp │ [test-model · think:high]",
+      "ctx: ? ? │ $0.00",
+      "review running",
+      "impl queued",
+    ]);
+    footer.dispose();
   });
 });

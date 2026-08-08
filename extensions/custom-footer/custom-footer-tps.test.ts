@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "vitest";
 import { createTpsTracker } from "./custom-footer-tps.ts";
 
 describe("custom footer tps tracker", () => {

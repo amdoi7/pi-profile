@@ -1,44 +1,45 @@
 /**
  * Custom Footer Extension - Enhanced status bar
  *
- * Displays: ctx used, ctx %, cost, elapsed, cwd, git branch, model
+ * Displays: ctx used, ctx %, cost, cwd, git branch, provider/model
  * Color-coded context usage: green <50%, yellow 50-75%, red >75%
+ *
+ * Ownership: lifecycle + data access live here; presentation (formatting,
+ * layout) lives in custom-footer-format.ts and is unit-tested there.
  */
 
+import { homedir } from "node:os";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth } from "@earendil-works/pi-tui";
-import { createGitStatusCache, type GitStatusSnapshot } from "./custom-footer-git.ts";
+import { truncateToWidth, type TUI } from "@earendil-works/pi-tui";
+import { createGitStatusCache } from "./custom-footer-git.ts";
 import { createTpsTracker } from "./custom-footer-tps.ts";
-
-function formatGitStatusSegment(
-	theme: { fg(name: string, text: string): string },
-	status: GitStatusSnapshot | null,
-): string {
-	if (status === null) {
-		return "";
-	}
-
-	const marker = status.dirtyCount > 0 ? theme.fg("warning", "*") : "";
-	const extras: string[] = [];
-	if (status.ahead > 0) {
-		extras.push(theme.fg("thinkingText", `↑${status.ahead}`));
-	}
-	if (status.behind > 0) {
-		extras.push(theme.fg("thinkingText", `↓${status.behind}`));
-	}
-	if (status.dirtyCount > 0) {
-		extras.push(theme.fg("thinkingText", `!${status.dirtyCount}`));
-	}
-
-	const suffix = extras.length > 0 ? ` ${extras.join(" ")}` : "";
-	return `${theme.fg("text", `⎇ ${status.branch}`)}${marker}${suffix}`;
-}
+import {
+	computeSessionCost,
+	computeTokenFlow,
+	extensionStatusLines,
+	formatCwd,
+	formatGitSegment,
+	formatModel,
+	formatProviderOnly,
+	formatTokenStats,
+	formatUsageLine,
+	layoutFooter,
+} from "./custom-footer-format.ts";
+import {
+	createUsageFetcher,
+	detectUsageProvider,
+	type ProviderUsageFetcher,
+	type UsageProviderName,
+} from "./custom-footer-usage.ts";
 
 export default function (pi: ExtensionAPI) {
 	let sessionStart = Date.now();
+	let footerTui: TUI | null = null;
 	const readGitStatus = createGitStatusCache();
 	const readTps = createTpsTracker();
+
+	pi.on("thinking_level_select", () => footerTui?.requestRender());
 
 	pi.on("message_start", async (event, ctx) => {
 		if (event.message.role !== "assistant") return;
@@ -49,25 +50,8 @@ export default function (pi: ExtensionAPI) {
 		if (event.message.role !== "assistant") return;
 		const m = event.message as AssistantMessage;
 		readTps.onMessageEnd(ctx.sessionManager.getCwd(), m.usage?.output ?? 0);
+		footerTui?.requestRender();
 	});
-
-	function formatElapsed(ms: number): string {
-		const s = Math.floor(ms / 1000);
-		if (s < 60) return `${s}s`;
-		const m = Math.floor(s / 60);
-		const rs = s % 60;
-		if (m < 60) return `${m}m${rs > 0 ? rs + "s" : ""}`;
-		const h = Math.floor(m / 60);
-		const rm = m % 60;
-		return `${h}h${rm > 0 ? rm + "m" : ""}`;
-	}
-
-	function fmt(n: number): string {
-		if (n < 1000) return `${n}`;
-		if (n < 1_000_000) return `${Math.round(n / 1000)}k`;
-		const millions = n / 1_000_000;
-		return `${Number.isInteger(millions) ? millions.toFixed(0) : millions.toFixed(1)}M`;
-	}
 
 	pi.on("session_start", async (event, ctx) => {
 		if (event.reason === "startup" || event.reason === "new") {
@@ -75,93 +59,73 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		ctx.ui.setFooter((tui, theme, footerData) => {
+			footerTui = tui;
 			const unsub = footerData.onBranchChange(() => tui.requestRender());
 			const timer = setInterval(() => tui.requestRender(), 30000);
+			let usageProvider: UsageProviderName = null;
+			let usageFetcher: ProviderUsageFetcher | null = null;
+			// The usage line follows the current model's provider: only subscription
+			// providers (claude/codex/kimi) show it; pay-as-you-go providers (e.g.
+			// deepseek) hide it even when other accounts have credentials.
+			const ensureUsageFetcher = (provider: UsageProviderName): ProviderUsageFetcher | null => {
+				if (provider !== usageProvider) {
+					usageProvider = provider;
+					usageFetcher = createUsageFetcher(provider);
+				}
+				return usageFetcher;
+			};
 
 			return {
 				dispose() {
+					footerTui = null;
 					unsub();
 					clearInterval(timer);
 				},
 				invalidate() {},
 				render(width: number): string[] {
-					let cost = 0;
-					for (const e of ctx.sessionManager.getEntries()) {
-						if (e.type === "message" && e.message.role === "assistant") {
-							const m = e.message as AssistantMessage;
-							cost += m.usage.cost.total;
-						}
-					}
-
-					const usage = ctx.getContextUsage();
-					const used = usage?.tokens;
-					const pct = usage?.percent;
-					const hasMeasuredPercent = typeof pct === "number";
-					const hasMeasuredUsed = typeof used === "number";
-					const pctColor = !hasMeasuredPercent && !hasMeasuredUsed
-						? "muted"
-						: (hasMeasuredPercent && pct >= 85) || (hasMeasuredUsed && used >= 400_000)
-							? "error"
-							: "success";
-					const usedDisplay = hasMeasuredUsed
-						? `ctx ${fmt(used)}`
-						: "ctx ?";
-					const percentDisplay = hasMeasuredPercent
-						? `${pct.toFixed(0)}%`
-						: "?";
-
 					const cwd = ctx.sessionManager.getCwd();
-
-					const lastTokPerSec = readTps.getLast(cwd);
-					const tpsDisplay = lastTokPerSec !== null
-						? theme.fg("text", `${Math.round(lastTokPerSec)} t/s`)
-						: null;
-
-					const tokenStats = [
-						theme.fg("text", usedDisplay),
-						theme.fg(pctColor, percentDisplay),
-						theme.fg("warning", `$${cost.toFixed(2)}`),
-						...(tpsDisplay ? [tpsDisplay] : []),
-					].join(" ");
-
-					const elapsed = theme.fg("thinkingText", `⏱ ${formatElapsed(Date.now() - sessionStart)}`);
-
-					const parts = cwd.split("/");
-					const short = parts.length > 2 ? parts.slice(-2).join("/") : cwd;
-					const cwdStr = theme.fg("thinkingText", `⌂ ${short}`);
-
-					const gitStatus = readGitStatus(cwd);
-					const branchStr = formatGitStatusSegment(theme, gitStatus);
-
+					const usage = ctx.getContextUsage();
+					const model = ctx.model;
+					const providerName = model
+						? ctx.modelRegistry?.getProviderDisplayName(model.provider) ?? model.id
+						: "no-model";
 					const thinking = pi.getThinkingLevel();
-					const thinkColor =
-						thinking === "high"
-							? "warning"
-							: thinking === "medium"
-								? "text"
-								: "thinkingText";
-					const modelId = ctx.model?.id || "no-model";
-					const modelStr = theme.fg(thinkColor, "◆") + " " + theme.fg("text", modelId);
+					const segments = {
+						model: formatModel(theme, providerName, model?.id, thinking),
+						providerOnly: formatProviderOnly(theme, providerName, thinking),
+						cwd: formatCwd(theme, cwd, homedir()),
+						branch: formatGitSegment(theme, readGitStatus(cwd)),
+					};
+					const entries = ctx.sessionManager.getEntries();
+					const tokenStats = formatTokenStats(theme, {
+						used: usage?.tokens,
+						pct: usage?.percent,
+						cost: computeSessionCost(entries),
+						tps: readTps.getLast(cwd),
+						flow: computeTokenFlow(entries),
+					});
 
-					const sep = theme.fg("thinkingText", " | ");
-					let leftParts = [modelStr, tokenStats, elapsed, cwdStr];
-					if (branchStr) leftParts.push(branchStr);
+					const fetcher = ensureUsageFetcher(detectUsageProvider(model?.provider, model?.id));
+					void fetcher?.refresh().then((updated) => {
+						if (updated) tui.requestRender();
+					});
+					const snapshot = fetcher?.getSnapshot() ?? null;
+					const usageLine = snapshot ? formatUsageLine(theme, snapshot, Date.now()) : null;
 
-					if (width < 100) {
-						leftParts = [modelStr, tokenStats, cwdStr];
-					}
-					if (width < 72) {
-						leftParts = [tokenStats, cwdStr];
-					}
-					if (width < 52) {
-						leftParts = [tokenStats];
-					}
+					const lines = layoutFooter(
+						width,
+						segments,
+						tokenStats,
+						usageLine,
+						theme.fg("muted", " │ "),
+					).map((line) => truncateToWidth(line, width));
 
-					const left = leftParts.join(sep);
-					return [truncateToWidth(left, width)];
+					for (const line of extensionStatusLines(footerData.getExtensionStatuses())) {
+						lines.push(truncateToWidth(theme.fg("accent", line), width));
+					}
+					return lines;
 				},
 			};
 		});
 	});
-
 }
