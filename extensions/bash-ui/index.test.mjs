@@ -1,4 +1,4 @@
-import { test as baseTest } from "vitest";
+import { afterAll, test as baseTest } from "vitest";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -26,6 +26,13 @@ initTheme("dark");
  */
 let sharedExtensionRoot = null;
 
+afterAll(() => {
+	if (sharedExtensionRoot) {
+		fs.rmSync(sharedExtensionRoot, { recursive: true, force: true });
+		sharedExtensionRoot = null;
+	}
+});
+
 /** 临时工作区 fixture：测试结束（含断言失败）自动清理，杜绝 /tmp 残留。 */
 const test = baseTest.extend({
 	temp: async ({}, use) => {
@@ -41,11 +48,6 @@ const test = baseTest.extend({
 async function loadRegisteredTool() {
 	if (!sharedExtensionRoot) {
 		sharedExtensionRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-bash-ui-"));
-		process.on("exit", () => {
-			if (sharedExtensionRoot) {
-				fs.rmSync(sharedExtensionRoot, { recursive: true, force: true });
-			}
-		});
 	}
 	const temp = sharedExtensionRoot;
 	const tempExtensionDir = path.join(temp, "extension");
@@ -55,9 +57,10 @@ async function loadRegisteredTool() {
 		"code-preview.ts",
 		"file-link.ts",
 		"final-diff.ts",
-		"ffi-diff.ts",
 		"diff-view.ts",
 		"file-mutation-view.ts",
+		"diff-service.ts",
+		"diff-worker.ts",
 	]);
 	await linkPiPackages(tempExtensionDir, { tui: true });
 	await linkSharedPackages(tempExtensionDir);
@@ -75,7 +78,30 @@ async function loadRegisteredTool() {
 		},
 	});
 	assert.ok(registeredTool, "bash-ui did not register a bash override");
-	return { tool: registeredTool, handlers };
+	const modules = await loadBuilderModules(tempToolDir, tempExtensionDir);
+	return { tool: { ...registeredTool, modules }, handlers };
+}
+
+/** 副本的纯 builder 模块：测试直接构造 view model payload（渲染层只消费 details 的契约）。 */
+async function loadBuilderModules(tempToolDir, tempExtensionDir) {
+	const stamp = `?t=${Date.now()}`;
+	const load = (name, base = tempToolDir) => import(`${pathToFileURL(path.join(base, name)).href}${stamp}`);
+	const [viewModel, plan, snapshot, result, diffService] = await Promise.all([
+		load("view-model.ts"),
+		load("patch-command.ts"),
+		load("patch-snapshot.ts"),
+		load("patch-result.ts"),
+		load("diff-service.ts", path.join(tempExtensionDir, "_shared")),
+	]);
+	return {
+		buildResultViewModel: viewModel.buildResultViewModel,
+		buildApplyPatchPlan: plan.buildApplyPatchPlan,
+		captureBeforeSnapshots: snapshot.captureBeforeSnapshots,
+		captureAfterSnapshots: snapshot.captureAfterSnapshots,
+		parseApplyPatchResultSequence: result.parseApplyPatchResultSequence,
+		resultText: result.resultText,
+		requestDiffBatch: diffService.requestDiffBatch,
+	};
 }
 
 function createTheme() {
@@ -105,6 +131,32 @@ function createContext(command, overrides = {}) {
 	};
 }
 
+/**
+ * 构造 view model payload（渲染层只消费 details 的契约）。
+ * 默认无快照（意图 diff）；withBefore/withAfter 时从真实文件捕获（行号 diff / rewrite 合并）。
+ */
+async function buildViewModel({ tool, command, text, cwd = "/tmp/pi-bash-ui-workspace", withBefore = false, withAfter = false }) {
+	const plan = tool.modules.buildApplyPatchPlan(command, cwd);
+	assert.ok(plan, "expected an apply_patch plan");
+	const parsed = tool.modules.parseApplyPatchResultSequence(text);
+	if (!parsed) return undefined;
+	const before = withBefore ? await tool.modules.captureBeforeSnapshots(plan) : undefined;
+	const after = withAfter && before ? await tool.modules.captureAfterSnapshots(plan, before) : undefined;
+	const submitter = async (inputs) => {
+		try {
+			const response = await tool.modules.requestDiffBatch(inputs, "test-batch");
+			return response.files;
+		} catch {
+			return undefined;
+		}
+	};
+	return tool.modules.buildResultViewModel(plan, parsed, before, after, submitter);
+}
+
+function detailsWith(viewModel) {
+	return { bashUi: { applyPatch: viewModel } };
+}
+
 async function runWithEvents(toolCallId, command, tool, handlers, { cwd = process.cwd() } = {}) {
 	// tool_call：捕获 before 快照
 	for (const handler of handlers["tool_call"] ?? []) {
@@ -126,6 +178,7 @@ async function runWithEvents(toolCallId, command, tool, handlers, { cwd = proces
 		);
 		if (outcome?.details) details = outcome.details;
 	}
+	console.error("DBG runWithEvents details:", details ? Object.keys(details) : "undefined");
 	return { ...result, details };
 }
 
@@ -209,6 +262,9 @@ test("single-quoted apply_patch invocation uses the compact pending renderer", a
 
 test("completed TUI row replaces the raw patch call with the confirmed result UI", async () => {
 	const { tool } = await loadRegisteredTool();
+	const successText = "Success. Updated the following files:\nA src/new.ts\nM src/old.ts\nM src/to.ts\nD src/dead.ts";
+	const viewModel = await buildViewModel({ tool, command: MULTI_OPERATION_COMMAND, text: successText });
+	assert.ok(viewModel, "expected a structured view model");
 	const row = new ToolExecutionComponent(
 		"bash",
 		"completed-row",
@@ -221,11 +277,8 @@ test("completed TUI row replaces the raw patch call with the confirmed result UI
 	row.setArgsComplete();
 	row.markExecutionStarted();
 	row.updateResult({
-		content: [{
-			type: "text",
-			text: "Success. Updated the following files:\nA src/new.ts\nM src/old.ts\nM src/to.ts\nD src/dead.ts",
-		}],
-		details: undefined,
+		content: [{ type: "text", text: successText }],
+		details: detailsWith(viewModel),
 		isError: false,
 	});
 
@@ -241,14 +294,13 @@ test("completed TUI row replaces the raw patch call with the confirmed result UI
 
 test("successful result renders confirmed affected paths", async () => {
 	const { tool } = await loadRegisteredTool();
+	const successText = "Success. Updated the following files:\nA src/new.ts\nM src/old.ts\nM src/to.ts\nD src/dead.ts";
+	const viewModel = await buildViewModel({ tool, command: MULTI_OPERATION_COMMAND, text: successText });
 	const context = createContext(MULTI_OPERATION_COMMAND, { executionStarted: true });
 	const output = renderText(tool.renderResult(
 		{
-			content: [{
-				type: "text",
-				text: "Success. Updated the following files:\nA src/new.ts\nM src/old.ts\nM src/to.ts\nD src/dead.ts",
-			}],
-			details: undefined,
+			content: [{ type: "text", text: successText }],
+			details: detailsWith(viewModel),
 		},
 		{ expanded: false, isPartial: false },
 		createTheme(),
@@ -270,10 +322,11 @@ test("successful result renders confirmed affected paths", async () => {
 test("successful result followed by unrelated command output is still rendered", async () => {
 	const { tool } = await loadRegisteredTool();
 	const mixedOutput = "Success. Updated the following files:\nA src/new.ts\nM src/old.ts\nM src/to.ts\nD src/dead.ts\nFAILED tests/integration/test_identity_access_api.py::test_grant_admin_updates_existing_grant_and_rejects_identical_regrant\n1 failed, 1 warning in 0.71s";
+	const viewModel = await buildViewModel({ tool, command: MULTI_OPERATION_COMMAND, text: mixedOutput });
 	const output = renderText(tool.renderResult(
 		{
 			content: [{ type: "text", text: mixedOutput }],
-			details: undefined,
+			details: detailsWith(viewModel),
 		},
 		{ expanded: false, isPartial: false },
 		createTheme(),
@@ -295,10 +348,11 @@ test("successful result followed by unrelated command output is still rendered",
 test("partial result renders the apply_patch block once the complete result is recognized", async () => {
 	const { tool } = await loadRegisteredTool();
 	const mixedOutput = "Success. Updated the following files:\nA src/new.ts\nM src/old.ts\nM src/to.ts\nD src/dead.ts\n\nFAILED tests/integration/test_identity_access_api.py::test_grant_admin\n1 failed in 0.71s";
+	const viewModel = await buildViewModel({ tool, command: MULTI_OPERATION_COMMAND, text: mixedOutput });
 	const output = renderText(tool.renderResult(
 		{
 			content: [{ type: "text", text: mixedOutput }],
-			details: undefined,
+			details: detailsWith(viewModel),
 		},
 		{ expanded: false, isPartial: true },
 		createTheme(),
@@ -361,13 +415,12 @@ test("successful result omits the redundant summary for a single operation", asy
 *** End Patch
 PATCH`;
 	const { tool } = await loadRegisteredTool();
+	const successText = "Success. Updated the following files:\nM src/only.ts";
+	const viewModel = await buildViewModel({ tool, command, text: successText });
 	const output = renderText(tool.renderResult(
 		{
-			content: [{
-				type: "text",
-				text: "Success. Updated the following files:\nM src/only.ts",
-			}],
-			details: undefined,
+			content: [{ type: "text", text: successText }],
+			details: detailsWith(viewModel),
 		},
 		{ expanded: false, isPartial: false },
 		createTheme(),
@@ -390,13 +443,12 @@ test("successful result follows the CLI A-M-D grouping instead of patch order", 
 *** End Patch
 PATCH`;
 	const { tool } = await loadRegisteredTool();
+	const successText = "Success. Updated the following files:\nA created.txt\nM existing.txt";
+	const viewModel = await buildViewModel({ tool, command, text: successText });
 	const output = renderText(tool.renderResult(
 		{
-			content: [{
-				type: "text",
-				text: "Success. Updated the following files:\nA created.txt\nM existing.txt",
-			}],
-			details: undefined,
+			content: [{ type: "text", text: successText }],
+			details: detailsWith(viewModel),
 		},
 		{ expanded: false, isPartial: false },
 		createTheme(),
@@ -409,43 +461,98 @@ PATCH`;
 	]);
 });
 
-test("successful result renders elapsed time above the threshold", async () => {
+test("renderCall records the start time once execution begins", async () => {
 	const { tool } = await loadRegisteredTool();
+	const state = {};
+	tool.renderCall(
+		{ command: MULTI_OPERATION_COMMAND },
+		createTheme(),
+		createContext(MULTI_OPERATION_COMMAND, { executionStarted: false, state }),
+	);
+	assert.equal(state.startedAt, undefined);
+	tool.renderCall(
+		{ command: MULTI_OPERATION_COMMAND },
+		createTheme(),
+		createContext(MULTI_OPERATION_COMMAND, { executionStarted: true, state }),
+	);
+	assert.equal(typeof state.startedAt, "number");
+});
+
+test("successful result renders the wall-clock runtime", async () => {
+	const { tool } = await loadRegisteredTool();
+	const successText = "Success. Updated the following files:\nA src/new.ts\nM src/old.ts\nM src/to.ts\nD src/dead.ts";
+	const viewModel = await buildViewModel({ tool, command: MULTI_OPERATION_COMMAND, text: successText });
+	const state = { startedAt: Date.now() - 30_100 };
 	const output = renderText(tool.renderResult(
 		{
-			content: [{
-				type: "text",
-				text: "Success. Updated the following files:\nA src/new.ts\nM src/old.ts\nM src/to.ts\nD src/dead.ts\n\nElapsed 30.1s",
-			}],
-			details: undefined,
+			content: [{ type: "text", text: successText }],
+			details: detailsWith(viewModel),
 		},
 		{ expanded: false, isPartial: false },
 		createTheme(),
-		createContext(MULTI_OPERATION_COMMAND, { executionStarted: true }),
+		createContext(MULTI_OPERATION_COMMAND, { executionStarted: true, state }),
 	));
 
 	assertAppearsInOrder(output, [
 		"apply_patch Add file src/new.ts",
-		"elapsed 30.1s",
+		"Took 30.1s",
 	]);
 });
 
-test("successful result omits elapsed time below the threshold", async () => {
+test("partial result ticks Elapsed and the final render freezes Took", async () => {
 	const { tool } = await loadRegisteredTool();
+	const successText = "Success. Updated the following files:\nA src/new.ts\nM src/old.ts\nM src/to.ts\nD src/dead.ts";
+	const viewModel = await buildViewModel({ tool, command: MULTI_OPERATION_COMMAND, text: successText });
+	const state = {};
+	const result = {
+		content: [{ type: "text", text: successText }],
+		details: detailsWith(viewModel),
+	};
+	try {
+		tool.renderCall(
+			{ command: MULTI_OPERATION_COMMAND },
+			createTheme(),
+			createContext(MULTI_OPERATION_COMMAND, { executionStarted: true, state }),
+		);
+		const partial = renderText(tool.renderResult(
+			result,
+			{ expanded: false, isPartial: true },
+			createTheme(),
+			createContext(MULTI_OPERATION_COMMAND, { executionStarted: true, state }),
+		));
+		assert.match(partial, /Elapsed \d+\.\ds/);
+		assert.ok(state.interval, "partial render starts the 1s ticking interval");
+
+		const final = renderText(tool.renderResult(
+			result,
+			{ expanded: false, isPartial: false },
+			createTheme(),
+			createContext(MULTI_OPERATION_COMMAND, { executionStarted: true, state }),
+		));
+		assert.match(final, /Took \d+\.\ds/);
+		assert.equal(state.interval, undefined, "final render stops the interval");
+		assert.equal(typeof state.endedAt, "number", "final render freezes endedAt");
+	} finally {
+		// 断言失败时也不泄漏 interval（测试进程保持存活）。
+		if (state.interval) clearInterval(state.interval);
+	}
+});
+
+test("result without renderer state omits the runtime line", async () => {
+	const { tool } = await loadRegisteredTool();
+	const successText = "Success. Updated the following files:\nA src/new.ts\nM src/old.ts\nM src/to.ts\nD src/dead.ts";
+	const viewModel = await buildViewModel({ tool, command: MULTI_OPERATION_COMMAND, text: successText });
 	const output = renderText(tool.renderResult(
 		{
-			content: [{
-				type: "text",
-				text: "Success. Updated the following files:\nA src/new.ts\nM src/old.ts\nM src/to.ts\nD src/dead.ts\n\nElapsed 0.3s",
-			}],
-			details: undefined,
+			content: [{ type: "text", text: successText }],
+			details: detailsWith(viewModel),
 		},
 		{ expanded: false, isPartial: false },
 		createTheme(),
 		createContext(MULTI_OPERATION_COMMAND, { executionStarted: true }),
 	));
 
-	assert.doesNotMatch(output, /elapsed/);
+	assert.doesNotMatch(output, /Elapsed|Took/);
 });
 
 test("failure JSON with a successful overall exit still renders the failure UI", async () => {
@@ -473,10 +580,12 @@ echo "exit=$?"`;
 		appliedPrefix: [{ index: 0, operation: "add", path: "first.txt" }],
 	};
 	const { tool } = await loadRegisteredTool();
+	const failureText = `${JSON.stringify(failure)}\nexit=1`;
+	const viewModel = await buildViewModel({ tool, command, text: failureText });
 	const output = renderText(tool.renderResult(
 		{
-			content: [{ type: "text", text: `${JSON.stringify(failure)}\nexit=1` }],
-			details: undefined,
+			content: [{ type: "text", text: failureText }],
+			details: detailsWith(viewModel),
 		},
 		{ expanded: false, isPartial: false },
 		createTheme(),
@@ -516,10 +625,12 @@ PATCH`;
 		appliedPrefix: [{ index: 0, operation: "add", path: "first.txt" }],
 	};
 	const { tool } = await loadRegisteredTool();
+	const failureText = `${JSON.stringify(failure)}\n\nCommand exited with code 1`;
+	const viewModel = await buildViewModel({ tool, command, text: failureText });
 	const output = renderText(tool.renderResult(
 		{
-			content: [{ type: "text", text: `${JSON.stringify(failure)}\n\nCommand exited with code 1` }],
-			details: undefined,
+			content: [{ type: "text", text: failureText }],
+			details: detailsWith(viewModel),
 		},
 		{ expanded: false, isPartial: false },
 		createTheme(),
@@ -593,8 +704,10 @@ PATCH`;
 		appliedPrefix: [],
 	};
 	const { tool } = await loadRegisteredTool();
+	const failureText = JSON.stringify(failure);
+	const viewModel = await buildViewModel({ tool, command, text: failureText });
 	const output = renderText(tool.renderResult(
-		{ content: [{ type: "text", text: JSON.stringify(failure) }], details: undefined },
+		{ content: [{ type: "text", text: failureText }], details: detailsWith(viewModel) },
 		{ expanded: false, isPartial: false },
 		createTheme(),
 		createContext(command, { executionStarted: true, isError: true }),
@@ -909,6 +1022,28 @@ test("ordinary shell commands retain the built-in bash renderer", async () => {
 
 	assert.match(output, /^\$ printf/);
 	assert.doesNotMatch(output, /apply_patch applied/);
+});
+
+test("ordinary shell commands show the built-in runtime line once execution starts", async () => {
+	const command = "printf 'ok'";
+	const { tool } = await loadRegisteredTool();
+	const state = {};
+	tool.renderCall(
+		{ command },
+		createTheme(),
+		createContext(command, { executionStarted: true, state }),
+	);
+	const output = renderText(tool.renderResult(
+		{ content: [{ type: "text", text: "ok" }], details: undefined },
+		{ expanded: false, isPartial: false },
+		createTheme(),
+		createContext(command, { executionStarted: true, state }),
+	));
+
+	assert.match(output, /ok/);
+	assert.match(output, /Took \d+\.\ds/);
+	assert.equal(state.interval, undefined);
+	assert.equal(typeof state.endedAt, "number");
 });
 
 

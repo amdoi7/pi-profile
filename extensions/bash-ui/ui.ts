@@ -10,8 +10,9 @@ import {
 	type FileMutationRenderItem,
 } from "../_shared/file-mutation-view.ts";
 import { renderCwdFilePathLink } from "../_shared/file-link.ts";
-import { trailingCommandAfterApplyPatches, type ParsedPatch, type PatchOperation } from "./patch-command.ts";
+import type { ApplyPatchPlan, PatchOperation, PlannedPatchOperation } from "./patch-command.ts";
 import {
+	isRecord,
 	parseRenderedResultPayload,
 	operationKindWord,
 	type ApplyPatchUnapplied,
@@ -19,10 +20,6 @@ import {
 	type ApplyPatchSingleResultViewModel,
 	type ApplyPatchResultViewModel,
 } from "./view-model.ts";
-
-// 耗时显示阈值：正常本地 apply_patch 是毫秒级文件写，远低于 1s；
-// 超过 2s 说明大 patch / 慢盘 / 锁竞争，值得作为诊断信号显示（tripwire，正常流量不触发）。
-const ELAPSED_SHOW_THRESHOLD_S = 2;
 
 // 后续命令输出（pytest 等）预览：总量沿用 20 行，首尾各半以同时保留失败标题与 summary。
 const TRAILING_PREVIEW_LINES = 20;
@@ -36,16 +33,12 @@ export type PatchRenderContext = {
 	lastComponent?: unknown;
 };
 
-/** 从 trailing 中分离 CLI 的 Elapsed 行（耗时由独立行表达，不进 trailing 预览）。 */
-function splitElapsedLine(trailing: string): { elapsed?: number; trailing: string } {
-	const lines = trailing.split("\n");
-	const filtered = lines.filter((line) => !/^Elapsed\s+[\d.]+\s*s$/.test(line));
-	const match = trailing.match(/Elapsed\s+([\d.]+)\s*s/);
-	const seconds = match ? Number(match[1]) : NaN;
-	return {
-		elapsed: Number.isFinite(seconds) ? seconds : undefined,
-		trailing: filtered.join("\n"),
-	};
+/** 渲染态中读取 wall-clock 耗时（ms）。startedAt 缺失（session restore 等无渲染态场景）时不显示。 */
+function elapsedMs(state: Record<string, unknown>, isPartial: boolean): number | undefined {
+	const startedAt = state.startedAt;
+	if (typeof startedAt !== "number") return undefined;
+	const endedAt = state.endedAt;
+	return (typeof endedAt === "number" ? endedAt : Date.now()) - startedAt;
 }
 
 function operationStats(operation: PatchOperation) {
@@ -54,10 +47,10 @@ function operationStats(operation: PatchOperation) {
 	return { additions, deletions, changedLines: additions + deletions };
 }
 
-function renderOperationPath(operation: PatchOperation, theme: Theme, context: PatchRenderContext): string {
-	const source = renderCwdFilePathLink(operation.path, operation.path, context.cwd, theme);
+function renderOperationPath(operation: PatchOperation, cwd: string, theme: Theme): string {
+	const source = renderCwdFilePathLink(operation.path, operation.path, cwd, theme);
 	if (!operation.destination) return source;
-	const destination = renderCwdFilePathLink(operation.destination, operation.destination, context.cwd, theme);
+	const destination = renderCwdFilePathLink(operation.destination, operation.destination, cwd, theme);
 	return `${source}${theme.fg("muted", " -> ")}${destination}`;
 }
 
@@ -67,15 +60,15 @@ function renderOperationPath(operation: PatchOperation, theme: Theme, context: P
  */
 function renderOperationRow(
 	operation: PatchOperation,
+	cwd: string,
 	theme: Theme,
-	context: PatchRenderContext,
 	options: { indent: boolean },
 ): string {
 	const parts = [
 		`${options.indent ? "  " : ""}${theme.fg("toolTitle", theme.bold("apply_patch"))}`,
 		theme.fg("muted", operationKindWord(operation)),
 		"file",
-		renderOperationPath(operation, theme, context),
+		renderOperationPath(operation, cwd, theme),
 	];
 	const stats = operationStats(operation);
 	if (stats.changedLines > 0) parts.push(renderDiffSummary(stats, theme));
@@ -83,13 +76,13 @@ function renderOperationRow(
 }
 
 function operationRenderItem(
-	operation: PatchOperation,
+	planned: PlannedPatchOperation,
+	cwd: string,
 	theme: Theme,
-	context: PatchRenderContext,
 	options: { indent: boolean },
 ): FileMutationRenderItem {
 	return {
-		title: renderOperationRow(operation, theme, context, options),
+		title: renderOperationRow(planned.operation, cwd, theme, options),
 		outcome: "pending",
 	};
 }
@@ -116,18 +109,21 @@ function renderTrailing(
 	container.addChild(new Text(theme.fg("toolOutput", lines.slice(-tail).join("\n")), 0, 0));
 }
 
+/** pending UI：每行操作使用自己 invocation 的 cwd 做 file link。 */
 export function renderPendingApplyPatch(
-	patch: ParsedPatch,
+	plan: ApplyPatchPlan,
 	theme: Theme,
 	context: PatchRenderContext,
 ): Container {
 	const container = beginPendingFileMutationRender(context);
-	const multiple = patch.operations.length > 1;
-	for (const operation of patch.operations) {
+	const rows = plan.invocations.flatMap((invocation) =>
+		invocation.operations.map((planned) => ({ planned, cwd: invocation.cwd })));
+	const multiple = rows.length > 1;
+	for (const { planned, cwd } of rows) {
 		appendFileMutationBatch(container, [
-			operationRenderItem(operation, theme, context, { indent: multiple }),
+			operationRenderItem(planned, cwd, theme, { indent: multiple }),
 		], theme);
-		for (const chunk of operation.chunks ?? []) {
+		for (const chunk of planned.operation.chunks ?? []) {
 			if (chunk.lines.some((line) => line.prefix === "+" || line.prefix === "-")) continue;
 			container.addChild(new Text(
 				theme.fg("warning", `  chunk ${chunk.index} · no +/- lines · must contain an insertion or deletion`),
@@ -157,7 +153,7 @@ function fileResultItem(
 	const count = patchCount > 1 ? theme.fg("muted", ` · ${patchCount} patches`) : "";
 	return {
 		title: `${theme.fg("toolTitle", theme.bold("apply_patch"))} ${theme.fg("success", file.kind)} file ` +
-		`${renderCwdFilePathLink(displayPath, linkTarget, context.cwd, theme)}` +
+		`${renderCwdFilePathLink(displayPath, linkTarget, file.cwd, theme)}` +
 		`${theme.fg("muted", " · ")}${renderDiffSummary(file.changeStats, theme)}${count}`,
 		outcome: "applied",
 		previews: resolvedPreviews,
@@ -173,7 +169,8 @@ type AggregatedSuccessfulFile = {
 function aggregateSuccessfulFiles(files: ApplyPatchFileDiff[]): AggregatedSuccessfulFile[] {
 	const aggregated = new Map<string, AggregatedSuccessfulFile>();
 	for (const file of files) {
-		const key = JSON.stringify([file.kind, file.path, file.destination]);
+		// key 含 cwd：不同 invocation 目录下同名 relative path 不聚合。
+		const key = JSON.stringify([file.kind, file.path, file.destination, file.cwd]);
 		const current = aggregated.get(key);
 		if (!current) {
 			const preview = filePreview(file);
@@ -195,11 +192,10 @@ function aggregateSuccessfulFiles(files: ApplyPatchFileDiff[]): AggregatedSucces
 function renderUnappliedRow(
 	item: ApplyPatchUnapplied,
 	theme: Theme,
-	context: PatchRenderContext,
 ): Text {
 	const displayPath = item.destination ? `${item.path} -> ${item.destination}` : item.path;
 	return new Text(
-		`  ${theme.fg("muted", item.kind)} file ${renderCwdFilePathLink(displayPath, item.destination ?? item.path, context.cwd, theme)}`,
+		`  ${theme.fg("muted", item.kind)} file ${renderCwdFilePathLink(displayPath, item.destination ?? item.path, item.cwd, theme)}`,
 		0,
 		0,
 	);
@@ -221,7 +217,7 @@ function renderFailureViewModel(
 	if (viewModel.error.path) {
 		const chunk = viewModel.error.chunkIndex === undefined ? "" : ` ${theme.fg("muted", `· chunk ${viewModel.error.chunkIndex}`)}`;
 		container.addChild(new Text(
-			`${theme.fg("error", "failed update")} ${renderCwdFilePathLink(viewModel.error.path, viewModel.error.path, context.cwd, theme)}${chunk}`,
+			`${theme.fg("error", "failed update")} ${renderCwdFilePathLink(viewModel.error.path, viewModel.error.path, viewModel.error.cwd ?? context.cwd, theme)}${chunk}`,
 			0,
 			0,
 		));
@@ -236,7 +232,9 @@ function renderFailureViewModel(
 		container.addChild(new Text(theme.fg("error", "skipped:"), 0, 0));
 		for (const item of viewModel.skipped) {
 			const operation = item.operation ? `${item.operation[0]!.toUpperCase()}${item.operation.slice(1)}` : "Operation";
-			const path = item.path ? ` ${renderCwdFilePathLink(item.path, item.path, context.cwd, theme)}` : "";
+			const path = item.path
+				? ` ${renderCwdFilePathLink(item.path, item.path, item.cwd ?? context.cwd, theme)}`
+				: "";
 			container.addChild(new Text(`  ${theme.fg("error", `${operation} file`)}${path}`, 0, 0));
 			container.addChild(new Text(`    ${theme.fg("muted", item.message)}`, 0, 0));
 		}
@@ -259,7 +257,7 @@ function renderFailureViewModel(
 		container.addChild(new Spacer(1));
 		container.addChild(new Text(theme.fg("muted", "unapplied:"), 0, 0));
 		for (const item of viewModel.unapplied) {
-			container.addChild(renderUnappliedRow(item, theme, context));
+			container.addChild(renderUnappliedRow(item, theme));
 		}
 	}
 }
@@ -326,20 +324,21 @@ export function renderResultViewModel(
 	} else {
 		renderSingleResultViewModel(container, viewModel, options, theme, context);
 	}
-	// 耗时独立行（CLI 的 Elapsed）只对成功结果展示；失败/批量的 trailing 原样保留。
-	const trailingInfo = viewModel.kind === "apply-patch-result" && viewModel.success
-		? splitElapsedLine(viewModel.trailing)
-		: { elapsed: undefined, trailing: viewModel.trailing };
-	if (trailingInfo.elapsed !== undefined && trailingInfo.elapsed > ELAPSED_SHOW_THRESHOLD_S) {
-		container.addChild(new Text(theme.fg("muted", `elapsed ${trailingInfo.elapsed.toFixed(1)}s`), 0, 0));
+	// 耗时独立行（wall-clock，与 built-in 一致：partial 时 Elapsed + 1s tick，最终/错误 Took）。
+	// 渲染态缺失时无耗时行；不解析 CLI 输出文本（apply_patch 从不自报耗时）。
+	if (viewModel.trailing.trim().length > 0) {
+		renderTrailing(container, viewModel.trailing, options.expanded, theme, viewModel.trailingCommand ?? "");
 	}
-	if (trailingInfo.trailing.trim().length > 0) {
-		renderTrailing(container, trailingInfo.trailing, options.expanded, theme, trailingCommandAfterApplyPatches(context.args.command));
+	const ms = elapsedMs(context.state, options.isPartial);
+	if (ms !== undefined) {
+		container.addChild(new Text(theme.fg("muted", `${options.isPartial ? "Elapsed" : "Took"} ${(ms / 1000).toFixed(1)}s`), 0, 0));
 	}
 	return container;
 }
 
 export function parseRenderedResultPayloadFromDetails(details: unknown): ApplyPatchResultViewModel | undefined {
-	return parseRenderedResultPayload(details);
+	// tool_result 注入契约：{ ...builtinDetails, bashUi: { applyPatch: viewModel } }。
+	// 无 bashUi 命名空间（普通命令 / 未识别结果）时返回 undefined，渲染层 delegate built-in。
+	if (!isRecord(details) || !isRecord(details.bashUi)) return undefined;
+	return parseRenderedResultPayload(details.bashUi.applyPatch);
 }
-

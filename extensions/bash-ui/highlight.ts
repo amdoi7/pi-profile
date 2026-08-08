@@ -17,7 +17,7 @@
  */
 
 import { accessSync, constants as fsConstants } from "node:fs";
-import { join } from "node:path";
+import { resolve } from "node:path";
 
 import type { Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
@@ -46,24 +46,31 @@ const WRAPPERS = new Set(["sudo", "doas", "env", "xargs", "nice", "nohup", "time
 
 const execCache = new Map<string, boolean>();
 
-export function isExecutable(cmd: string): boolean {
+/**
+ * 命令存在性检查（fish 语义核心）。
+ * cache key 含 cwd + PATH + command：相对可执行文件按命令执行目录解析，
+ * PATH 变化后不返回陈旧结果。
+ */
+export function isExecutable(cmd: string, cwd: string): boolean {
 	if (BUILTINS.has(cmd)) return true;
-	const cached = execCache.get(cmd);
+	const pathEntries = process.env.PATH ?? "";
+	const key = `${cwd}|${pathEntries}|${cmd}`;
+	const cached = execCache.get(key);
 	if (cached !== undefined) return cached;
 
 	let found = false;
 	if (cmd.includes("/")) {
 		try {
-			accessSync(cmd, fsConstants.X_OK);
+			accessSync(resolve(cwd, cmd), fsConstants.X_OK);
 			found = true;
 		} catch {
 			found = false;
 		}
 	} else {
-		for (const dir of (process.env.PATH ?? "").split(":")) {
+		for (const dir of pathEntries.split(":")) {
 			if (!dir) continue;
 			try {
-				accessSync(join(dir, cmd), fsConstants.X_OK);
+				accessSync(resolve(dir, cmd), fsConstants.X_OK);
 				found = true;
 				break;
 			} catch {
@@ -71,7 +78,7 @@ export function isExecutable(cmd: string): boolean {
 			}
 		}
 	}
-	execCache.set(cmd, found);
+	execCache.set(key, found);
 	return found;
 }
 
@@ -113,7 +120,7 @@ function readVariable(s: string, i: number): { text: string; end: number } {
 	return { text: s.slice(i, k), end: k };
 }
 
-export function tokenize(cmd: string): Seg[] {
+export function tokenize(cmd: string, cwd = process.cwd()): Seg[] {
 	const segs: Seg[] = [];
 	const n = cmd.length;
 	let i = 0;
@@ -141,10 +148,13 @@ export function tokenize(cmd: string): Seg[] {
 			continue;
 		}
 
-		// 注释到行尾
+		// 注释只到当前行结尾（不吞后续行的命令）
 		if (c === "#") {
-			push(cmd.slice(i), "syntaxComment");
-			break;
+			const newline = cmd.indexOf("\n", i);
+			const end = newline === -1 ? n : newline;
+			push(cmd.slice(i, end), "syntaxComment");
+			i = end;
+			continue;
 		}
 
 		// 单引号字符串（无转义）
@@ -213,9 +223,15 @@ export function tokenize(cmd: string): Seg[] {
 			continue;
 		}
 
-		// 双字符操作符
+		// 双字符操作符（最长匹配优先：<<< / 2>> / 1>> 先于 << / 2> / 1>）
+		const three = cmd.slice(i, i + 3);
+		if (["<<<", "2>>", "1>>"].includes(three)) {
+			push(three, "syntaxOperator");
+			i += 3;
+			continue;
+		}
 		const two = cmd.slice(i, i + 2);
-		if (["&&", "||", ";;", "|&", "&>", ">>", "<<", ">&", "<&", "<<<", "<(", ">(", "2>", "1>", "2>>", "1>>"].includes(two)) {
+		if (["&&", "||", ";;", "|&", "&>", ">>", "<<", ">&", "<&", "2>", "1>", "<(", ">("].includes(two)) {
 			push(two, "syntaxOperator");
 			i += 2;
 			if (two === "&&" || two === "||" || two === "|&") atCmd = true;
@@ -261,7 +277,7 @@ export function tokenize(cmd: string): Seg[] {
 				atCmd = CMD_FOLLOWS.has(word);
 			} else {
 				// fish 语义：命令存在则绿，不存在则红
-				push(word, isExecutable(word) ? "success" : "error");
+				push(word, isExecutable(word, cwd) ? "success" : "error");
 				atCmd = WRAPPERS.has(word);
 			}
 		} else if (word === "in") {

@@ -1,185 +1,135 @@
-import { readFile, stat } from "node:fs/promises";
-import { resolve } from "node:path";
-
 import {
 	createBashToolDefinition,
 	isBashToolResult,
 	isToolCallEventType,
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
-import { Container } from "@earendil-works/pi-tui";
 
-import { highlightBashCall } from "./highlight.ts";
-import { parseApplyPatches, parseStandaloneApplyPatch } from "./patch-command.ts";
-import { parseApplyPatchResultSequence, resultText } from "./patch-result.ts";
-import {
-	parseRenderedResultPayloadFromDetails,
-	renderPendingApplyPatch,
-	renderResultViewModel,
-	type PatchRenderContext,
-} from "./ui.ts";
-import { buildResultViewModel, buildResultViewModelSync, type ApplyPatchResultViewModel, type BeforeSnapshots } from "./view-model.ts";
-
-function mergeParsedPatches(patches: ReturnType<typeof parseApplyPatches>): {
-	operations: ReturnType<typeof parseApplyPatches>[number]["patch"]["operations"];
-} {
-	const operations: typeof patches[number]["patch"]["operations"] = [];
-	for (const entry of patches) {
-		operations.push(...entry.patch.operations);
-	}
-	return { operations };
-}
-
-function resolvePatches(command: string, cwd: string): ReturnType<typeof parseApplyPatches> {
-	const patches = parseApplyPatches(command, cwd);
-	if (patches.length > 0) return patches;
-	const standalone = parseStandaloneApplyPatch(command);
-	return standalone ? [{ patch: standalone, cwd, endLine: 0 }] : [];
-}
-
-function bashResultCommand(input: unknown): string {
-	if (typeof input !== "object" || input === null || !("command" in input) || typeof input.command !== "string") {
-		throw new Error("bash-ui received malformed bash tool_result input: expected input.command string; upgrade pi or disable bash-ui");
-	}
-	return input.command;
-}
+import { renderBashCall, renderBashResult } from "./bash-renderer.ts";
+import { warmUpDiffWorker } from "../_shared/diff-service.ts";
+import { buildApplyPatchPlan } from "./patch-command.ts";
+import { resultText } from "./patch-result.ts";
+import { ApplyPatchRunRegistry } from "./patch-run-registry.ts";
+import { captureBeforeSnapshots } from "./patch-snapshot.ts";
 
 /**
- * before 快照大小上限：超出视为非源码文件（生成物/数据），跳过行号 diff（回退意图 diff）。
- * 实测最大源码文件约 2.5MB（ai4x 生成物），此处留 3 倍余量。
- */
-const BEFORE_SNAPSHOT_MAX_BYTES = 8 * 1024 * 1024;
-
-/**
- * 行号 diff 的最小前置：执行前捕获 before 内容（每路径一次读取）。
- * 在 tool_call 事件中完成——bash 的 execute 完全不覆盖。
- */
-async function captureBefore(
-	operations: ReturnType<typeof mergeParsedPatches>["operations"],
-	cwd: string,
-): Promise<BeforeSnapshots> {
-	const snapshots: BeforeSnapshots = new Map();
-	for (const operation of operations) {
-		const paths = operation.destination ? [operation.path, operation.destination] : [operation.path];
-		for (const displayPath of paths) {
-			if (snapshots.has(displayPath)) continue;
-			const absolutePath = resolve(cwd, displayPath);
-			let before: string | null = null;
-			try {
-				if ((await stat(absolutePath)).size > BEFORE_SNAPSHOT_MAX_BYTES) continue;
-				before = await readFile(absolutePath, "utf8");
-			} catch {
-				// ENOENT 等：文件不存在（add 目标等），before 为 null。
-			}
-			snapshots.set(displayPath, { absolutePath, before });
-		}
-	}
-	return snapshots;
-}
-
-/**
- * apply_patch UI（edit 模式）：bash 只是命令执行与输出识别来源，语义零改动。
- * - tool_call：捕获 before 快照（bash execute 不覆盖）。
- * - tool_result：解析 bash 输出，生成结构化 view model 注入 result.details。
- * - renderCall/renderResult：渲染 view model（完成态或流式缓存），渲染路径不做文件 IO/diff。
- * - 流式：首次成功解析时构建一次 view model 并缓存；后续 chunk 只刷新 trailing。
- * - 未识别（普通命令、复合未支持语法）：渲染原样交给 bash。
+ * bash-ui（edit 模式）：bash 只是命令执行与输出识别来源，语义零改动。
+ *
+ *   command-policy tool_call      -> mutate/block command（settings.json 中先于 bash-ui 加载）
+ *   bash-ui tool_call             -> parse authoritative plan -> 捕获 before 快照
+ *                                    （并行 sibling execute 开始前的最早观察点）
+ *   wrapped bash.execute          -> 验证 params.command 与 plan.command 一致
+ *                                    -> delegate built-in execution（不改 input/output/error/order）
+ *                                    -> 观察 accumulated update -> terminal block 完整时冻结 after
+ *                                    -> 提交不可变 DiffRequest 到长期 worker
+ *   tool_result                   -> 最后识别 -> await finalization -> 合并 BashUiDetails -> 清理 run
+ *   renderCall/renderResult       -> 维护 wall-clock 耗时状态（startedAt/endedAt/interval，
+ *                                    与 built-in 一致：执行开始记时，partial 每 1s tick，
+ *                                    最终/错误冻结），renderResult 只消费 view model 否则 delegate
+ *
+ * 所有 mode 都注入 namespaced details（RPC/HTML export/session restore 消费）；
+ * 只有 TUI 在 tool_call 捕获文件快照；RPC/JSON/print 走轻量 run（intent diff，不读文件）。
  */
 export default function bashUiExtension(pi: ExtensionAPI) {
 	const baseBash = createBashToolDefinition(process.cwd());
 	const baseRenderCall = baseBash.renderCall;
 	const baseRenderResult = baseBash.renderResult;
+	const baseExecute = baseBash.execute;
 	if (!baseRenderCall || !baseRenderResult) {
 		throw new Error("bash-ui requires built-in bash renderCall/renderResult; upgrade pi or disable bash-ui");
 	}
-	const beforeRuns = new Map<string, BeforeSnapshots>();
-	/** 流式期间已构建的 view model：渲染路径只读缓存，tool_result 消费后删除。 */
-	const streamViewModels = new Map<string, { viewModel: ApplyPatchResultViewModel; resultsCount: number }>();
+	const runs = new ApplyPatchRunRegistry();
 
-	pi.on("session_shutdown", () => {
-		beforeRuns.clear();
-		streamViewModels.clear();
-	});
-
-	/** 从最新 text 刷新 trailing（patch 结果块不变时只延长 trailing；解析失败则保留缓存值）。 */
-	const refreshTrailing = (text: string, cached: { viewModel: ApplyPatchResultViewModel; resultsCount: number }): string => {
-		const parsed = parseApplyPatchResultSequence(text);
-		if (!parsed || parsed.results.length !== cached.resultsCount) return cached.viewModel.trailing;
-		return parsed.trailing;
-	};
+	pi.on("session_shutdown", () => runs.clear());
 
 	pi.on("tool_call", async (event, ctx) => {
 		if (!isToolCallEventType("bash", event)) return;
-		const patches = resolvePatches(event.input.command, ctx.cwd);
-		if (patches.length === 0 || ctx.mode !== "tui") return;
-		beforeRuns.set(event.toolCallId, await captureBefore(mergeParsedPatches(patches).operations, patches[0].cwd));
+		if (ctx.mode !== "tui") return; // 非 TUI 的轻量 run 在 execute 创建（无文件 IO）
+		const plan = buildApplyPatchPlan(event.input.command, ctx.cwd);
+		if (!plan) return;
+		// 启动 diff worker（不等待）：cold start 与 shell execution 重叠。
+		warmUpDiffWorker();
+		// tool_call 时捕获：sibling mutation tools 尚未开始执行。
+		const before = await captureBeforeSnapshots(plan);
+		runs.capture(event.toolCallId, plan, before);
 	});
 
 	pi.on("tool_result", async (event, ctx) => {
 		if (!isBashToolResult(event)) return;
-		const patches = resolvePatches(bashResultCommand(event.input), ctx.cwd);
-		if (patches.length === 0) return;
-		const before = beforeRuns.get(event.toolCallId);
-		beforeRuns.delete(event.toolCallId);
-		// 流式期间已构建 → 复用（patch 落地瞬间的文件状态，语义正确），只刷新 trailing。
-		const cached = streamViewModels.get(event.toolCallId);
-		streamViewModels.delete(event.toolCallId);
-		let viewModel: ApplyPatchResultViewModel | undefined;
-		if (cached) {
-			viewModel = { ...cached.viewModel, trailing: refreshTrailing(resultText(event), cached) };
-		} else {
-			viewModel = await buildResultViewModel(
-				patches.map((entry) => entry.patch),
-				{ content: event.content, isError: event.isError },
-				before,
-			);
-		}
+		const viewModel = await runs.finalize(event.toolCallId, resultText(event));
 		if (!viewModel) return;
-		return { details: viewModel };
+		// BashUiDetails：保留 built-in metadata（truncation/fullOutputPath），
+		// bashUi 只承载 view model（tool_result 的 details 整体替换，必须合并）。
+		return { details: { ...event.details, bashUi: { applyPatch: viewModel } } };
 	});
 
 	pi.registerTool({
 		...baseBash,
-		renderCall(args, theme, context) {
-			if (!context.argsComplete) return baseRenderCall(args, theme, context);
-			const patches = resolvePatches(args.command, context.cwd);
-			if (patches.length === 0) return highlightBashCall(args, theme, context, baseRenderCall);
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			if (ctx.mode === "tui") {
+				const plan = buildApplyPatchPlan(params.command, ctx.cwd);
+				if (plan) {
+					// 验证 captured plan 与 final params 一致：policy mutation 可能发生在
+					// bash-ui 的 tool_call 之后（extension 顺序异常）。不一致时放弃旧快照
+					// （sibling tools 可能已开始，重新捕获不可靠），基于 final command 建轻量 run。
+					const captured = runs.capturedPlanCommand(toolCallId);
+					if (captured !== undefined && captured !== plan.command) {
+						console.error(
+							`bash-ui plan mismatch toolCallId=${toolCallId} ` +
+							`captured=${JSON.stringify(captured)} executed=${JSON.stringify(plan.command)} ` +
+							`action="rebuilding run without snapshots (intent diff)"`,
+						);
+						runs.capture(toolCallId, plan);
+					}
+				} else {
+					runs.remove(toolCallId);
+				}
+			} else {
+				// 非 TUI：轻量 run（只保留 plan，intent diff），不读文件。
+				const plan = buildApplyPatchPlan(params.command, ctx.cwd);
+				if (plan) runs.capture(toolCallId, plan);
+			}
 
-			// 执行中：结果块（bash 流式输出或已识别的结果 UI）接管 call 槽；
-			// 完成态：call 槽由 clearPendingCall 清空（edit 模式）。
-			if (!context.isPartial || context.executionStarted) return new Container();
-			return renderPendingApplyPatch(mergeParsedPatches(patches), theme, context as PatchRenderContext);
+			let executeActive = true;
+			runs.attachSink(toolCallId, (update) => {
+				if (executeActive) onUpdate?.(update);
+			});
+			try {
+				const result = await baseExecute(toolCallId, params, signal, (update) => {
+					onUpdate?.(runs.observe(toolCallId, update));
+				}, ctx);
+				return result;
+			} finally {
+				executeActive = false;
+				runs.detachSink(toolCallId);
+			}
+		},
+		renderCall(args, theme, context) {
+			// 执行开始即记时（所有命令，含 apply_patch plan 路径）：
+			// built-in 在自身 renderCall 记时，但 bash-ui 的 argsComplete 路径不调 baseRenderCall。
+			const state = context.state;
+			if (context.executionStarted && state.startedAt === undefined) {
+				state.startedAt = Date.now();
+				state.endedAt = undefined;
+			}
+			const plan = context.argsComplete ? buildApplyPatchPlan(args.command, context.cwd) : undefined;
+			return renderBashCall(args, theme, context, baseRenderCall, plan);
 		},
 		renderResult(result, options, theme, context) {
-			const patches = resolvePatches(context.args.command, context.cwd);
-			if (patches.length === 0) return baseRenderResult(result, options, theme, context);
-
-			const renderContext = context as PatchRenderContext;
-			// 完成态：消费 tool_result 注入的结构化 view model（不解析文本、不读文件）。
-			const viewModel = parseRenderedResultPayloadFromDetails(result.details);
-			if (viewModel) return renderResultViewModel(viewModel, options, theme, renderContext);
-
-			// 流式：首次成功解析时构建一次并缓存；后续 chunk 只刷新 trailing。
-			const cached = streamViewModels.get(context.toolCallId);
-			const text = resultText(result);
-			if (cached) {
-				return renderResultViewModel(
-					{ ...cached.viewModel, trailing: refreshTrailing(text, cached) },
-					options,
-					theme,
-					renderContext,
-				);
+			// 耗时生命周期（与 built-in 相同的 state keys）：partial 期间 1s tick 重绘；
+			// 最终/错误渲染冻结 endedAt 并停 interval。delegate 路径 built-in 复用同一 state。
+			const state = context.state;
+			if (state.startedAt !== undefined && options.isPartial && !state.interval) {
+				state.interval = setInterval(() => context.invalidate(), 1000);
 			}
-			const built = buildResultViewModelSync(patches.map((entry) => entry.patch), result, beforeRuns.get(context.toolCallId));
-			if (built) {
-				streamViewModels.set(context.toolCallId, {
-					viewModel: built,
-					resultsCount: "results" in built ? built.results.length : 1,
-				});
-				return renderResultViewModel(built, options, theme, renderContext);
+			if (!options.isPartial || context.isError) {
+				state.endedAt ??= Date.now();
+				if (state.interval) {
+					clearInterval(state.interval);
+					state.interval = undefined;
+				}
 			}
-			// 未识别（普通命令、复合未支持语法、输出无法匹配）：原样交给 bash。
-			return baseRenderResult(result, options, theme, context);
+			return renderBashResult(result, options, theme, context, baseRenderResult);
 		},
 	});
 }

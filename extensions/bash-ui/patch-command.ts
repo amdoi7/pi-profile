@@ -23,8 +23,41 @@ export type ParsedPatch = {
 	operations: PatchOperation[];
 };
 
+/**
+ * 计划中的一次操作：operation 保留 CLI 局部 index 与展示用 relative path，
+ * absolute path 是 snapshot / aggregation / rewrite pairing 的唯一 identity。
+ */
+export type PlannedPatchOperation = {
+	invocationIndex: number;
+	operation: PatchOperation;
+	sourceAbsolutePath: string;
+	destinationAbsolutePath?: string;
+};
+
+/** 一次 apply_patch invocation：自己的 cwd + patch + absolute-path identity。 */
+export type ApplyPatchInvocation = {
+	index: number;
+	cwd: string;
+	patch: ParsedPatch;
+	operations: readonly PlannedPatchOperation[];
+};
+
+/**
+ * 一次命令的权威解析结果（command 是经过所有 tool_call mutation 后的 final command）。
+ * 只解析一次，capture/finalize/渲染全部消费它，不再到处重跑 parser。
+ * trailingCommand 缺省表示 standalone 单引号形式（本就没有 trailing command）。
+ */
+export type ApplyPatchPlan = {
+	command: string;
+	invocations: readonly ApplyPatchInvocation[];
+	trailingCommand?: string;
+};
+
 const OPERATION_HEADER = /^\*\*\* (Add|Delete|Update) File: (.+)$/;
 const OPERATION_HEADER_PREFIXES = ["*** Add File: ", "*** Delete File: ", "*** Update File: "] as const;
+const APPLY_PATCH_HEREDOC =
+	/(?:^[ \t]*apply_patch[ \t]+|[ \t]*&&[ \t]*apply_patch[ \t]+)<<'([A-Za-z_][A-Za-z0-9_]*)'[ \t]*$/;
+const CD_PREFIX = /(?:^|&&)[ \t]*cd[ \t]+(\S+)/;
 
 function isOperationHeader(line: string): boolean {
 	return OPERATION_HEADER_PREFIXES.some((prefix) => line.startsWith(prefix));
@@ -35,8 +68,8 @@ function normalizeLines(text: string): string[] {
 	return normalized.endsWith("\n") ? normalized.slice(0, -1).split("\n") : normalized.split("\n");
 }
 
-function extractSingleQuotedPatch(command: string): string | undefined {
-	const normalized = command.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+function extractSingleQuotedPatch(line: string): string | undefined {
+	const normalized = line.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 	const prefix = normalized.match(/^[ \t]*apply_patch[ \t]+/);
 	if (!prefix || normalized[prefix[0].length] !== "'") return undefined;
 
@@ -153,65 +186,84 @@ export function operationByIndex(patch: ParsedPatch, index: number): PatchOperat
 	return patch.operations.find((operation) => operation.index === index);
 }
 
-function resolveWorkingDirectory(command: string, initialCwd: string): string {
-	// 取第一个 apply_patch 调用行之前的最后一个 cd（支持行首与 && 链中的 cd）。
-	// 例：`rm -rf X && printf ... && cd Y && apply_patch <<'PATCH'` → Y。
-	let resolved = initialCwd;
-	for (const line of normalizeLines(command)) {
-		const cd = line.match(/(?:^|&&)[ \t]*cd[ \t]+(\S+)/);
-		if (cd) resolved = path.resolve(resolved, cd[1]);
-		if (/(?:^[ \t]*apply_patch[ \t]+|[ \t]*&&[ \t]*apply_patch[ \t]+)<</.test(line)) break;
-	}
-	return resolved;
+function planOperations(invocationIndex: number, cwd: string, patch: ParsedPatch): PlannedPatchOperation[] {
+	return patch.operations.map((operation) => ({
+		invocationIndex,
+		operation,
+		sourceAbsolutePath: path.resolve(cwd, operation.path),
+		destinationAbsolutePath: operation.destination === undefined ? undefined : path.resolve(cwd, operation.destination),
+	}));
 }
 
-export function parseApplyPatches(command: string, initialCwd: string): { patch: ParsedPatch; cwd: string; endLine: number }[] {
-	const cwd = resolveWorkingDirectory(command, initialCwd);
+/**
+ * 权威 plan 构建：顺序扫描命令，为每个 invocation 解析独立 cwd。
+ * - cd 只在 heredoc 之外的命令行生效（heredoc body 是 shell 输入，不是命令）；
+ * - 同一行的 `cd X && apply_patch <<'P'` 前缀先应用再记录；
+ * - trailing command 是最后一个 invocation 的 marker 之后的所有行。
+ * 无 heredoc 时回退 canonical 单引号 standalone 形式（仅第一行，与既有识别范围一致）。
+ */
+export function buildApplyPatchPlan(command: string, initialCwd: string): ApplyPatchPlan | undefined {
 	const lines = normalizeLines(command);
-	const patches: { patch: ParsedPatch; cwd: string; endLine: number }[] = [];
+	const invocations: ApplyPatchInvocation[] = [];
+	let cwd = initialCwd;
+	let lastEndLine = -1;
 	let cursor = 0;
 	while (cursor < lines.length) {
 		const line = lines[cursor] ?? "";
-		const header = line.match(/(?:^[ \t]*apply_patch[ \t]+|[ \t]*&&[ \t]*apply_patch[ \t]+)<<'([A-Za-z_][A-Za-z0-9_]*)'[ \t]*$/);
+		const header = line.match(APPLY_PATCH_HEREDOC);
 		if (!header) {
-			cursor++;
+			const cd = line.match(CD_PREFIX);
+			if (cd) cwd = path.resolve(cwd, cd[1]!);
+			cursor += 1;
 			continue;
 		}
-		const marker = header[1];
+		const cd = line.match(CD_PREFIX);
+		if (cd) cwd = path.resolve(cwd, cd[1]!);
+		const marker = header[1]!;
 		let end = -1;
-		for (let i = cursor + 1; i < lines.length; i++) {
+		for (let i = cursor + 1; i < lines.length; i += 1) {
 			if (lines[i] === marker) {
 				end = i;
 				break;
 			}
 		}
 		if (end === -1) {
-			cursor++;
+			cursor += 1;
 			continue;
 		}
 		const envelope = lines.slice(cursor + 1, end).join("\n");
 		const patch = parsePatchEnvelope(envelope);
 		if (patch) {
-			patches.push({ patch, cwd, endLine: end });
-			cursor = end + 1;
-		} else {
-			cursor++;
+			invocations.push({
+				index: invocations.length,
+				cwd,
+				patch,
+				operations: planOperations(invocations.length, cwd, patch),
+			});
+			lastEndLine = end;
 		}
+		// heredoc body 已被 shell 消费：无论 envelope 是否有效都跳过，body 内的 cd 不算命令。
+		cursor = end + 1;
 	}
-	return patches;
-}
-
-export function trailingCommandAfterApplyPatches(command: string): string {
-	const patches = parseApplyPatches(command, process.cwd());
-	if (patches.length === 0) return "";
-	const lastEndLine = Math.max(...patches.map((entry) => entry.endLine));
-	return normalizeLines(command).slice(lastEndLine + 1).join("\n").trim();
-}
-
-export function parseStandaloneApplyPatch(command: string): ParsedPatch | undefined {
-	const patches = parseApplyPatches(command, process.cwd());
-	if (patches.length === 1) return patches[0]?.patch;
-	if (patches.length > 1) return undefined;
-	const source = extractSingleQuotedPatch(command);
-	return source === undefined ? undefined : parsePatchEnvelope(source);
+	if (invocations.length === 0) {
+		// 回退 canonical 单引号 standalone 形式（引号可跨行；整条命令匹配，与既有识别范围一致）。
+		const source = extractSingleQuotedPatch(command);
+		if (source !== undefined) {
+			const patch = parsePatchEnvelope(source);
+			if (patch) {
+				return {
+					command,
+					invocations: [{
+						index: 0,
+						cwd: initialCwd,
+						patch,
+						operations: planOperations(0, initialCwd, patch),
+					}],
+				};
+			}
+		}
+		return undefined;
+	}
+	const trailing = lines.slice(lastEndLine + 1).join("\n").trim();
+	return { command, invocations, trailingCommand: trailing || undefined };
 }
