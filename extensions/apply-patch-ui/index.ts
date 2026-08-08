@@ -10,6 +10,7 @@ import {
 import { Container } from "@earendil-works/pi-tui";
 
 import { parseApplyPatches, parseStandaloneApplyPatch } from "./patch-command.ts";
+import { highlightBashCall } from "./highlight.ts";
 import {
 	parseRenderedResultPayloadFromDetails,
 	renderApplyPatchResult,
@@ -116,7 +117,7 @@ export default function applyPatchUiExtension(pi: ExtensionAPI) {
 		renderCall(args, theme, context) {
 			if (!context.argsComplete) return baseRenderCall(args, theme, context);
 			const patches = resolvePatches(args.command, context.cwd);
-			if (patches.length === 0) return baseRenderCall(args, theme, context);
+			if (patches.length === 0) return highlightBashCall(args, theme, context, baseRenderCall);
 
 			// 执行中：结果块（bash 流式输出或已识别的结果 UI）接管 call 槽；
 			// 完成态：call 槽由 clearPendingCall 清空（edit 模式）。
