@@ -25,7 +25,7 @@
 
 ### UI polish
 
-- `custom-footer/` — compact footer/status customization；显示 model、context、cost、elapsed、cwd、git branch。
+- `custom-footer/` — 两行网格状态栏：左列 `cwd:`/`ctx:` 标签对齐，右列 model（含 think 级别）与订阅额度；行1 显示 cwd、model、git branch（静态），行2 显示 ctx 用量、token 流量（`↑in ↓out Rw Ww CH%`）、会话成本与额度窗口（5h / Weekly 用量条）；额度只随当前模型 provider 显示（claude/codex/kimi），按量付费 provider（如 deepseek）不显示；宽 <72 退化三行流式布局。
 - `whimsical/` — streaming working-indicator variants；按 tool 类别切换 working message。
 - `escape-rewind/` — early-ESC prompt rewind；assistant 尚未开始回复时，第二次 Esc 回填刚提交 prompt。
 

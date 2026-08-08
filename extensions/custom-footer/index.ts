@@ -2,7 +2,12 @@
  * Custom Footer Extension - Enhanced status bar
  *
  * Displays: ctx used, ctx %, cost, cwd, git branch, provider/model
- * Color-coded context usage: green <50%, yellow 50-75%, red >75%
+ * Color semantics: meters fire signal colors only past healthy thresholds
+ * (ctx: green <70 / amber 70-84 / red >=85; quota bars: green <50 / neutral
+ * 50-69 / amber 70-89 / red >=90). The thinking level label echoes the
+ * editor border's thinking* tokens; extension statuses use customMessageLabel.
+ * Cost is hidden for subscription providers (claude/codex/kimi) where it is
+ * always $0.00.
  *
  * Ownership: lifecycle + data access live here; presentation (formatting,
  * layout) lives in custom-footer-format.ts and is unit-tested there.
@@ -21,11 +26,11 @@ import {
 	formatCwd,
 	formatGitSegment,
 	formatModel,
-	formatProviderOnly,
-	formatTokenStats,
+	formatSessionRow,
 	formatUsageLine,
 	layoutFooter,
 } from "./custom-footer-format.ts";
+import { computeCacheWaste } from "./custom-footer-cache.ts";
 import {
 	createUsageFetcher,
 	detectUsageProvider,
@@ -92,20 +97,27 @@ export default function (pi: ExtensionAPI) {
 					const thinking = pi.getThinkingLevel();
 					const segments = {
 						model: formatModel(theme, providerName, model?.id, thinking),
-						providerOnly: formatProviderOnly(theme, providerName, thinking),
+						providerOnly: formatModel(theme, providerName, undefined, thinking),
 						cwd: formatCwd(theme, cwd, homedir()),
 						branch: formatGitSegment(theme, readGitStatus(cwd)),
 					};
+					const usageProvider = detectUsageProvider(model?.provider, model?.id);
 					const entries = ctx.sessionManager.getEntries();
-					const tokenStats = formatTokenStats(theme, {
+					const cacheWaste = computeCacheWaste(entries, {
+						find: (provider, modelId) => ctx.modelRegistry.find(provider, modelId),
+					});
+					const sessionRow = formatSessionRow(theme, {
 						used: usage?.tokens,
 						pct: usage?.percent,
-						cost: computeSessionCost(entries),
+						cost: usageProvider === null ? computeSessionCost(entries) : null,
 						tps: readTps.getLast(cwd),
 						flow: computeTokenFlow(entries),
+						// 与成本同一规则：订阅制提供商隐藏金额，只留 token 数
+						waste: cacheWaste.missCount > 0 ? cacheWaste : null,
+						showMissCost: usageProvider === null,
 					});
 
-					const fetcher = ensureUsageFetcher(detectUsageProvider(model?.provider, model?.id));
+					const fetcher = ensureUsageFetcher(usageProvider);
 					void fetcher?.refresh().then((updated) => {
 						if (updated) tui.requestRender();
 					});
@@ -115,13 +127,13 @@ export default function (pi: ExtensionAPI) {
 					const lines = layoutFooter(
 						width,
 						segments,
-						tokenStats,
+						sessionRow,
 						usageLine,
 						theme.fg("muted", " │ "),
 					).map((line) => truncateToWidth(line, width));
 
 					for (const line of extensionStatusLines(footerData.getExtensionStatuses())) {
-						lines.push(truncateToWidth(theme.fg("accent", line), width));
+						lines.push(truncateToWidth(theme.fg("customMessageLabel", line), width));
 					}
 					return lines;
 				},
