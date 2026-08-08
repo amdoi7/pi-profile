@@ -1,8 +1,8 @@
 {
-  "lastChangelogVersion": "0.83.0",
+  "lastChangelogVersion": "0.84.1",
   "defaultProvider": "kimi-coding",
   "defaultModel": "k3-256k",
-  "defaultThinkingLevel": "high",
+  "defaultThinkingLevel": "max",
   "packages": [
     {
       "source": "git:github.com/HazAT/glimpse",
@@ -31,8 +31,7 @@
     "./extensions/escape-rewind",
     "./extensions/btw",
     "./extensions/session-breakdown",
-    "./extensions/command-policy",
-    "./extensions/pi-sub-ui"
+    "./extensions/command-policy"
   ],
   "skills": [
     "./extensions/memory/skills",
@@ -65,7 +64,9 @@
   "showCacheMissNotices": true,
   "httpIdleTimeoutMs": 300000,
   "compaction": {
-    "enabled": false
+    "enabled": true
   },
-  "defaultProjectTrust": "ask"
+  "defaultProjectTrust": "always",
+  "fullscreenScrollbar": "auto",
+  "tuiMode": "fullscreen"
 }

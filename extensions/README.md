@@ -21,10 +21,6 @@
 ### Workflow
 
 - `btw/` — side-channel assistant overlay；提供 `/btw` 侧聊与 handoff summary。
-- `pi-sub/` — background subagent 工具 `pi_sub`（start/prompt/abort/status/list/result/wait/transcript/prune）；
-  worker 为 detached `pi --mode rpc` 进程，run 目录是唯一生命周期事实源，子会话恒用
-  确定性 lane 文件（无 fork 切换），alias lease 由 worker 持有；多 TUI 按 owner-session
-  隔离；UI（完成通知、active-run widget、`/pisub` overlay）同目录。
 - `session-breakdown/` — session/context inspection UI；统计 sessions、messages、tokens、cost 与 model/cwd/time breakdown。
 
 ### UI polish
