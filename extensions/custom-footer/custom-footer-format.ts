@@ -46,12 +46,12 @@ export function formatCost(cost: number): string {
 
 /**
  * 缓存失效汇总：`miss 143k (2×)` — 主指标是本应命中却被重新计费的
- * token 总量，括号内为失效次数；非订阅制提供商且额外成本 ≥1 分时
- * 追加金额。词汇与 pi 内部 computeCacheWaste / Cache miss 对齐。
+ * token 总量，括号内为失效次数；额外成本 ≥1 分时追加金额。
+ * 词汇与 pi 内部 computeCacheWaste / Cache miss 对齐。
  */
-export function formatCacheWaste(theme: FooterTheme, waste: CacheWaste, showCost: boolean): string {
+export function formatCacheWaste(theme: FooterTheme, waste: CacheWaste): string {
   let text = theme.fg("warning", `miss ${formatCompact(waste.missedTokens)} (${waste.missCount}×)`);
-  if (showCost && waste.missedCost >= 0.01) {
+  if (waste.missedCost >= 0.01) {
     text += theme.fg("warning", ` (+$${waste.missedCost.toFixed(2)})`);
   }
   return text;
@@ -83,27 +83,51 @@ export function formatSessionRow(
   opts: {
     used: number | undefined;
     pct: number | undefined;
-    cost: number | null;
+    /** 上下文窗口容量：`443k/1M`（用量/容量），compact 决策直接可读。 */
+    contextWindow: number;
+    cost: number;
     tps: number | null;
+    /** 进行中一轮的经过时间（毫秒）：`本轮12s`，每秒增长。 */
+    currentElapsedMs: number | null;
+    /** 最近一轮的总时长（毫秒）：`本轮1m5s`（完成态）。 */
+    turnMs: number | null;
+    /** 最近完成消息的首字时间（TTFB，毫秒）：`ttfb1.2s`。 */
+    ttfbMs: number | null;
     flow: TokenFlow | null;
     waste: CacheWaste | null;
-    showMissCost: boolean;
   },
 ): string {
   const hasPct = typeof opts.pct === "number";
   const hasUsed = typeof opts.used === "number";
   const color = contextColor(opts.pct, opts.used);
+  const usedText = hasUsed
+    ? `${formatCompact(opts.used)}/${formatCompact(opts.contextWindow)}`
+    : "?";
   const rows = [
-    `${theme.fg("muted", "ctx:")} ${theme.fg("text", hasUsed ? formatCompact(opts.used) : "?")} ${theme.fg(color, hasPct ? `${opts.pct.toFixed(0)}%` : "?")}`,
+    `${theme.fg("muted", "ctx:")} ${theme.fg("text", usedText)} ${theme.fg(color, hasPct ? `${opts.pct.toFixed(0)}%` : "?")}`,
   ];
-  if (opts.flow !== null) rows.push(formatTokenFlow(theme, opts.flow));
+  // 会话累计段：token 流 + τ 占比 + miss（浪费）+ 账单——都是会话级，同段。
+  const sessionParts: string[] = [];
+  if (opts.flow !== null) sessionParts.push(formatTokenFlow(theme, opts.flow));
   if (opts.waste !== null && opts.waste.missCount > 0) {
-    rows.push(formatCacheWaste(theme, opts.waste, opts.showMissCost));
+    sessionParts.push(formatCacheWaste(theme, opts.waste));
   }
+  sessionParts.push(theme.fg("muted", formatCost(opts.cost)));
+  rows.push(sessionParts.join(" "));
+  // 本轮动态段：tps/ttfb/本轮时长——都是本轮级，独立一段。
+  // 所有字段独立显示（有数据就显示，不做状态互斥）：tps/ttfb 是最近完成消息
+  // 的值（一直显示）；本轮时长进行中显示实时值，完成后显示总时长。
   const tail: string[] = [];
-  if (opts.cost !== null) tail.push(theme.fg("muted", formatCost(opts.cost)));
-  if (opts.tps !== null) {
+  if (opts.tps != null) {
     tail.push(theme.fg("muted", `${Math.round(opts.tps)} t/s`));
+  }
+  if (opts.ttfbMs != null && opts.tps != null) {
+    tail.push(theme.fg("muted", `ttfb${(opts.ttfbMs / 1000).toFixed(1)}s`));
+  }
+  if (opts.currentElapsedMs != null) {
+    tail.push(theme.fg("muted", `本轮${formatDuration(opts.currentElapsedMs)}`));
+  } else if (opts.turnMs != null) {
+    tail.push(theme.fg("muted", `本轮${formatDuration(opts.turnMs)}`));
   }
   if (tail.length > 0) rows.push(tail.join(" "));
   return rows.join(theme.fg("muted", " │ "));
@@ -112,15 +136,15 @@ export function formatSessionRow(
 // --- token flow ------------------------------------------------------------
 
 /**
- * Session totals of input/output/cache tokens.
- * ↑/↓ 输入输出、R 缓存读、W 缓存写均为会话累计值；
- * 缓存浪费（miss）见 formatCacheWaste，比单次命中率更有行动意义。
+ * 会话累计的输入/输出 tokens 与 thinking 占比。
+ * R/W（缓存读写累计）已移除：绝对值无参照系（每轮重复读缓存是常态），
+ * 缓存浪费信号由 formatCacheWaste（miss）承载。
  */
 export type TokenFlow = {
   input: number;
   output: number;
-  cacheRead: number;
-  cacheWrite: number;
+  /** 输出中 thinking（reasoning）token 累计；reasoning 是 output 的子集。 */
+  reasoning: number;
 };
 
 /**
@@ -130,32 +154,40 @@ export type TokenFlow = {
 export function computeTokenFlow(entries: readonly SessionEntry[]): TokenFlow | null {
   let input = 0;
   let output = 0;
-  let cacheRead = 0;
-  let cacheWrite = 0;
+  let reasoning = 0;
   for (const entry of entries) {
     if (entry.type !== "message" || entry.message?.role !== "assistant") continue;
     const u = entry.message.usage;
     if (!u) continue;
     if (typeof u.input === "number") input += u.input;
     if (typeof u.output === "number") output += u.output;
-    if (typeof u.cacheRead === "number") cacheRead += u.cacheRead;
-    if (typeof u.cacheWrite === "number") cacheWrite += u.cacheWrite;
+    if (typeof u.reasoning === "number") reasoning += u.reasoning;
   }
-  if (input === 0 && output === 0 && cacheRead === 0 && cacheWrite === 0) return null;
-  return { input, output, cacheRead, cacheWrite };
+  if (input === 0 && output === 0 && reasoning === 0) return null;
+  return { input, output, reasoning };
 }
 
-/** `↑3k ↓400 R20k W2.0k`；无缓存活动时省略 R/W。 */
+/**
+ * `↑3k ↓400 (τ69%)`；输出含 thinking（reasoning > 0）时显示占比
+ * （τ = thinking，reasoning 是 output 的子集）。单轮动态字段（tps/ttfb/
+ * 思考时长）统一在尾部动态组，不在此处。
+ */
 export function formatTokenFlow(theme: FooterTheme, flow: TokenFlow): string {
   const parts = [
     theme.fg("text", `↑${formatCompact(flow.input)} ↓${formatCompact(flow.output)}`),
   ];
-  if (flow.cacheRead > 0 || flow.cacheWrite > 0) {
-    parts.push(
-      theme.fg("muted", `R${formatCompact(flow.cacheRead)} W${formatCompact(flow.cacheWrite)}`),
-    );
+  if (flow.reasoning > 0) {
+    const thinkingPct = (flow.reasoning / flow.output) * 100;
+    parts[0] = theme.fg("text", `↑${formatCompact(flow.input)} ↓${formatCompact(flow.output)} (τ${thinkingPct.toFixed(0)}%)`);
   }
   return parts.join(" ");
+}
+
+/** 思考时长显示：`42s` / `1m5s`（毫秒输入）。 */
+export function formatDuration(ms: number): string {
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  return `${Math.floor(seconds / 60)}m${seconds % 60}s`;
 }
 
 // --- git segment ------------------------------------------------------------
@@ -163,10 +195,15 @@ export function formatTokenFlow(theme: FooterTheme, flow: TokenFlow): string {
 export function formatGitSegment(theme: FooterTheme, status: GitStatusSnapshot | null): string {
   if (status === null) return "";
   const marker = status.dirtyCount > 0 ? theme.fg("warning", "*") : "";
+  // zentui diverged form：计数紧贴各自箭头，无分隔符，歧义为零。
+  let aheadBehind = "";
+  if (status.ahead > 0 && status.behind > 0) aheadBehind = `↑${status.ahead}↓${status.behind}`;
+  else if (status.ahead > 0) aheadBehind = `↑${status.ahead}`;
+  else if (status.behind > 0) aheadBehind = `↓${status.behind}`;
   const extras: string[] = [];
-  if (status.ahead > 0) extras.push(theme.fg("muted", `↑${status.ahead}`));
-  if (status.behind > 0) extras.push(theme.fg("muted", `↓${status.behind}`));
+  if (aheadBehind) extras.push(theme.fg("muted", aheadBehind));
   if (status.dirtyCount > 0) extras.push(theme.fg("muted", `!${status.dirtyCount}`));
+  if (status.gitStateLabel) extras.push(theme.fg("warning", status.gitStateLabel));
   const suffix = extras.length > 0 ? ` ${extras.join(" ")}` : "";
   return `${theme.fg("text", `⎇ ${status.branch}`)}${marker}${suffix}`;
 }
@@ -289,11 +326,15 @@ function isWideCode(code: number): boolean {
 }
 
 /**
- * Two-row dashboard on a designed grid: the left column (cwd / ctx) pads
- * out to LEFT_BAND units when content is short, and the right column
- * (model+branch / usage) starts COLUMN_GAP units after it — positions are
- * stable no matter how wide the terminal is; the footer never stretches
- * to the terminal edge. Longer left content extends the grid naturally.
+ * Two-row dashboard on a designed grid. Left column is the session environment
+ * (cwd + git branch), right column the runtime config (model, usage). Column
+ * positions stay stable: right column starts at max(content, regime band
+ * minimum) + COLUMN_GAP, never stretching to the terminal edge.
+ *
+ * Git branch joins the cwd segment (semantic grouping: repo state is a
+ * property of the working directory), so branch changes (commit / dirty count /
+ * switch) move the right column — accepted trade-off for left-column
+ * continuity, kept to ≥100 columns to protect narrow terminals.
  * One formula in both grid regimes: column start = max(content, regime
  * band minimum) + COLUMN_GAP. The band minimum applies at >=100 columns
  * (where the branch segment also appears); below it the minimum is zero
@@ -314,10 +355,12 @@ export function layoutFooter(
   separator: string,
 ): string[] {
   if (width >= 72) {
-    const rightTop = width >= 100 && segments.branch.length > 0
-      ? `${segments.model}${separator}${segments.branch}`
-      : segments.model;
-    const leftWidth = Math.max(displayWidth(segments.cwd), displayWidth(sessionRow));
+    const leftTop =
+      width >= 100 && segments.branch.length > 0
+        ? `${segments.cwd}${separator}${segments.branch}`
+        : segments.cwd;
+    const rightTop = segments.model;
+    const leftWidth = Math.max(displayWidth(leftTop), displayWidth(sessionRow));
     const start = Math.max(leftWidth, width >= 100 ? LEFT_BAND : 0) + COLUMN_GAP;
     const place = (left: string, right: string): string => {
       if (right.length === 0) return left;
@@ -325,7 +368,7 @@ export function layoutFooter(
       return `${left}${" ".repeat(gap)}${right}`;
     };
     return [
-      place(segments.cwd, rightTop),
+      place(leftTop, rightTop),
       place(sessionRow, usageLine ?? ""),
     ];
   }

@@ -59,16 +59,16 @@ describe("contextColor", () => {
 describe("formatCacheWaste", () => {
 	const waste: CacheWaste = { missedTokens: 122_330, missedCost: 0.0084, missCount: 2 };
 	test("renders count and tokens", () => {
-		expect(formatCacheWaste(theme, waste, false)).toBe("miss 122k (2×)");
+		expect(formatCacheWaste(theme, waste)).toBe("miss 122k (2×)");
 	});
-	test("appends cost when shown and material", () => {
-		expect(formatCacheWaste(theme, { ...waste, missedCost: 0.012 }, true)).toBe("miss 122k (2×) (+$0.01)");
+	test("appends cost when material", () => {
+		expect(formatCacheWaste(theme, { ...waste, missedCost: 0.012 })).toBe("miss 122k (2×) (+$0.01)");
 	});
 	test("omits cost below a cent", () => {
-		expect(formatCacheWaste(theme, { ...waste, missedCost: 0.004 }, true)).toBe("miss 122k (2×)");
+		expect(formatCacheWaste(theme, { ...waste, missedCost: 0.004 })).toBe("miss 122k (2×)");
 	});
 	test("renders single miss without plural marker", () => {
-		expect(formatCacheWaste(theme, { ...waste, missCount: 1 }, false)).toBe("miss 122k (1×)");
+		expect(formatCacheWaste(theme, { ...waste, missCount: 1 })).toBe("miss 122k (1×)");
 	});
 });
 
@@ -78,48 +78,104 @@ describe("formatSessionRow", () => {
 			formatSessionRow(theme, {
 				used: 12_000,
 				pct: 52.3,
+				contextWindow: 1_000_000,
 				cost: 0.1234,
 				tps: 42.4,
-				flow: { input: 3_000, output: 400, cacheRead: 20_000, cacheWrite: 2_000 },
+				ttfbMs: null,
+				currentElapsedMs: null,
+				flow: { input: 3_000, output: 400, reasoning: 0 },
 				waste: null,
-				showMissCost: false,
 			}),
-		).toBe("ctx: 12k 52% │ ↑3k ↓400 R20k W2k │ $0.12 42 t/s");
+		).toBe("ctx: 12k/1M 52% │ ↑3k ↓400 $0.12 │ 42 t/s");
 	});
-	test("hides cost when null (subscription providers)", () => {
-		expect(
-			formatSessionRow(theme, { used: 12_000, pct: 52.3, cost: null, tps: null, flow: null, waste: null, showMissCost: false }),
-		).toBe("ctx: 12k 52%");
-	});
-	test("keeps zero cache counters visible as diagnostics", () => {
+	test("shows first-token time (ttfb) next to the tps", () => {
 		expect(
 			formatSessionRow(theme, {
 				used: 12_000,
 				pct: 52.3,
+				contextWindow: 1_000_000,
+				cost: 0.1234,
+				tps: 42.4,
+				ttfbMs: 1_200,
+				currentElapsedMs: null,
+				turnMs: null,
+				flow: null,
+				waste: null,
+			}),
+		).toBe("ctx: 12k/1M 52% │ $0.12 │ 42 t/s ttfb1.2s");
+	});
+	test("shows turn duration in the completed dynamic group", () => {
+		expect(
+			formatSessionRow(theme, {
+				used: 12_000,
+				pct: 52.3,
+				contextWindow: 1_000_000,
+				cost: 0.1,
+				tps: 42.4,
+				ttfbMs: null,
+				currentElapsedMs: null,
+				turnMs: 65_000,
+				flow: { input: 3_000, output: 400, reasoning: 276 },
+				waste: null,
+			}),
+		).toBe("ctx: 12k/1M 52% │ ↑3k ↓400 (τ69%) $0.10 │ 42 t/s 本轮1m5s");
+	});
+	test("shows live turn elapsed alongside the completed tps/ttfb", () => {
+		expect(
+			formatSessionRow(theme, {
+				used: 12_000,
+				pct: 52.3,
+				contextWindow: 1_000_000,
+				cost: 0.1,
+				tps: 42.4,
+				ttfbMs: 1_200,
+				currentElapsedMs: 12_000,
+				turnMs: null,
+				flow: null,
+				waste: null,
+			}),
+		).toBe("ctx: 12k/1M 52% │ $0.10 │ 42 t/s ttfb1.2s 本轮12s");
+	});
+	test("renders zero cost when the model has no price table", () => {
+		expect(
+			formatSessionRow(theme, { used: 12_000, pct: 52.3, contextWindow: 1_000_000, cost: 0, tps: null, ttfbMs: null, currentElapsedMs: null, turnMs: null, flow: null, waste: null }),
+		).toBe("ctx: 12k/1M 52% │ $0.00");
+	});
+	test("omits cache counters (waste signal lives in the miss segment)", () => {
+		expect(
+			formatSessionRow(theme, {
+				used: 12_000,
+				pct: 52.3,
+				contextWindow: 1_000_000,
 				cost: 0.1,
 				tps: null,
-				flow: { input: 3_000, output: 400, cacheRead: 20_000, cacheWrite: 0 },
+				ttfbMs: null,
+				currentElapsedMs: null,
+				turnMs: null,
+				flow: { input: 3_000, output: 400, reasoning: 0 },
 				waste: null,
-				showMissCost: false,
 			}),
-		).toBe("ctx: 12k 52% │ ↑3k ↓400 R20k W0 │ $0.10");
+		).toBe("ctx: 12k/1M 52% │ ↑3k ↓400 $0.10");
 	});
 	test("omits cache and flow segments when unavailable", () => {
 		expect(
 			formatSessionRow(theme, {
 				used: 12_000,
 				pct: 52.3,
+				contextWindow: 1_000_000,
 				cost: 0.1234,
 				tps: null,
-				flow: { input: 3_000, output: 400, cacheRead: 0, cacheWrite: 0 },
+				ttfbMs: null,
+				currentElapsedMs: null,
+				turnMs: null,
+				flow: { input: 3_000, output: 400, reasoning: 0 },
 				waste: null,
-				showMissCost: false,
 			}),
-		).toBe("ctx: 12k 52% │ ↑3k ↓400 │ $0.12");
+		).toBe("ctx: 12k/1M 52% │ ↑3k ↓400 $0.12");
 	});
 	test("renders placeholders and omits tps when unavailable", () => {
 		expect(
-			formatSessionRow(theme, { used: undefined, pct: undefined, cost: 0, tps: null, flow: null, waste: null, showMissCost: false }),
+			formatSessionRow(theme, { used: undefined, pct: undefined, contextWindow: 1_000_000, cost: 0, tps: null, ttfbMs: null, currentElapsedMs: null, turnMs: null, flow: null, waste: null }),
 		).toBe("ctx: ? ? │ $0.00");
 	});
 });
@@ -127,15 +183,24 @@ describe("formatSessionRow", () => {
 describe("computeTokenFlow", () => {
 	test("accumulates session totals across assistant messages", () => {
 		const entries = [
-			{ type: "message", message: { role: "assistant", usage: { input: 1_000, output: 100, cacheRead: 500, cacheWrite: 200, cost: { total: 0.1 } } } },
-			{ type: "message", message: { role: "assistant", usage: { input: 2_000, output: 300, cacheRead: 4_500, cacheWrite: 1_800, cost: { total: 0.2 } } } },
-			{ type: "message", message: { role: "user", usage: { input: 9_999, output: 9_999, cacheRead: 9_999, cacheWrite: 9_999 } } },
+			{ type: "message", message: { role: "assistant", usage: { input: 1_000, output: 100, reasoning: 10, cost: { total: 0.1 } } } },
+			{ type: "message", message: { role: "assistant", usage: { input: 2_000, output: 300, reasoning: 30, cost: { total: 0.2 } } } },
+			{ type: "message", message: { role: "user", usage: { input: 9_999, output: 9_999, reasoning: 9_999 } } },
 		];
 		expect(computeTokenFlow(entries)).toEqual({
 			input: 3_000,
 			output: 400,
-			cacheRead: 5_000,
-			cacheWrite: 2_000,
+			reasoning: 40,
+		});
+	});
+	test("accumulates reasoning tokens as a subset of output", () => {
+		const entries = [
+			{ type: "message", message: { role: "assistant", usage: { input: 1_000, output: 400, reasoning: 276 } } },
+		];
+		expect(computeTokenFlow(entries)).toEqual({
+			input: 1_000,
+			output: 400,
+			reasoning: 276,
 		});
 	});
 	test("returns null without assistant usage", () => {
@@ -148,12 +213,23 @@ describe("formatGitSegment", () => {
 	test("renders branch, dirty marker and ahead/behind", () => {
 		expect(
 			formatGitSegment(theme, { branch: "main", dirtyCount: 2, ahead: 1, behind: 3 }),
-		).toBe("⎇ main* ↑1 ↓3 !2");
+		).toBe("⎇ main* ↑1↓3 !2");
 	});
 	test("renders clean branch without extras", () => {
 		expect(formatGitSegment(theme, { branch: "main", dirtyCount: 0, ahead: 0, behind: 0 })).toBe(
 			"⎇ main",
 		);
+	});
+	test("renders in-flight git operation state label", () => {
+		expect(
+			formatGitSegment(theme, {
+				branch: "main",
+				dirtyCount: 5,
+				ahead: 3,
+				behind: 2,
+				gitStateLabel: "REBASING 3/5",
+			}),
+		).toBe("⎇ main* ↑3↓2 !5 REBASING 3/5");
 	});
 	test("returns empty string for null status", () => {
 		expect(formatGitSegment(theme, null)).toBe("");
@@ -240,18 +316,17 @@ describe("layoutFooter", () => {
 	};
 	const sessionRow = "ctx";
 	const usageLine = "5h ████░░░░ 42% (1h 2m)";
-	const rightTop = "provider/model · think:low │ ⎇ main";
 
 	test("wide layout pads the left column to the designed band", () => {
 		expect(layoutFooter(120, segments, sessionRow, usageLine, " │ ")).toEqual([
-			`cwd: ~/repo${" ".repeat(33)}${rightTop}`,
+			`cwd: ~/repo │ ⎇ main${" ".repeat(24)}${segments.model}`,
 			`ctx${" ".repeat(41)}${usageLine}`,
 		]);
 	});
 	test("left content longer than the band extends the grid", () => {
 		const long = "ctx: 12k 52% $0.12";
 		expect(layoutFooter(120, segments, long, usageLine, " │ ")).toEqual([
-			`cwd: ~/repo${" ".repeat(33)}${rightTop}`,
+			`cwd: ~/repo │ ⎇ main${" ".repeat(24)}${segments.model}`,
 			`${long}${" ".repeat(44 - long.length)}${usageLine}`,
 		]);
 	});
@@ -282,7 +357,7 @@ describe("layoutFooter", () => {
 	});
 	test("grid persists without usage, right column empty", () => {
 		expect(layoutFooter(120, segments, sessionRow, null, " │ ")).toEqual([
-			`cwd: ~/repo${" ".repeat(33)}${rightTop}`,
+			`cwd: ~/repo │ ⎇ main${" ".repeat(24)}${segments.model}`,
 			"ctx",
 		]);
 	});
@@ -290,7 +365,7 @@ describe("layoutFooter", () => {
 		const cjk = "ctx: 5k 2% │ ↑5k ↓1k R26k W0 上次CH97%";
 		// JS 长度 36，终端宽度 38（上次 占 4 列）；右列仍与 ASCII 行同一起点 44
 		expect(layoutFooter(120, segments, cjk, usageLine, " │ ")).toEqual([
-			`cwd: ~/repo${" ".repeat(33)}${rightTop}`,
+			`cwd: ~/repo │ ⎇ main${" ".repeat(24)}${segments.model}`,
 			`${cjk}${" ".repeat(6)}${usageLine}`,
 		]);
 	});
@@ -300,7 +375,7 @@ describe("layoutFooter", () => {
 		const cwd = ansi("cwd: ~/repo");
 		// truecolor 转义每条 16 字符：若不剥 ANSI，行 1 右列会被推到 ~100 列外
 		expect(layoutFooter(120, { ...segments, cwd }, cjk, usageLine, " │ ")).toEqual([
-			`${cwd}${" ".repeat(33)}${rightTop}`,
+			`${cwd} │ ⎇ main${" ".repeat(24)}${segments.model}`,
 			`${cjk}${" ".repeat(6)}${usageLine}`,
 		]);
 	});

@@ -46,14 +46,19 @@ function makeDeps(overrides: Partial<UsageFetcherDeps> = {}): UsageFetcherDeps &
 }
 
 describe("detectUsageProvider", () => {
-	test("detects claude, codex and kimi by provider or model id", () => {
-		expect(detectUsageProvider("anthropic", "claude-sonnet")).toBe("claude");
-		expect(detectUsageProvider("local", "claude-opus")).toBe("claude");
-		expect(detectUsageProvider("openai", "codex-mini")).toBe("codex");
-		expect(detectUsageProvider("chatgpt", "gpt-5")).toBe("codex");
-		expect(detectUsageProvider("kimi-coding", "kimi-k2")).toBe("kimi");
-		expect(detectUsageProvider("moonshot", "kimi-k2")).toBe("kimi");
-		expect(detectUsageProvider("deepseek", "deepseek-v4")).toBeNull();
+	test("detects the exact built-in subscription provider ids", () => {
+		expect(detectUsageProvider("anthropic")).toBe("claude");
+		expect(detectUsageProvider("openai-codex")).toBe("codex");
+		expect(detectUsageProvider("kimi-coding")).toBe("kimi");
+	});
+
+	test("proxy and API providers are pay-as-you-go (no quota line)", () => {
+		expect(detectUsageProvider("xfastapi-codex")).toBeNull();
+		expect(detectUsageProvider("openai")).toBeNull();
+		expect(detectUsageProvider("local")).toBeNull();
+		expect(detectUsageProvider("moonshotai")).toBeNull();
+		expect(detectUsageProvider("deepseek")).toBeNull();
+		expect(detectUsageProvider(undefined)).toBeNull();
 	});
 });
 

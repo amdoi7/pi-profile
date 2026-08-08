@@ -97,7 +97,7 @@ describe("computeCacheWaste", () => {
 		expect(computeCacheWaste(entries, noCostModel).missCount).toBe(0);
 	});
 
-	test("records idle gap and model switch as miss metadata", () => {
+	test("counts misses across model switches and idle gaps (no exemption)", () => {
 		const entries = [
 			msg({ timestamp: t(0), usage: { input: 1_000, output: 10, cacheRead: 50_000, cacheWrite: 0 } }),
 			msg({

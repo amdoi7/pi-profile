@@ -443,14 +443,22 @@ export type UsageProviderName = "claude" | "codex" | "kimi" | null;
 
 /**
  * Detect which usage provider applies to the current model.
- * Provider name and model id are both considered; unknown providers map to null.
+ * Subscription status is a property of the provider id, not the model id:
+ * only the exact built-in subscription providers (anthropic / openai-codex /
+ * kimi-coding) match. Proxies and API providers (xfastapi-codex, openai,
+ * moonshotai, local, ...) are pay-as-you-go and map to null.
  */
-export function detectUsageProvider(providerName: string | undefined, modelId: string | undefined): UsageProviderName {
-  const haystack = `${providerName ?? ""} ${modelId ?? ""}`.toLowerCase();
-  if (haystack.includes("anthropic") || haystack.includes("claude")) return "claude";
-  if (haystack.includes("codex") || haystack.includes("chatgpt")) return "codex";
-  if (haystack.includes("kimi") || haystack.includes("moonshot")) return "kimi";
-  return null;
+export function detectUsageProvider(providerName: string | undefined): UsageProviderName {
+  switch ((providerName ?? "").toLowerCase()) {
+    case "anthropic":
+      return "claude";
+    case "openai-codex":
+      return "codex";
+    case "kimi-coding":
+      return "kimi";
+    default:
+      return null;
+  }
 }
 
 export function createUsageFetcher(

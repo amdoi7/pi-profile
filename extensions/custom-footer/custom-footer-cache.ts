@@ -9,7 +9,6 @@
  * 额外成本 = miss token × (实际付费单价 − 缓存读单价)。
  */
 
-export const CACHE_TTL_MS = 5 * 60 * 1000;
 export const NOISE_FLOOR_TOKENS = 1024;
 
 export type CacheWasteModel = { cost?: { cacheRead?: number } } | undefined;
@@ -24,7 +23,7 @@ export type CacheWaste = {
   missCount: number;
 };
 
-type CacheEntry = {
+export type CacheEntry = {
   type: string;
   message?: {
     role?: string;
@@ -34,6 +33,7 @@ type CacheEntry = {
     usage?: {
       input?: number;
       output?: number;
+      reasoning?: number;
       cacheRead?: number;
       cacheWrite?: number;
       cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; total?: number };
@@ -41,18 +41,16 @@ type CacheEntry = {
   };
 };
 
-type PrevRequest = {
+export type PrevRequest = {
   promptTokens: number;
-  modelKey: string;
-  timestamp: number;
   reportedCache: boolean;
 };
 
-function detectMiss(
+export function detectMiss(
   prev: PrevRequest | undefined,
   entry: CacheEntry,
   models: CacheWasteModels,
-): { missedTokens: number; missedCost: number; idleMs: number; modelChanged: boolean } | undefined {
+): { missedTokens: number; missedCost: number } | undefined {
   const u = entry.message?.usage;
   if (!u) return undefined;
   const input = u.input ?? 0;
@@ -80,28 +78,23 @@ function detectMiss(
   return {
     missedTokens,
     missedCost: missedTokens * Math.max(0, paidPerToken - readPerToken),
-    idleMs: Math.max(0, (entry.message?.timestamp ?? 0) - prev.timestamp),
-    modelChanged:
-      `${entry.message?.provider}/${entry.message?.model}` !== prev.modelKey,
   };
 }
 
-function asPreviousRequest(entry: CacheEntry, reportedCache: boolean): PrevRequest | undefined {
+export function asPreviousRequest(entry: CacheEntry, reportedCache: boolean): PrevRequest | undefined {
   const u = entry.message?.usage;
   if (!u) return undefined;
   const promptTokens = (u.input ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0);
   if (promptTokens <= 0) return undefined;
   return {
     promptTokens,
-    modelKey: `${entry.message?.provider ?? ""}/${entry.message?.model ?? ""}`,
-    timestamp: entry.message?.timestamp ?? 0,
     reportedCache: reportedCache || (u.cacheRead ?? 0) + (u.cacheWrite ?? 0) > 0,
   };
 }
 
 /**
  * 会话级缓存浪费汇总：应为缓存读却被重新计费的 prompt token。
- * compaction / 分支摘要使上下文合法变化，重置基线（换模型不豁免）。
+ * compaction / 分支摘要使上下文合法变化，重置基线（换模型、空闲间隔不豁免）。
  */
 export function computeCacheWaste(entries: readonly CacheEntry[], models: CacheWasteModels): CacheWaste {
   let prev: PrevRequest | undefined;

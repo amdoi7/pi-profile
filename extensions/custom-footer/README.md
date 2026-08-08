@@ -11,7 +11,7 @@ cwd: ~/.pi                                  Kimi For Coding/k3-256k · think:max
 ctx: 53k 20% │ ↑69k ↓29k R973k W0 │ miss 143k (2×)      5h ▎░░░░░░░ 3% (2h 39m) │ Weekly ▏░░░░░░░ 1% (1d 9h)
 ```
 
-- 行1（静态）：`cwd:` 工作目录（home 相对 `~` 路径，>30 列折叠中段）、`provider/model · think:level`（level 按 thinking* 主题 token 着色，与编辑器边框同色）、git branch（`⎇` + dirty `*` + ahead/behind `↑↓`）。
+- 行1（静态）：`cwd:` 工作目录（home 相对 `~` 路径，>30 列折叠中段）、`provider/model · think:level`（level 按 thinking* 主题 token 着色，与编辑器边框同色）、git branch（`⎇` + dirty `*` + ahead/behind `↑↓`，diverged 为 `↑3↓2` 紧凑式）；rebase/merge/cherry-pick/revert/bisect 进行中时追加操作标签（`REBASING 3/5`、`MERGING`…，warning 色）。
 - 行2（动态）：`ctx:` 上下文 tokens 与使用率（≥70% 橙、≥85% 红）、token 流量
   `↑输入 ↓输出 R缓存读 W缓存写（均为会话累计）`、缓存失效汇总
   `miss次数× 重新计费tokens (+$金额)`（仅 missCount>0 时显示；金额≥1分且
@@ -54,14 +54,14 @@ fetcher 有 60s TTL 与失败退避（5min）；刷新成功返回 `true` 触发
 
 ## 模块
 
-- `index.ts` — extension 入口；`session_start` 注册 footer，`message_start/end` 采集 tps，`thinking_level_select`/`onBranchChange`/30s 定时触发重渲染。
+- `index.ts` — extension 入口；`session_start` 注册 footer，`message_start/end` 采集 tps，`thinking_level_select`/`model_select` 即时 flush，`onBranchChange` + gitDir watch（外部 git 变化即时重渲染）触发，30s 定时兜底。
 - `custom-footer-format.ts` — 纯格式化与布局：段函数（model/cwd/ctx/git/usage）、token flow 聚合（`computeTokenFlow`）、网格布局（`layoutFooter`）。
 - `custom-footer-usage.ts` — 额度 fetcher 工厂 + TTL/退避缓存。
-- `custom-footer-git.ts` — git status 缓存（TTL + mtime 校验）。
+- `custom-footer-git.ts` — git status 缓存（TTL + mtime 校验，含操作标记文件）+ 操作状态检测（`detectGitState`）+ gitDir watch（`createGitWatcher`，目录级监听，失败静默降级）。
 - `custom-footer-tps.ts` — 最近请求吞吐（t/s）tracker。
 
 ## 测试
 
 ```bash
-npx vitest run   # 49 tests：format 纯函数、usage fetcher（含 kimi 刷新链路 mock）、git 缓存、tps、index 集成
+npx vitest run   # 93 tests：format 纯函数、usage fetcher（含 kimi 刷新链路 mock）、git 缓存与操作状态检测与 watcher、tps、session stats、index 集成
 ```

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { createGitStatusCache } from "./custom-footer-git.ts";
+import { createGitStatusCache, type GitRepoMtimes } from "./custom-footer-git.ts";
 import customFooterExtension from "./index.ts";
 
 describe("custom footer git status cache", () => {
@@ -17,7 +17,16 @@ describe("custom footer git status cache", () => {
       },
       getRepoMtimes() {
         repoMtimesCalls += 1;
-        return { headMtimeMs: 10, indexMtimeMs: 20 };
+        return {
+          headMtimeMs: 10,
+          indexMtimeMs: 20,
+          mergeHeadMtimeMs: -1,
+          cherryPickHeadMtimeMs: -1,
+          revertHeadMtimeMs: -1,
+          bisectLogMtimeMs: -1,
+          rebaseMsgnumMtimeMs: -1,
+          rebaseEndMtimeMs: -1,
+        };
       },
       readStatus() {
         readStatusCalls += 1;
@@ -36,7 +45,16 @@ describe("custom footer git status cache", () => {
 
   test("refreshes cached git status when mtimes change before TTL expiry", () => {
     let nowMs = 1_000;
-    let mtimes = { headMtimeMs: 10, indexMtimeMs: 20 };
+    let mtimes: GitRepoMtimes = {
+      headMtimeMs: 10,
+      indexMtimeMs: 20,
+      mergeHeadMtimeMs: -1,
+      cherryPickHeadMtimeMs: -1,
+      revertHeadMtimeMs: -1,
+      bisectLogMtimeMs: -1,
+      rebaseMsgnumMtimeMs: -1,
+      rebaseEndMtimeMs: -1,
+    };
     let readStatusCalls = 0;
 
     const readGitStatus = createGitStatusCache({
@@ -55,7 +73,51 @@ describe("custom footer git status cache", () => {
 
     expect(readGitStatus("/repo")?.branch).toBe("main-1");
     nowMs = 1_500;
-    mtimes = { headMtimeMs: 10, indexMtimeMs: 21 };
+    mtimes = {
+      headMtimeMs: 10,
+      indexMtimeMs: 21,
+      mergeHeadMtimeMs: -1,
+      cherryPickHeadMtimeMs: -1,
+      revertHeadMtimeMs: -1,
+      bisectLogMtimeMs: -1,
+      rebaseMsgnumMtimeMs: -1,
+      rebaseEndMtimeMs: -1,
+    };
+    expect(readGitStatus("/repo")?.branch).toBe("main-2");
+    expect(readStatusCalls).toBe(2);
+  });
+
+  test("refreshes cached status when an operation marker file mtime changes", () => {
+    let nowMs = 1_000;
+    let mtimes: GitRepoMtimes = {
+      headMtimeMs: 10,
+      indexMtimeMs: 20,
+      mergeHeadMtimeMs: -1,
+      cherryPickHeadMtimeMs: -1,
+      revertHeadMtimeMs: -1,
+      bisectLogMtimeMs: -1,
+      rebaseMsgnumMtimeMs: -1,
+      rebaseEndMtimeMs: -1,
+    };
+    let readStatusCalls = 0;
+
+    const readGitStatus = createGitStatusCache({
+      getNowMs: () => nowMs,
+      resolveGitDir() {
+        return "/repo/.git";
+      },
+      getRepoMtimes() {
+        return mtimes;
+      },
+      readStatus() {
+        readStatusCalls += 1;
+        return { branch: `main-${readStatusCalls}`, dirtyCount: 0, ahead: 0, behind: 0 };
+      },
+    });
+
+    expect(readGitStatus("/repo")?.branch).toBe("main-1");
+    // MERGE_HEAD 出现（mtime 变化）：HEAD/index 未动，缓存也必须失效。
+    mtimes = { ...mtimes, mergeHeadMtimeMs: 500 };
     expect(readGitStatus("/repo")?.branch).toBe("main-2");
     expect(readStatusCalls).toBe(2);
   });
@@ -101,6 +163,7 @@ describe("custom footer extension statusline", () => {
 
     let footerFactory: any;
     const ctx = {
+      mode: "tui",
       getContextUsage: () => undefined,
       model: { id: "test-model" },
       sessionManager: {
@@ -130,6 +193,51 @@ describe("custom footer extension statusline", () => {
       "review running",
       "impl queued",
     ]);
+    footer.dispose();
+  });
+});
+
+describe("custom footer extension model hook", () => {
+  test("model_select triggers an immediate footer render", async () => {
+    const handlers = new Map<string, (event: unknown, ctx: any) => unknown>();
+    const pi = {
+      getThinkingLevel: () => "high",
+      on(event: string, handler: (event: unknown, ctx: any) => unknown) {
+        handlers.set(event, handler);
+      },
+    };
+    customFooterExtension(pi as never);
+
+    let footerFactory: any;
+    let renderCalls = 0;
+    const ctx = {
+      mode: "tui",
+      getContextUsage: () => undefined,
+      model: { id: "test-model" },
+      sessionManager: {
+        getCwd: () => "/tmp",
+        getEntries: () => [],
+      },
+      ui: {
+        setFooter(factory: unknown) {
+          footerFactory = factory;
+        },
+      },
+    };
+    await handlers.get("session_start")?.({ reason: "startup" }, ctx);
+
+    const footer = footerFactory(
+      { requestRender() { renderCalls += 1; } },
+      { fg: (_name: string, text: string) => text },
+      {
+        getExtensionStatuses: () => new Map(),
+        onBranchChange: () => () => {},
+      },
+    );
+    footer.render(120);
+
+    await handlers.get("model_select")?.({ model: {}, previousModel: undefined, source: "user" }, ctx);
+    expect(renderCalls).toBe(1);
     footer.dispose();
   });
 });
