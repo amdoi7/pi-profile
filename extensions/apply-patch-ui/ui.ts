@@ -336,17 +336,17 @@ export function renderResultViewModel(
 	context: PatchRenderContext,
 ): Container {
 	const container = beginFileMutationResultRender(context);
-	if (viewModel.kind === "apply-patch-batch-result" && options.expanded) {
-		viewModel.results.forEach((result, index) => {
-			if (index > 0) container.addChild(new Spacer(1));
-			renderSingleResultViewModel(container, result, options, theme, context);
-		});
-	} else if (viewModel.kind === "apply-patch-batch-result" && viewModel.finalFiles) {
+	if (viewModel.kind === "apply-patch-batch-result" && viewModel.finalFiles) {
 		appendFileMutationBatch(
 			container,
 			viewModel.finalFiles.map((file) => fileResultItem(file, theme, context, file.patchCount)),
 			theme,
 		);
+	} else if (viewModel.kind === "apply-patch-batch-result" && options.expanded) {
+		viewModel.results.forEach((result, index) => {
+			if (index > 0) container.addChild(new Spacer(1));
+			renderSingleResultViewModel(container, result, options, theme, context);
+		});
 	} else if (viewModel.kind === "apply-patch-batch-result") {
 		const successfulFiles: ApplyPatchFileDiff[] = [];
 		let hasRendered = false;

@@ -19,8 +19,8 @@ const display = {
 	lineNumberWidth: 3,
 	rows: [
 		{ kind: "context", oldLine: 171, newLine: 171, content: "before" },
-		{ kind: "remove", oldLine: 172, content: "const value = someVeryLongIdentifier;" },
-		{ kind: "add", newLine: 172, content: "const value = anotherVeryLongIdentifier;" },
+		{ kind: "remove", oldLine: 172, content: "const value = someVeryLongIdentifier;", highlights: [{ start: 14, end: 36 }] },
+		{ kind: "add", newLine: 172, content: "const value = anotherVeryLongIdentifier;", highlights: [{ start: 14, end: 39 }] },
 		{ kind: "context", oldLine: 173, newLine: 181, content: "" },
 		{ kind: "fold", omittedLines: 24 },
 	],
@@ -44,6 +44,14 @@ test("Pi diff component renders dual gutters and visible source blank lines", ()
 	assert.equal(lines[2], "+    172 │ const value = anotherVeryLongIdentifier;");
 	assert.equal(lines[3], " 173 181 │ ");
 	assert.equal(lines[4], "         │ ... 24 unchanged lines omitted");
+});
+
+test("Pi diff component renders only computed word ranges with inverse styling", () => {
+	const theme = { ...createTheme(), inverse: (text) => `<inv>${text}</inv>` };
+	const lines = new DiffComponent(display, theme).render(100);
+
+	assert.equal(lines[1], "-172     │ const value = <inv>someVeryLongIdentifier</inv>;");
+	assert.equal(lines[2], "+    172 │ const value = <inv>anotherVeryLongIdentifier</inv>;");
 });
 
 test("Pi diff component wraps content under an empty continuation gutter", () => {

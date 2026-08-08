@@ -1,4 +1,3 @@
-import { diffWords } from "diff";
 import {
 	Container,
 	Text,
@@ -19,78 +18,20 @@ type DiffTheme = {
 
 export type DiffPreview = Pick<FinalDiff, "display" | "truncated">;
 
-type RenderedContents = Map<number, string>;
-
 function replaceTabs(text: string): string {
 	return text.replace(/\t/g, "   ");
 }
 
-function renderIntraLineDiff(
-	oldContent: string,
-	newContent: string,
-	theme: DiffTheme,
-): { oldContent: string; newContent: string } {
-	const parts = diffWords(oldContent, newContent);
-	let renderedOld = "";
-	let renderedNew = "";
-	let firstRemoved = true;
-	let firstAdded = true;
-
-	for (const part of parts) {
-		if (part.removed) {
-			let value = part.value;
-			if (firstRemoved) {
-				const whitespace = value.match(/^\s*/)?.[0] ?? "";
-				renderedOld += whitespace;
-				value = value.slice(whitespace.length);
-				firstRemoved = false;
-			}
-			if (value.length > 0) renderedOld += theme.inverse(value);
-			continue;
-		}
-		if (part.added) {
-			let value = part.value;
-			if (firstAdded) {
-				const whitespace = value.match(/^\s*/)?.[0] ?? "";
-				renderedNew += whitespace;
-				value = value.slice(whitespace.length);
-				firstAdded = false;
-			}
-			if (value.length > 0) renderedNew += theme.inverse(value);
-			continue;
-		}
-		renderedOld += part.value;
-		renderedNew += part.value;
+function highlightedContent(row: DisplayDiffRow, theme: DiffTheme): string {
+	if (row.kind !== "remove" && row.kind !== "add" && row.kind !== "unlocated") return rowContent(row);
+	let rendered = "";
+	let cursor = 0;
+	for (const range of row.highlights) {
+		rendered += replaceTabs(row.content.slice(cursor, range.start));
+		rendered += theme.inverse(replaceTabs(row.content.slice(range.start, range.end)));
+		cursor = range.end;
 	}
-
-	return { oldContent: renderedOld, newContent: renderedNew };
-}
-
-function intraLineContents(display: DisplayDiff, theme: DiffTheme): RenderedContents {
-	const rendered: RenderedContents = new Map();
-	for (let index = 0; index < display.rows.length; index += 1) {
-		if (display.rows[index]?.kind !== "remove") continue;
-		let removedEnd = index;
-		while (display.rows[removedEnd + 1]?.kind === "remove") removedEnd += 1;
-		let addedEnd = removedEnd;
-		while (display.rows[addedEnd + 1]?.kind === "add") addedEnd += 1;
-		if (removedEnd !== index || addedEnd !== removedEnd + 1) {
-			index = addedEnd;
-			continue;
-		}
-		const removed = display.rows[index];
-		const added = display.rows[addedEnd];
-		if (removed?.kind !== "remove" || added?.kind !== "add") continue;
-		const contents = renderIntraLineDiff(
-			replaceTabs(removed.content),
-			replaceTabs(added.content),
-			theme,
-		);
-		rendered.set(index, contents.oldContent);
-		rendered.set(addedEnd, contents.newContent);
-		index = addedEnd;
-	}
-	return rendered;
+	return rendered + replaceTabs(row.content.slice(cursor));
 }
 
 function operationPrefix(row: DisplayDiffRow): " " | "+" | "-" {
@@ -153,7 +94,6 @@ export class DiffComponent implements Component {
 	render(width: number): string[] {
 		if (this.cachedLines !== undefined && this.cachedWidth === width) return this.cachedLines;
 		const availableWidth = Math.max(0, width);
-		const renderedContents = intraLineContents(this.display, this.theme);
 		const lines: string[] = [];
 
 		for (let index = 0; index < this.display.rows.length; index += 1) {
@@ -169,7 +109,7 @@ export class DiffComponent implements Component {
 				lines.push(truncateToWidth(firstGutter, width, ""));
 				continue;
 			}
-			const content = renderedContents.get(index) ?? rowContent(row);
+			const content = highlightedContent(row, this.theme);
 			const wrapped = wrapTextWithAnsi(content, contentWidth);
 			for (let wrappedIndex = 0; wrappedIndex < wrapped.length; wrappedIndex += 1) {
 				const gutter = wrappedIndex === 0 ? firstGutter : continuationGutter;

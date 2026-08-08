@@ -4,7 +4,6 @@ import { highlightCode } from "@earendil-works/pi-coding-agent";
 export const CODE_PREVIEW = {
 	readCollapsedLines: 10,
 	editCollapsedLines: 80,
-	statusCommandChars: 72,
 	secretScanChars: 200_000,
 	secretLabels: [
 		{ label: "API key", pattern: /\b(?:api[_-]?key|token|secret|password)\b\s*[:=]\s*['\"]?[^\s'\"]{8,}/i },
@@ -253,19 +252,6 @@ function parseFishThemeDump(output: string): Record<string, string> {
 		env[name] = value;
 	}
 	return env;
-}
-
-export function summarizeCommandRewrite(original: string, rewritten: string): string {
-	const prefix = "rewrite ";
-	const body = `${truncateMiddle(original, CODE_PREVIEW.statusCommandChars)} → ${truncateMiddle(rewritten, CODE_PREVIEW.statusCommandChars)}`;
-	return `${prefix}${body}`;
-}
-
-export function truncateMiddle(value: string, maxChars: number): string {
-	if (value.length <= maxChars) return value;
-	const head = Math.max(1, Math.floor((maxChars - 1) / 2));
-	const tail = Math.max(1, maxChars - head - 1);
-	return `${value.slice(0, head)}…${value.slice(value.length - tail)}`;
 }
 
 function withSecretWarning(source: string, preview: string, theme: PreviewTheme): string {

@@ -9,7 +9,7 @@
 ### Runtime 与 memory
 
 - `memory/` — `Issue -> Task` work control-plane owner；负责 project scaffold、prompt injection、issue/task/lesson contract 与 context features；无 CLI/graph，issues/tasks/lessons 由普通编辑工具按 project-memory skill 维护。
-- `_shared/` — sibling extensions 共用 helper；非 extension 入口；结构化 diff 由 `jsdiff` 计算，Pi TUI renderer 只负责 gutter、ANSI 与 width-aware wrapping。
+- `_shared/` — sibling extensions 共用 helper；非 extension 入口；`jsdiff` 先计算 line hunk，再将阈值内 changed block 细化为逐行 word ranges；Myers 超时（250ms）时降级为 O(n) 公共前后缀剥离的 unlocated 行 diff（stats 仍准确，无行号与 word 高亮）；Pi TUI renderer 只负责 gutter、range ANSI 与 width-aware wrapping。
 
 ### Tool ownership
 
@@ -21,6 +21,10 @@
 ### Workflow
 
 - `btw/` — side-channel assistant overlay；提供 `/btw` 侧聊与 handoff summary。
+- `pi-sub/` — background subagent 工具 `pi_sub`（start/prompt/abort/status/list/result/wait/transcript/prune）；
+  worker 为 detached `pi --mode rpc` 进程，run 目录是唯一生命周期事实源，子会话恒用
+  确定性 lane 文件（无 fork 切换），alias lease 由 worker 持有；多 TUI 按 owner-session
+  隔离；UI（完成通知、active-run widget、`/pisub` overlay）同目录。
 - `session-breakdown/` — session/context inspection UI；统计 sessions、messages、tokens、cost 与 model/cwd/time breakdown。
 
 ### UI polish

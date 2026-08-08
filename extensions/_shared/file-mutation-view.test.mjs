@@ -32,8 +32,8 @@ test("a one-item edit is rendered through the batch contract without a title gap
 			display: {
 				lineNumberWidth: 1,
 				rows: [
-					{ kind: "remove", oldLine: 1, content: "before" },
-					{ kind: "add", newLine: 1, content: "after" },
+					{ kind: "remove", oldLine: 1, content: "before", highlights: [{ start: 0, end: 6 }] },
+					{ kind: "add", newLine: 1, content: "after", highlights: [{ start: 0, end: 5 }] },
 				],
 			},
 			truncated: false,
@@ -54,11 +54,11 @@ test("independent previews cannot form an intra-line pair across patch boundarie
 		outcome: "applied",
 		previews: [
 			{
-				display: { lineNumberWidth: 1, rows: [{ kind: "remove", oldLine: 1, content: "removed" }] },
+				display: { lineNumberWidth: 1, rows: [{ kind: "remove", oldLine: 1, content: "removed", highlights: [] }] },
 				truncated: false,
 			},
 			{
-				display: { lineNumberWidth: 1, rows: [{ kind: "add", newLine: 1, content: "added" }] },
+				display: { lineNumberWidth: 1, rows: [{ kind: "add", newLine: 1, content: "added", highlights: [] }] },
 				truncated: false,
 			},
 		],

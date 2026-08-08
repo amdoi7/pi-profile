@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "diff": "8.0.4"
+    "diff": "8.0.4",
+    "ffi-rs": "^1.3.6"
   }
 }

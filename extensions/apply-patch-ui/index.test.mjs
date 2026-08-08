@@ -29,6 +29,7 @@ async function loadRegisteredTool() {
 		"code-preview.ts",
 		"file-link.ts",
 		"final-diff.ts",
+		"ffi-diff.ts",
 		"diff-view.ts",
 		"file-mutation-view.ts",
 	]);
@@ -798,7 +799,7 @@ PATCH`;
 	assert.match(output, /\.\.\. 8 unchanged lines omitted/);
 });
 
-test("collapsed batch renders the final file diff instead of concatenated intermediate diffs", async (t) => {
+test("batch renders the final located diff in collapsed and expanded views", async (t) => {
 	const workspace = await fs.promises.mkdtemp(path.join(process.cwd(), ".apply-patch-ui-test-"));
 	t.after(() => fs.promises.rm(workspace, { recursive: true, force: true }));
 	await fs.promises.writeFile(path.join(workspace, "state.txt"), "one\n", "utf8");
@@ -836,7 +837,9 @@ test("collapsed batch renders the final file diff instead of concatenated interm
 		createTheme(),
 		createContext(command, { toolCallId, executionStarted: true, expanded: true }),
 	));
-	assert.match(expanded, /two/);
+	assert.match(expanded, /-1   │ one/);
+	assert.match(expanded, /\+  1 │ three/);
+	assert.doesNotMatch(expanded, /two/);
 });
 
 test("collapsed diffs keep two context lines around every change group", async (t) => {

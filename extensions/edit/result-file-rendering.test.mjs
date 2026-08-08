@@ -38,7 +38,7 @@ async function loadRegisteredEditTool() {
 		recursive: true,
 		filter: (source) => path.basename(source) !== "node_modules",
 	});
-	await copySharedFiles(tempSharedDir, ["file-link.ts", "code-preview.ts", "final-diff.ts", "diff-view.ts", "file-mutation-view.ts"]);
+	await copySharedFiles(tempSharedDir, ["file-link.ts", "code-preview.ts", "final-diff.ts", "ffi-diff.ts", "diff-view.ts", "file-mutation-view.ts"]);
 	await linkPiPackages(tempExtensionDir, { tui: true });
 	await linkSharedPackages(tempExtensionDir);
 	await linkLocalDependency(tempEditDir, "arktype");
@@ -65,7 +65,7 @@ function createTheme() {
 		fg: (_name, text) => text,
 		bg: (_name, text) => text,
 		bold: (text) => text,
-		inverse: (text) => `<inv>${text}</inv>`,
+		inverse: (text) => `\x1b[7m${text}\x1b[27m`,
 	};
 }
 
@@ -124,8 +124,8 @@ function replacementDisplay(line, before, after) {
 	return {
 		lineNumberWidth: String(line).length,
 		rows: [
-			{ kind: "remove", oldLine: line, content: before },
-			{ kind: "add", newLine: line, content: after },
+			{ kind: "remove", oldLine: line, content: before, highlights: before.length > 0 ? [{ start: 0, end: before.length }] : [] },
+			{ kind: "add", newLine: line, content: after, highlights: after.length > 0 ? [{ start: 0, end: after.length }] : [] },
 		],
 	};
 }
@@ -210,7 +210,7 @@ test("production result renderer uses Pi native diff rendering", async () => {
 		createRenderContext(),
 	));
 
-	assert.match(output, /-10 {4}│ {3}indented/);
+	assert.match(output, /-10 {4}│ {4}indented/);
 	assert.match(output, /\+ {3}10 │ {3}indented/);
 });
 

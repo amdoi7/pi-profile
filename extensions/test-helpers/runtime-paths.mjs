@@ -59,6 +59,16 @@ export async function linkSharedPackages(targetExtensionDir) {
 	}
 	await fs.promises.mkdir(path.join(targetExtensionDir, "node_modules"), { recursive: true });
 	await symlinkDir(diffPackageDir, path.join(targetExtensionDir, "node_modules", "diff"));
+	const ffiRsPackageDir = path.join(sharedDir, "node_modules", "ffi-rs");
+	if (fs.existsSync(path.join(ffiRsPackageDir, "package.json"))) {
+		await symlinkDir(ffiRsPackageDir, path.join(targetExtensionDir, "node_modules", "ffi-rs"));
+	}
+	// Rust diff engine: link the build tree so ffi-diff.ts finds the dylib
+	// through its relative candidate path.
+	const diffEngineDir = path.join(sharedDir, "diff-engine");
+	if (fs.existsSync(path.join(diffEngineDir, "target", "release"))) {
+		await symlinkDir(diffEngineDir, path.join(targetExtensionDir, "_shared", "diff-engine"));
+	}
 }
 
 export function packageFileUrl(packageDir, relativePath) {
