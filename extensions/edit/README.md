@@ -37,7 +37,7 @@
 - 同一调用中的所有替换要么全部写入，要么一个也不写入
 - 重叠或嵌套的 replacement 被拒绝
 - LF/CRLF 与直引号/弯引号只做窄范围归一化；空白、破折号和其他文本仍须精确匹配
-- 成功后由 `jsdiff` 生成结构化 line hunk，并将阈值内 changed block 细化为逐行 word ranges，再交给 Pi `Component` renderer 展示双行号最终 diff；`jsdiff` 超时（250ms，整文件重写等退化场景）时降级为公共前后缀剥离的 unlocated 行 diff，stats 保持准确
+- 成功后由纯 TS diff 引擎生成结构化 line hunk（公共前后缀剥离 + 无共享行 fast path + `jsdiff` Myers 250ms tripwire），在每进程一个长期 worker 中计算（batch 提交，首次调用预热）；展示保持 unified 块形态，配对仅在预算内计算词级高亮；可证明整文件替换走 O(N) rewrite path；Myers 超时等退化场景降级为 unlocated 行 diff，stats 保持准确
 
 ## Failures
 

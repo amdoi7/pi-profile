@@ -9,7 +9,7 @@
 ### Runtime 与 memory
 
 - `memory/` — `Issue -> Task` work control-plane owner；负责 project scaffold、prompt injection、issue/task/lesson contract 与 context features；无 CLI/graph，issues/tasks/lessons 由普通编辑工具按 project-memory skill 维护。
-- `_shared/` — sibling extensions 共用 helper；非 extension 入口；`jsdiff` 先计算 line hunk，再将阈值内 changed block 细化为逐行 word ranges；Myers 超时（250ms）时降级为 O(n) 公共前后缀剥离的 unlocated 行 diff（stats 仍准确，无行号与 word 高亮）；Pi TUI renderer 只负责 gutter、range ANSI 与 width-aware wrapping。
+- `_shared/` — sibling extensions 共用 helper；非 extension 入口；结构化 diff 为纯 TS 引擎：公共前后缀剥离 + 无共享行 fast path（整体/核心段，O(N)）+ `jsdiff` Myers（250ms tripwire）分流出 located hunk；展示保持 unified 块形态（不重排），配对仅在预算内（65536 对 / 2M cells）计算词级高亮，未配对整行高亮；可证明 whole rewrite 走 O(N) rewrite path；计算在每进程一个长期 worker 中串行执行（batch 提交、5s 超时 watchdog、崩溃/超时自动重建），主线程零阻塞。
 
 ### Tool ownership
 

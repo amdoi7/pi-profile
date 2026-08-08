@@ -51,12 +51,12 @@ export function renderDiffSummary(
 	if (!stats) return "";
 	const additions = typeof stats.additions === "number" && Number.isFinite(stats.additions) ? stats.additions : 0;
 	const deletions = typeof stats.deletions === "number" && Number.isFinite(stats.deletions) ? stats.deletions : 0;
-	const changedLines = Number.isFinite(stats.changedLines) ? stats.changedLines : additions + deletions;
-	return [
-		theme.fg("muted", `${changedLines} changed`),
-		theme.fg("success", `+${additions}`),
-		theme.fg("error", `-${deletions}`),
-	].join(theme.fg("muted", " · "));
+	// 紧凑摘要：changedLines 恒等于 additions+deletions（isChangeStats 强制），
+	// 总数是冗余；只显示非零项（git 惯例）。
+	const parts: string[] = [];
+	if (additions > 0) parts.push(theme.fg("success", `+${additions}`));
+	if (deletions > 0) parts.push(theme.fg("error", `-${deletions}`));
+	return parts.join(" ");
 }
 
 export function renderShellCommandCall(

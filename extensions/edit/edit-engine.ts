@@ -2,6 +2,10 @@ import { constants } from "node:fs";
 import { access, readFile, stat, writeFile } from "node:fs/promises";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { generateFinalDiff, type ChangeStats, type DisplayDiff } from "../_shared/final-diff.ts";
+import { requestDiffBatch, warmUpDiffWorker, type DiffStrategy } from "../_shared/diff-service.ts";
+
+/** preview 的 context 行数（与 generateFinalDiff 默认一致）。 */
+const EDIT_PREVIEW_CONTEXT_LINES = 4;
 
 export type FileEditOperation = {
 	oldText: string;
@@ -365,6 +369,10 @@ export async function executeFileEdits(
 	return withFileMutationQueue(absolutePath, async () => {
 		throwIfAborted(signal);
 
+		// 预热 diff worker（不等待）：冷启动（~300ms 模块加载）与文件 IO 重叠，
+		// 消除首次 preview 的冷启动延迟；后续 edit 全部 warm。
+		warmUpDiffWorker();
+
 		// Preflight: hard file-size gate before reading content into memory.
 		try {
 			const fileStat = await operations.stat(absolutePath);
@@ -394,13 +402,37 @@ export async function executeFileEdits(
 
 		// Resolve, validate, apply, and return spans in one call.
 		// applyEditsToNormalizedContent is the single source of truth for match logic.
-		const { newContent } = applyEditsToNormalizedContent(normalizedContent, edits);
+		const { newContent, matchedSpans } = applyEditsToNormalizedContent(normalizedContent, edits);
 		throwIfAborted(signal);
 
 		await operations.writeFile(absolutePath, bom + restoreLineEndings(newContent, originalEnding));
 		throwIfAborted(signal);
 
-		const preview = generateFinalDiff(normalizedContent, newContent);
+		// 可证明的 whole rewrite：matched spans 覆盖完整文件 → O(N) rewrite diff（不跑 Myers）。
+		// 无法证明时 exact（250ms 超时是 abnormal 输入 tripwire，不用阈值猜测）。
+		const strategy: DiffStrategy = spansCoverWholeFile(matchedSpans, normalizedContent.length)
+			? { kind: "rewrite", reason: "all-lines-replaced" }
+			: { kind: "exact" };
+		const preview = await requestDiffBatch(
+			[{
+				fileId: "preview",
+				oldContent: normalizedContent,
+				newContent,
+				strategy,
+				contextLines: EDIT_PREVIEW_CONTEXT_LINES,
+			}],
+			"edit-preview",
+		).then((response) => response.files[0])
+			.catch((error) => {
+				// diff worker 不可用（崩溃 / session dispose）：只在失败路径回退主线程同步引擎，
+				// 保证 mutation 结果与 preview 始终可用；正常路径全部经 worker。
+				console.error(
+					`edit preview diff worker failed ` +
+					`error=${error instanceof Error ? error.message : String(error)} ` +
+					`action="falling back to synchronous diff engine for this preview"`,
+				);
+				return generateFinalDiff(normalizedContent, newContent);
+			});
 		return {
 			previewDisplay: preview.display,
 			previewStartLine: preview.firstChangedLine,
@@ -408,4 +440,17 @@ export async function executeFileEdits(
 			changeStats: preview.stats,
 		};
 	});
+}
+
+/** matched spans 覆盖完整文件内容 → 可证明的 whole rewrite。 */
+function spansCoverWholeFile(spans: readonly MatchedEditSpan[], contentLength: number): boolean {
+	if (contentLength === 0) return true;
+	const sorted = [...spans].sort((a, b) => a.matchIndex - b.matchIndex);
+	let cursor = 0;
+	for (const span of sorted) {
+		if (span.matchIndex > cursor) return false;
+		cursor = Math.max(cursor, span.matchIndex + span.matchLength);
+		if (cursor >= contentLength) return true;
+	}
+	return false;
 }

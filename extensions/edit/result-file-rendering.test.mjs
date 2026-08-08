@@ -38,7 +38,7 @@ async function loadRegisteredEditTool() {
 		recursive: true,
 		filter: (source) => path.basename(source) !== "node_modules",
 	});
-	await copySharedFiles(tempSharedDir, ["file-link.ts", "code-preview.ts", "final-diff.ts", "ffi-diff.ts", "diff-view.ts", "file-mutation-view.ts"]);
+	await copySharedFiles(tempSharedDir, ["file-link.ts", "code-preview.ts", "final-diff.ts", "diff-view.ts", "file-mutation-view.ts", "diff-service.ts", "diff-worker.ts"]);
 	await linkPiPackages(tempExtensionDir, { tui: true });
 	await linkSharedPackages(tempExtensionDir);
 	await linkLocalDependency(tempEditDir, "arktype");

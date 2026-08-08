@@ -31,26 +31,51 @@ test("word refinement maps one N:M changed block back to per-line ranges", () =>
 		0,
 	);
 
+	// 对称全配对块（2:2 全部配对）= 整块替换，保持 unified 块形态（- 全部在前 + 全部在后），
+	// 不逐行交错；词级高亮仍按配对映射回每行。
 	assert.deepEqual(diff.display.rows, [
 		{ kind: "remove", oldLine: 1, content: "const first = oldValue;", highlights: [{ start: 14, end: 22 }] },
-		{ kind: "add", newLine: 1, content: "const first = newValue;", highlights: [{ start: 14, end: 22 }] },
 		{ kind: "remove", oldLine: 2, content: "const second = keep;", highlights: [{ start: 6, end: 12 }] },
+		{ kind: "add", newLine: 1, content: "const first = newValue;", highlights: [{ start: 14, end: 22 }] },
 		{ kind: "add", newLine: 2, content: "const renamed = keep;", highlights: [{ start: 6, end: 13 }] },
 	]);
 });
 
-test("similar changed lines pair up adjacent with word highlights", () => {
+test("symmetric fully-paired reindent block keeps unified scope order", () => {
+	const diff = generateFinalDiff(
+		"      }).catch((error) => {\n          // keep comment\n          return run();\n      });\n",
+		"         .catch((error) => {\n             // keep comment\n             return run();\n         });\n",
+		0,
+	);
+
+	// 整块缩进变化：所有行配对但差异仅为空白，展示为整块替换（scope 粒度），
+	// 不逐行 -+ 交错；空白差异 trim 后无词级高亮（首行 `}).` → `.` 是实质变化，保留高亮）。
+	assert.deepEqual(diff.display.rows, [
+		{ kind: "remove", oldLine: 1, content: "      }).catch((error) => {", highlights: [{ start: 6, end: 8 }] },
+		{ kind: "remove", oldLine: 2, content: "          // keep comment", highlights: [] },
+		{ kind: "remove", oldLine: 3, content: "          return run();", highlights: [] },
+		{ kind: "remove", oldLine: 4, content: "      });", highlights: [] },
+		{ kind: "add", newLine: 1, content: "         .catch((error) => {", highlights: [] },
+		{ kind: "add", newLine: 2, content: "             // keep comment", highlights: [] },
+		{ kind: "add", newLine: 3, content: "             return run();", highlights: [] },
+		{ kind: "add", newLine: 4, content: "         });", highlights: [] },
+	]);
+});
+
+test("changed lines keep unified order with word highlights on paired rows", () => {
 	const diff = generateFinalDiff(
 		"alpha\nbeta\nfrom collections.abc import Callable\n",
 		"alpha\nbeta\nimport asyncio\nimport json\nfrom collections.abc import AsyncIterator, Callable\n",
 		0,
 	);
 
+	// Zed/VS Code 同款：unified 块形态（- 全部在前 + 全部在后，不重排），
+	// 配对仅用于词级高亮；未配对行整行高亮。
 	assert.deepEqual(diff.display.rows, [
 		{ kind: "fold", omittedLines: 2 },
+		{ kind: "remove", oldLine: 3, content: "from collections.abc import Callable", highlights: [] },
 		{ kind: "add", newLine: 3, content: "import asyncio", highlights: [{ start: 0, end: 14 }] },
 		{ kind: "add", newLine: 4, content: "import json", highlights: [{ start: 0, end: 11 }] },
-		{ kind: "remove", oldLine: 3, content: "from collections.abc import Callable", highlights: [] },
 		{ kind: "add", newLine: 5, content: "from collections.abc import AsyncIterator, Callable", highlights: [{ start: 28, end: 42 }] },
 	]);
 });
@@ -241,31 +266,42 @@ test("degraded path handles identical inputs as an empty diff", () => {
 	assert.deepEqual(rows, []);
 });
 
-test("timeout degrades whole-file replacement to unlocated rows with exact stats", () => {
+test("whole-file replacement is resolved by the no-shared-lines fast path", () => {
 	const { oldLines, newLines } = replacementLines(1000);
-	const diff = generateFinalDiff(oldLines.join("\n"), newLines.join("\n"), 4, { timeoutMs: 1 });
+	// 无共享行 fast path：O(N) 定位，即使 timeout 极小也不退化。
+	const diff = generateFinalDiff(oldLines.join("\n") + "\n", newLines.join("\n") + "\n", 4, { timeoutMs: 1 });
 
-	assert.equal(diff.degraded, true);
-	assert.equal(diff.firstChangedLine, undefined);
+	assert.equal(diff.degraded, false);
+	assert.equal(diff.firstChangedLine, 1);
 	assert.deepEqual(diff.stats, { additions: 1000, deletions: 1000, changedLines: 2000 });
-	assert.ok(diff.display.rows.every((row) => row.kind === "unlocated"));
-	assert.ok(diff.display.rows.every((row) => row.highlights.length === 0));
+	assert.ok(diff.display.rows.every((row) => row.kind === "remove" || row.kind === "add"));
 	assert.ok(diff.display.rows.length <= DEFAULT_MAX_LINES, "truncation caps the output");
 });
 
-test("default timeout degrades a 5000-line full replacement", () => {
+test("mid-file replacement is resolved by the core-segment fast path", () => {
+	// 前一半相同（有共享行）：公共前后缀剥离后，核心段（后半 500 行）无共享行 →
+	// O(N) fast path 直接构造带偏移的整段替换 hunk，不跑 Myers，不退化。
+	const oldLines = Array.from({ length: 1000 }, (_, i) => `line ${i}`);
+	const newLines = oldLines.map((line, i) => (i < 500 ? line : `${line} changed`));
+	const diff = generateFinalDiff(oldLines.join("\n") + "\n", newLines.join("\n") + "\n", 4, { timeoutMs: 1 });
+
+	assert.equal(diff.degraded, false);
+	assert.equal(diff.firstChangedLine, 501);
+	assert.deepEqual(diff.stats, { additions: 500, deletions: 500, changedLines: 1000 });
+	assert.ok(diff.display.rows.some((row) => row.kind === "remove"));
+	assert.ok(diff.display.rows.some((row) => row.kind === "add"));
+	assert.ok(diff.display.rows.every((row) => row.kind !== "unlocated"));
+	assert.ok(diff.display.rows.length <= DEFAULT_MAX_LINES, "truncation caps the output");
+});
+
+test("default timeout resolves a 5000-line full replacement via fast path", () => {
 	const { oldLines, newLines } = replacementLines(5000);
 	const diff = generateFinalDiff(oldLines.join("\n"), newLines.join("\n"));
 
 	assert.deepEqual(diff.stats, { additions: 5000, deletions: 5000, changedLines: 10000 });
-	if (process.env.PI_DIFF_ENGINE !== "js") {
-		// Rust engine (auto or forced) completes within the 250ms budget, so it
-		// yields a located diff instead of degrading (better behavior, same stats).
-		assert.equal(diff.degraded, false);
-		assert.ok(diff.display.rows.some((row) => row.kind === "remove"));
-	} else {
-		assert.equal(diff.degraded, true);
-	}
+	assert.equal(diff.degraded, false);
+	assert.ok(diff.display.rows.some((row) => row.kind === "remove"));
+	assert.ok(diff.truncated, "presentation rows are capped at Pi output limits");
 });
 
 test("small diffs are never degraded by a tiny timeout", () => {
