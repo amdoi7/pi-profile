@@ -45,7 +45,7 @@
   "steeringMode": "one-at-a-time",
   "followUpMode": "one-at-a-time",
   "treeFilterMode": "default",
-  "theme": "bluloco-dark",
+  "theme": "moon-nord",
   "collapseChangelog": true,
   "transport": "auto",
   "terminal": {
