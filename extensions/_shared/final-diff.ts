@@ -168,6 +168,8 @@ function appendHighlight(row: DisplayDiffRow, start: number, end: number): void 
 }
 
 function highlightWholeRow(row: DisplayDiffRow): void {
+	// fold/annotation 之外的 changed 行才有 content；fold 行是 gap，无高亮。
+	if (!("content" in row)) return;
 	appendHighlight(row, 0, row.content.length);
 }
 
@@ -319,6 +321,8 @@ function pairChangedItems(
 }
 
 function refinePair(oldRow: DisplayDiffRow, newRow: DisplayDiffRow): void {
+	// 调用方保证 changed 配对；fold 行（gap）无 content，防御收窄。
+	if (!("content" in oldRow) || !("content" in newRow)) return;
 	const oldTokens = oldRow.content.match(/\S+/g)?.length ?? 0;
 	const newTokens = newRow.content.match(/\S+/g)?.length ?? 0;
 	if ((oldTokens + 1) * (newTokens + 1) > WORD_REFINEMENT_MAX_CELLS) return;
