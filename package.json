@@ -1,0 +1,8 @@
+{
+	"name": "pi-agent-workspace",
+	"private": true,
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "link:/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent",
+		"@earendil-works/pi-tui": "link:/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-tui"
+	}
+}

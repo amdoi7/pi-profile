@@ -14,6 +14,16 @@ export function resolvePiPackageDir(packageName) {
 	const fromImport = resolvePackageDirFromImport(packageName);
 	if (fromImport) return fromImport;
 
+	// agent 根 node_modules 的固定链接（mise 环境下 npm root -g 指向 mise 全局根，不可靠）。
+	const agentLink = path.join(path.resolve(extensionsRoot, ".."), "node_modules", ...packageName.split("/"));
+	try {
+		if (fs.lstatSync(agentLink).isSymbolicLink() || fs.existsSync(agentLink)) {
+			return fs.realpathSync(agentLink);
+		}
+	} catch {
+		// 链接不存在：继续候选链。
+	}
+
 	const globalRoot = execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim();
 	const globalPackageDir = path.join(globalRoot, ...packageName.split("/"));
 	if (fs.existsSync(path.join(globalPackageDir, "package.json"))) return globalPackageDir;

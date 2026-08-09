@@ -1,0 +1,6 @@
+# mise 工具链配置（agent 项目根）
+# node/go/pnpm 版本由 mise 统一管理；各 node 项目包管理统一使用 pnpm。
+[tools]
+node = "26"
+go = "1.26"
+pnpm = "11"

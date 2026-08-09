@@ -1,0 +1,11 @@
+# pnpm workspace：依赖统一安装到 agent 根 node_modules（各扩展目录只留 symlink）。
+# @earendil-works/* 通过根 package.json 的 link: 依赖指向全局安装（pi 运行时版本）。
+packages:
+  - extensions/*
+  - npm
+
+# pnpm 11 构建脚本批准（原各扩展目录 pnpm-workspace.yaml 的配置汇总）。
+allowBuilds:
+  esbuild: true
+  "@google/genai": true
+  protobufjs: true
