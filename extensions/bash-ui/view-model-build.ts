@@ -1,6 +1,5 @@
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateHead } from "@earendil-works/pi-coding-agent";
-import type { ChangeStats, DisplayDiff } from "../_shared/final-diff.ts";
-import { displayDiffFromLines, isChangeStats, isDisplayDiff } from "../_shared/final-diff.ts";
+import { displayDiffFromLines } from "../_shared/final-diff.ts";
 import type { DiffInput, DiffOutput, DiffStrategy } from "../_shared/diff-service.ts";
 import {
 	operationByIndex,
@@ -9,94 +8,40 @@ import {
 	type PlannedPatchOperation,
 	type PatchLine,
 	type PatchOperation,
-} from "./patch-command.ts";
+} from "./recognize.ts";
 import {
 	type ApplyPatchFailure,
 	failureMatchesPatch,
 	type ParsedApplyPatchResultSequence,
 	successMatchesPatch,
 	type SuccessfulChange,
-} from "./patch-result.ts";
+} from "./invocation-result.ts";
 import type { AfterContents, SnapshotSet } from "./patch-snapshot.ts";
+import type {
+	ApplyPatchBatchFileDiff,
+	ApplyPatchContextMismatch,
+	ApplyPatchFileDiff,
+	ApplyPatchResultViewModel,
+	ApplyPatchSkipped,
+	ApplyPatchSingleResultViewModel,
+	ApplyPatchUnapplied,
+} from "./view-model-codec.ts";
+import { operationKindWord } from "./view-model-codec.ts";
+
+/**
+ * view-model-build.ts — 快照 + 结果 → view model（P2，仅执行侧 import）。
+ * 阶段 A 收集所有文件的 DiffInput（不计算）；阶段 B 一次 batch 提交到 worker；
+ * 阶段 C 用输出组装 view model（worker 不可用时整体降级 intent diff）。
+ * 渲染层（P4）不得 import 本模块——只消费 codec 的类型与校验。
+ */
 
 export const PATCH_DIFF_CONTEXT_LINES = 2;
 
 /**
  * 一次 batch 提交的返回：undefined 表示 worker 不可用（该批次整体降级 intent diff）。
- * 提交方（registry）负责捕获 worker 失败并返回 undefined。
+ * 提交方（execute）负责捕获 worker 失败并返回 undefined。
  */
 export type DiffBatchSubmitter = (inputs: readonly DiffInput[]) => Promise<readonly DiffOutput[] | undefined>;
-
-export type ApplyPatchFileDiff = {
-	kind: "Add" | "Update" | "Move" | "Delete" | "Rewrite";
-	/** 展示用原始 relative path（UI 文字）。 */
-	path: string;
-	destination?: string;
-	/** 所属 invocation 的 cwd：renderer 不再猜路径基础目录。 */
-	cwd: string;
-	changeStats: ChangeStats;
-	diffDisplay: DisplayDiff;
-	diffTruncated: boolean;
-};
-
-export type ApplyPatchBatchFileDiff = ApplyPatchFileDiff & { patchCount: number };
-
-export type ApplyPatchUnapplied = {
-	kind: ApplyPatchFileDiff["kind"];
-	path: string;
-	destination?: string;
-	cwd: string;
-};
-
-export type ApplyPatchSkipped = {
-	operation?: string;
-	path?: string;
-	cwd?: string;
-	message: string;
-};
-
-export type ApplyPatchContextMismatch = {
-	expectedLines: string[];
-	actualLines: string[];
-	actualTruncated: boolean;
-};
-
-export type ApplyPatchSingleResultViewModel =
-	| {
-		kind: "apply-patch-result";
-		success: true;
-		files: ApplyPatchFileDiff[];
-		trailing: string;
-		/** 计划中 trailing command（渲染 `$ <cmd>` 头用；standalone patch 无 trailing 时缺省）。 */
-		trailingCommand?: string;
-	}
-	| {
-		kind: "apply-patch-result";
-		success: false;
-		error: {
-			code: string;
-			message: string;
-			path?: string;
-			cwd?: string;
-			chunkIndex?: number;
-		};
-		applied: ApplyPatchFileDiff[];
-		skipped: ApplyPatchSkipped[];
-		contextMismatch?: ApplyPatchContextMismatch;
-		unapplied: ApplyPatchUnapplied[];
-		trailing: string;
-		trailingCommand?: string;
-	};
-
-export type ApplyPatchResultViewModel =
-	| ApplyPatchSingleResultViewModel
-	| {
-		kind: "apply-patch-batch-result";
-		results: ApplyPatchSingleResultViewModel[];
-		finalFiles?: ApplyPatchBatchFileDiff[];
-		trailing: string;
-		trailingCommand?: string;
-	};
 
 // ---------------------------------------------------------------------------
 // 收集阶段（阶段 A）：决定每个文件条目的 diff 请求，不做计算。
@@ -110,6 +55,8 @@ type CollectedFile = {
 	planned: PlannedPatchOperation;
 	cwd: string;
 	spec?: { fileId: string };
+	/** batch finalFiles 聚合 intent（全部同 key patch 的投影行；普通条目缺省）。 */
+	lines?: PatchLine[];
 	/** batch finalFiles 聚合计数（普通条目缺省）。 */
 	patchCount?: number;
 };
@@ -148,10 +95,6 @@ type DiffRequestSpec = {
 	input: DiffInput;
 };
 
-function specKey(oldContent: string, newContent: string, strategy: DiffStrategy): string {
-	return `${strategy.kind}:${strategy.kind === "rewrite" ? strategy.reason : ""}:${oldContent.length}:${oldContent}\u0000${newContent}`;
-}
-
 /** 同一 (old, new, strategy) 对只提交一次；返回 fileId（供组装阶段解析）。 */
 function collectDiff(
 	collection: DiffCollection,
@@ -159,7 +102,7 @@ function collectDiff(
 	newContent: string,
 	strategy: DiffStrategy,
 ): string {
-	const key = specKey(oldContent, newContent, strategy);
+	const key = `${strategy.kind}:${strategy.kind === "rewrite" ? strategy.reason : ""}:${oldContent.length}:${oldContent}\u0000${newContent}`;
 	const existing = collection.byKey.get(key);
 	if (existing !== undefined) return existing;
 	const fileId = `f${collection.specs.length}`;
@@ -192,7 +135,7 @@ function collectExactFileDiff(
 	const beforeSnapshot = before?.get(planned.sourceAbsolutePath);
 	if (!beforeSnapshot || beforeSnapshot.kind === "unavailable") return undefined;
 	const afterPath = planned.destinationAbsolutePath ?? planned.sourceAbsolutePath;
-	if (!before.has(afterPath)) return undefined;
+	if (!before || !before.has(afterPath)) return undefined;
 	const afterEntry = afterContents?.get(afterPath);
 	if (!afterEntry || afterEntry.kind === "unavailable") return undefined;
 	return {
@@ -281,7 +224,7 @@ function assembleFileDiff(entry: CollectedFile, outputs: ReadonlyMap<string, Dif
 			diffTruncated: built.diffTruncated,
 		};
 	}
-	const intent = localIntentDiff(operation.lines);
+	const intent = localIntentDiff(entry.lines ?? operation.lines);
 	return {
 		kind: entry.kind,
 		path: operation.path,
@@ -500,7 +443,13 @@ function buildContextMismatch(
 // ---------------------------------------------------------------------------
 
 type BatchGroup =
-	| { kind: Exclude<ApplyPatchFileDiff["kind"], "Rewrite">; planned: PlannedPatchOperation; cwd: string; patchCount: number }
+	| {
+		kind: Exclude<ApplyPatchFileDiff["kind"], "Rewrite">;
+		planned: PlannedPatchOperation;
+		cwd: string;
+		patchCount: number;
+		operations: PlannedPatchOperation[];
+	}
 	| { kind: "Rewrite"; deleteOp: PlannedPatchOperation; addOp: PlannedPatchOperation; cwd: string; patchCount: number };
 
 async function collectBatchFinalFiles(
@@ -528,8 +477,12 @@ async function collectBatchFinalFiles(
 			}
 			const key = JSON.stringify([operationKindWord(planned.operation), planned.sourceAbsolutePath, planned.destinationAbsolutePath]);
 			const current = grouped.get(key);
-			if (current && current.kind !== "Rewrite") current.patchCount += 1;
-			else grouped.set(key, { kind: operationKindWord(planned.operation), planned, cwd: invocation.cwd, patchCount: 1 });
+			if (current && current.kind !== "Rewrite") {
+				current.patchCount += 1;
+				current.operations.push(planned);
+			} else {
+				grouped.set(key, { kind: operationKindWord(planned.operation), planned, cwd: invocation.cwd, patchCount: 1, operations: [planned] });
+			}
 		}
 	}
 	mergeCrossPatchRewrites(grouped);
@@ -551,6 +504,7 @@ async function collectBatchFinalFiles(
 			planned: group.planned,
 			cwd: group.cwd,
 			spec: collectExactFileDiff(collection, group.planned, before, afterContents),
+			lines: group.operations.flatMap((operation) => operation.operation.lines),
 			patchCount: group.patchCount,
 		});
 	}
@@ -583,7 +537,7 @@ function mergeCrossPatchRewrites(grouped: Map<string, BatchGroup>): void {
  * 阶段 A 收集所有文件的 DiffInput（不计算）；阶段 B 一次 batch 提交到 worker；
  * 阶段 C 用输出组装 view model（worker 不可用时整体降级 intent diff）。
  * 不做任何文件 IO 与本地 diff（intent 仅是 worker 不可用的兜底）。
- * parsed 与 plan 必须来自同一次命令（registry 保证）。
+ * parsed 与 plan 必须来自同一次执行（execute 保证：逐 invocation 直读输出）。
  */
 export async function buildResultViewModel(
 	plan: ApplyPatchPlan,
@@ -642,145 +596,14 @@ export async function buildResultViewModel(
 	if (results.length === 1) return { ...results[0]!, trailing: parsed.trailing, trailingCommand };
 	const finalFiles = finalCollected === undefined
 		? undefined
-		: finalCollected.map((entry) => ({ ...assembleFileDiff(entry, outputs), patchCount: entry.patchCount ?? 1 }));
+		: finalCollected.map((entry) => {
+			const file = assembleFileDiff(entry, outputs);
+			return {
+				...file,
+				patchCount: entry.patchCount ?? 1,
+				// 构建层判定一次：intent 聚合（unlocated 行）时 expanded 无净变更可展示，渲染层只消费字段。
+				isIntent: file.diffDisplay.rows.some((row) => row.kind === "unlocated"),
+			};
+		});
 	return { kind: "apply-patch-batch-result", results, finalFiles, trailing: parsed.trailing, trailingCommand };
-}
-
-export function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null;
-}
-
-function isFileDiff(value: unknown): value is ApplyPatchFileDiff {
-	return isRecord(value) &&
-		["Add", "Update", "Move", "Delete", "Rewrite"].includes(String(value.kind)) &&
-		typeof value.path === "string" &&
-		(value.destination === undefined || typeof value.destination === "string") &&
-		typeof value.cwd === "string" &&
-		isChangeStats(value.changeStats) &&
-		isDisplayDiff(value.diffDisplay) &&
-		typeof value.diffTruncated === "boolean";
-}
-
-function isBatchFileDiff(value: unknown): value is ApplyPatchBatchFileDiff {
-	if (!isRecord(value)) return false;
-	const patchCount = value.patchCount;
-	return isFileDiff(value) &&
-		typeof patchCount === "number" &&
-		Number.isInteger(patchCount) &&
-		patchCount > 0;
-}
-
-function isUnapplied(value: unknown): value is ApplyPatchUnapplied {
-	return isRecord(value) &&
-		["Add", "Update", "Move", "Delete"].includes(String(value.kind)) &&
-		typeof value.path === "string" &&
-		(value.destination === undefined || typeof value.destination === "string") &&
-		typeof value.cwd === "string";
-}
-
-function isSkipped(value: unknown): value is ApplyPatchSkipped {
-	return isRecord(value) &&
-		(value.operation === undefined || typeof value.operation === "string") &&
-		(value.path === undefined || typeof value.path === "string") &&
-		(value.cwd === undefined || typeof value.cwd === "string") &&
-		typeof value.message === "string";
-}
-
-function isOptionalString(value: unknown): value is string | undefined {
-	return value === undefined || typeof value === "string";
-}
-
-function parseContextMismatch(value: unknown): ApplyPatchContextMismatch | undefined {
-	if (!isRecord(value) || !Array.isArray(value.expectedLines) || !Array.isArray(value.actualLines)) return undefined;
-	if (!value.expectedLines.every((line) => typeof line === "string")) return undefined;
-	if (!value.actualLines.every((line) => typeof line === "string")) return undefined;
-	return {
-		expectedLines: value.expectedLines,
-		actualLines: value.actualLines,
-		actualTruncated: value.actualTruncated === true,
-	};
-}
-
-function parseSingleRenderedResultPayload(details: unknown): ApplyPatchSingleResultViewModel | undefined {
-	if (!isRecord(details) || details.kind !== "apply-patch-result" || typeof details.success !== "boolean") return undefined;
-	if (!isOptionalString(details.trailingCommand)) return undefined;
-	if (details.success === true) {
-		if (!Array.isArray(details.files) || !details.files.every(isFileDiff) || typeof details.trailing !== "string") return undefined;
-		return {
-			kind: "apply-patch-result",
-			success: true,
-			files: details.files,
-			trailing: details.trailing,
-			trailingCommand: details.trailingCommand,
-		};
-	}
-	if (
-		!isRecord(details.error) ||
-		typeof details.error.code !== "string" ||
-		typeof details.error.message !== "string" ||
-		!isOptionalString(details.error.cwd) ||
-		!Array.isArray(details.applied) ||
-		!details.applied.every(isFileDiff) ||
-		!Array.isArray(details.skipped) ||
-		!details.skipped.every(isSkipped) ||
-		!Array.isArray(details.unapplied) ||
-		!details.unapplied.every(isUnapplied) ||
-		typeof details.trailing !== "string"
-	) return undefined;
-	const contextMismatch = details.contextMismatch === undefined ? undefined : parseContextMismatch(details.contextMismatch);
-	if (details.contextMismatch !== undefined && !contextMismatch) return undefined;
-	return {
-		kind: "apply-patch-result",
-		success: false,
-		error: {
-			code: details.error.code,
-			message: details.error.message,
-			path: typeof details.error.path === "string" ? details.error.path : undefined,
-			cwd: typeof details.error.cwd === "string" ? details.error.cwd : undefined,
-			chunkIndex: typeof details.error.chunkIndex === "number" ? details.error.chunkIndex : undefined,
-		},
-		applied: details.applied,
-		skipped: details.skipped,
-		contextMismatch,
-		unapplied: details.unapplied,
-		trailing: details.trailing,
-		trailingCommand: details.trailingCommand,
-	};
-}
-
-/** 从 result.details 解析结构化结果（tool_result 注入），渲染层只消费它。 */
-export function parseRenderedResultPayload(details: unknown): ApplyPatchResultViewModel | undefined {
-	const single = parseSingleRenderedResultPayload(details);
-	if (single) return single;
-	if (
-		!isRecord(details) ||
-		details.kind !== "apply-patch-batch-result" ||
-		!Array.isArray(details.results) ||
-		(details.finalFiles !== undefined && (!Array.isArray(details.finalFiles) || !details.finalFiles.every(isBatchFileDiff))) ||
-		typeof details.trailing !== "string" ||
-		!isOptionalString(details.trailingCommand)
-	) {
-		return undefined;
-	}
-	const results = details.results.map(parseSingleRenderedResultPayload);
-	return results.some((result) => result === undefined)
-		? undefined
-		: {
-			kind: "apply-patch-batch-result",
-			results: results as ApplyPatchSingleResultViewModel[],
-			finalFiles: details.finalFiles as ApplyPatchBatchFileDiff[] | undefined,
-			trailing: details.trailing,
-			trailingCommand: details.trailingCommand,
-		};
-}
-
-export function operationKindWord(operation: Pick<PatchOperation, "kind" | "destination">): Exclude<ApplyPatchFileDiff["kind"], "Rewrite"> {
-	if (operation.kind === "add") return "Add";
-	if (operation.kind === "delete") return "Delete";
-	return operation.destination ? "Move" : "Update";
-}
-
-export function changeMatchesOperation(change: SuccessfulChange, operation: Pick<PatchOperation, "kind" | "path" | "destination">): boolean {
-	const status = operation.kind === "add" ? "A" : operation.kind === "delete" ? "D" : "M";
-	return status === change.status && (operation.destination ?? operation.path) === change.path;
 }

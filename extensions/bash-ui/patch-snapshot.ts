@@ -1,6 +1,6 @@
 import { readFile, stat } from "node:fs/promises";
 
-import type { ApplyPatchPlan } from "./patch-command.ts";
+import { isRecord, type ApplyPatchPlan } from "./recognize.ts";
 
 /**
  * 文件快照三态：
@@ -25,10 +25,6 @@ export type AfterContents = ReadonlyMap<string, FileSnapshot>;
  */
 const BEFORE_SNAPSHOT_MAX_BYTES = 8 * 1024 * 1024;
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null;
-}
-
 /** ENOENT 才是 missing；EACCES/EPERM 是 permission；其余是 io-error。 */
 function errorSnapshot(absolutePath: string, error: unknown): FileSnapshot {
 	if (!isRecord(error) || typeof error.code !== "string") {
@@ -51,6 +47,20 @@ async function readSnapshotEntry(absolutePath: string): Promise<FileSnapshot> {
 	} catch (error) {
 		return errorSnapshot(absolutePath, error);
 	}
+}
+
+/**
+ * 执行者架构的快照 API：按 absolute path 去重读取（每路径只读一次）。
+ * 快照时机由执行者 bracket（队列内、spawn 前/后），无 sibling 竞态窗口。
+ */
+export async function snapshotPaths(absolutePaths: readonly string[]): Promise<SnapshotSet> {
+	const snapshots = new Map<string, FileSnapshot>();
+	for (const absolutePath of absolutePaths) {
+		if (!snapshots.has(absolutePath)) {
+			snapshots.set(absolutePath, await readSnapshotEntry(absolutePath));
+		}
+	}
+	return snapshots;
 }
 
 /**

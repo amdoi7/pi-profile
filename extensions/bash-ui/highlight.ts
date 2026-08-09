@@ -84,7 +84,7 @@ export function isExecutable(cmd: string, cwd: string): boolean {
 
 // --- 词法分析 ------------------------------------------------------------
 
-interface Seg {
+export interface Seg {
 	text: string;
 	color: ThemeColor | null; // theme token 名；null = 默认前景色
 }
@@ -120,18 +120,28 @@ function readVariable(s: string, i: number): { text: string; end: number } {
 	return { text: s.slice(i, k), end: k };
 }
 
-export function tokenize(cmd: string, cwd = process.cwd()): Seg[] {
+export function tokenize(cmd: string, cwd = process.cwd(), budget = Number.POSITIVE_INFINITY): Seg[] {
 	const segs: Seg[] = [];
 	const n = cmd.length;
 	let i = 0;
 	let atCmd = true; // 下一个词处于命令位置
+	let exhausted = false; // 预算耗尽：剩余文本不再词法（P4 每帧路径 100KB heredoc 白扫防护）
+	let raw = 0;
 
-	const push = (text: string, color: string | null) => {
-		if (!text) return;
+	const push = (text: string, color: ThemeColor | null) => {
+		if (!text || exhausted) return;
+		raw += text.length;
+		if (raw > budget) {
+			// 追加省略 seg：assemble 的截断逻辑据此输出 "…"（与全量词法后截断同形）。
+			segs.push({ text: "…", color: "dim" });
+			exhausted = true;
+			return;
+		}
 		segs.push({ text, color });
 	};
 
 	while (i < n) {
+		if (exhausted) break;
 		const c = cmd[i];
 
 		// 空白（含换行；换行后是新命令位置）
@@ -317,30 +327,38 @@ function assemble(segs: Seg[], theme: Theme, maxRaw: number): string {
 // --- 渲染入口 ------------------------------------------------------------
 
 interface BashCallArgs {
-	command?: string;
+	command: string;
 	timeout?: number;
 }
 
 interface RenderContext {
 	argsComplete: boolean;
+	/** 上一帧渲染返回的组件（P4 自缓存：同类型实例复用，setText 原地更新）。 */
+	lastComponent?: unknown;
 }
 
-type FallbackRenderCall = (args: BashCallArgs, theme: Theme, context: RenderContext) => unknown;
+/** 高亮显示预算（字符）：与 assemble 的 maxRaw 一致；P4 每帧路径满预算即停词法。 */
+export const HIGHLIGHT_BUDGET = 500;
 
-export function highlightBashCall(
+export function highlightBashCall<C extends RenderContext>(
 	args: BashCallArgs,
 	theme: Theme,
-	context: RenderContext,
-	fallback: FallbackRenderCall,
+	context: C,
+	fallback: (args: BashCallArgs, theme: Theme, context: C) => unknown,
+	segs?: Seg[],
 ) {
 	// 参数未完整（流式）时沿用原渲染，避免高亮半截命令
 	if (!context.argsComplete) return fallback(args, theme, context);
 
 	const cmd = args.command ?? "";
 	let text = theme.fg("toolTitle", theme.bold("$ "));
-	text += assemble(tokenize(cmd), theme, 500);
+	// segs 由渲染层 memo 提供（同一 command 的 tokenize 产物复用）；缺省时按预算词法。
+	text += assemble(segs ?? tokenize(cmd, process.cwd(), HIGHLIGHT_BUDGET), theme, HIGHLIGHT_BUDGET);
 	if (args.timeout) {
 		text += theme.fg("dim", ` (timeout: ${args.timeout}s)`);
 	}
-	return new Text(text, 0, 0);
+	// 自缓存：复用上一帧的 Text 实例（built-in renderCall 同模式），避免每帧重建组件。
+	const component = context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
+	component.setText(text);
+	return component;
 }

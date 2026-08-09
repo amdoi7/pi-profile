@@ -1,4 +1,14 @@
-import { operationByIndex, type ParsedPatch, type PatchOperation } from "./patch-command.ts";
+import { isRecord, normalizeLines, operationByIndex, type ParsedPatch, type PatchOperation } from "./recognize.ts";
+
+/**
+ * invocation-result.ts — 单 invocation 输出解析（执行者架构）。
+ *
+ * 每个 invocation 的 stdout 隔离捕获（不与其他输出混流），因此只需要识别
+ * 两种 canonical 形状：success 块（"Success. Updated the following files:" +
+ * A/M/D 行）与 failure JSON 行。混流扫描（mightBeComplete /
+ * containsResultBlockMarker / parseApplyPatchResultSequence）随观察者架构
+ * 整体删除：这里没有"门卫"，输出就是块本身。
+ */
 
 export type AppliedChange = {
 	index: number;
@@ -42,26 +52,12 @@ export type ParsedApplyPatchResult =
 	| { success: true; changes: SuccessfulChange[]; text: string }
 	| { success: false; failure: ApplyPatchFailure; text: string };
 
+/** 执行者架构的 sequence：各 invocation 的 parsed 拼接（trailing 恒空——混流概念已死）。 */
 export type ParsedApplyPatchResultSequence = {
 	results: ParsedApplyPatchResult[];
 	trailing: string;
 };
 
-function normalizeLines(text: string): string[] {
-	const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-	return normalized.endsWith("\n") ? normalized.slice(0, -1).split("\n") : normalized.split("\n");
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null;
-}
-
-export function resultText(result: { content: Array<{ type: string; text?: string }> }): string {
-	return result.content
-		.filter((item): item is { type: "text"; text: string } => item.type === "text" && typeof item.text === "string")
-		.map((item) => item.text)
-		.join("\n");
-}
 
 export function parseSuccessfulChanges(text: string): SuccessfulChange[] | undefined {
 	const lines = normalizeLines(text);
@@ -83,28 +79,20 @@ export function parseSuccessfulChanges(text: string): SuccessfulChange[] | undef
 	return changes.length > 0 ? changes : undefined;
 }
 
-/** Parse consecutive apply_patch invocations at the start of one shell result. */
-export function parseApplyPatchResultSequence(text: string): ParsedApplyPatchResultSequence | undefined {
+/**
+ * 单 invocation 输出解析：failure JSON 行（trimStart 后 {）优先，否则 success 块。
+ * 无法识别（输出为空 / 与 canonical 形状不符）返回 undefined。
+ */
+export function parseInvocationResult(text: string): ParsedApplyPatchResult | undefined {
+	const failure = parseApplyPatchFailure(text);
+	if (failure) return { success: false, failure, text };
 	const lines = normalizeLines(text);
-	const results: ParsedApplyPatchResult[] = [];
-	let cursor = 0;
-	while (cursor < lines.length) {
-		const failure = parseApplyPatchFailure(lines[cursor] ?? "");
-		if (failure) {
-			results.push({ success: false, failure, text: lines[cursor] ?? "" });
-			cursor += 1;
-			continue;
-		}
-		if (lines[cursor] !== "Success. Updated the following files:") break;
-		const start = cursor;
-		cursor += 1;
-		while (cursor < lines.length && /^[AMD] .+$/.test(lines[cursor] ?? "")) cursor += 1;
-		const resultBlock = lines.slice(start, cursor).join("\n");
-		const changes = parseSuccessfulChanges(resultBlock);
-		if (!changes) return undefined;
-		results.push({ success: true, changes, text: resultBlock });
-	}
-	return results.length > 0 ? { results, trailing: lines.slice(cursor).join("\n") } : undefined;
+	if (lines[0] !== "Success. Updated the following files:") return undefined;
+	let cursor = 1;
+	while (cursor < lines.length && /^[AMD] .+$/.test(lines[cursor] ?? "")) cursor++;
+	const changes = parseSuccessfulChanges(text);
+	if (!changes) return undefined;
+	return { success: true, changes, text: lines.slice(0, cursor).join("\n") };
 }
 
 function parseAppliedChange(value: unknown): AppliedChange | undefined {

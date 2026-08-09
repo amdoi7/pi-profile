@@ -52,7 +52,12 @@ async function loadRegisteredTool() {
 	const temp = sharedExtensionRoot;
 	const tempExtensionDir = path.join(temp, "extension");
 	const tempToolDir = path.join(tempExtensionDir, "bash-ui");
-	await fs.promises.cp(sourceDir, tempToolDir, { recursive: true });
+	// 排除 node_modules：pnpm 的 symlink 结构会让递归复制自引用（EINVAL），
+	// 且测试的依赖解析走 vitest alias + linkPiPackages/linkSharedPackages 的链接。
+	await fs.promises.cp(sourceDir, tempToolDir, {
+		recursive: true,
+		filter: (src) => !src.split(path.sep).includes("node_modules"),
+	});
 	await copySharedFiles(path.join(tempExtensionDir, "_shared"), [
 		"code-preview.ts",
 		"file-link.ts",
@@ -87,10 +92,10 @@ async function loadBuilderModules(tempToolDir, tempExtensionDir) {
 	const stamp = `?t=${Date.now()}`;
 	const load = (name, base = tempToolDir) => import(`${pathToFileURL(path.join(base, name)).href}${stamp}`);
 	const [viewModel, plan, snapshot, result, diffService] = await Promise.all([
-		load("view-model.ts"),
-		load("patch-command.ts"),
+		load("view-model-build.ts"),
+		load("recognize.ts"),
 		load("patch-snapshot.ts"),
-		load("patch-result.ts"),
+		load("invocation-result.ts"),
 		load("diff-service.ts", path.join(tempExtensionDir, "_shared")),
 	]);
 	return {
@@ -98,8 +103,7 @@ async function loadBuilderModules(tempToolDir, tempExtensionDir) {
 		buildApplyPatchPlan: plan.buildApplyPatchPlan,
 		captureBeforeSnapshots: snapshot.captureBeforeSnapshots,
 		captureAfterSnapshots: snapshot.captureAfterSnapshots,
-		parseApplyPatchResultSequence: result.parseApplyPatchResultSequence,
-		resultText: result.resultText,
+		parseInvocationResult: result.parseInvocationResult,
 		requestDiffBatch: diffService.requestDiffBatch,
 	};
 }
@@ -132,14 +136,47 @@ function createContext(command, overrides = {}) {
 }
 
 /**
+ * 测试辅助：多块 sequence 解析（渲染测试构造 batch payload 用）。
+ * 产品执行者是逐 invocation 解析（invocation-result.ts），此处的多块切分
+ * 只存在于测试：按 failure JSON 行 / Success 块边界切分，块后余文为 trailing。
+ */
+function parseSequence(tool, text) {
+	const lines = text.replace(/\r\n/g, "\n").split("\n");
+	const results = [];
+	let cursor = 0;
+	while (cursor < lines.length) {
+		if (lines[cursor].trimStart().startsWith("{")) {
+			const parsed = tool.modules.parseInvocationResult(lines[cursor]);
+			if (!parsed) break;
+			results.push(parsed);
+			cursor += 1;
+			continue;
+		}
+		if (lines[cursor] === "Success. Updated the following files:") {
+			let end = cursor + 1;
+			while (end < lines.length && /^[AMD] .+$/.test(lines[end])) end += 1;
+			const parsed = tool.modules.parseInvocationResult(lines.slice(cursor, end).join("\n"));
+			if (!parsed) break;
+			results.push(parsed);
+			cursor = end;
+			continue;
+		}
+		break;
+	}
+	return results.length > 0 ? { results, trailing: lines.slice(cursor).join("\n") } : undefined;
+}
+
+/**
  * 构造 view model payload（渲染层只消费 details 的契约）。
  * 默认无快照（意图 diff）；withBefore/withAfter 时从真实文件捕获（行号 diff / rewrite 合并）。
+ * plan 截断到 results 数（执行者架构的短路语义：失败后 invocation 不执行）。
  */
 async function buildViewModel({ tool, command, text, cwd = "/tmp/pi-bash-ui-workspace", withBefore = false, withAfter = false }) {
 	const plan = tool.modules.buildApplyPatchPlan(command, cwd);
 	assert.ok(plan, "expected an apply_patch plan");
-	const parsed = tool.modules.parseApplyPatchResultSequence(text);
-	if (!parsed) return undefined;
+	const sequence = parseSequence(tool, text);
+	if (!sequence) return undefined;
+	const executedPlan = { ...plan, invocations: plan.invocations.slice(0, sequence.results.length) };
 	const before = withBefore ? await tool.modules.captureBeforeSnapshots(plan) : undefined;
 	const after = withAfter && before ? await tool.modules.captureAfterSnapshots(plan, before) : undefined;
 	const submitter = async (inputs) => {
@@ -150,7 +187,7 @@ async function buildViewModel({ tool, command, text, cwd = "/tmp/pi-bash-ui-work
 			return undefined;
 		}
 	};
-	return tool.modules.buildResultViewModel(plan, parsed, before, after, submitter);
+	return tool.modules.buildResultViewModel(executedPlan, sequence, before, after, submitter);
 }
 
 function detailsWith(viewModel) {
@@ -158,28 +195,14 @@ function detailsWith(viewModel) {
 }
 
 async function runWithEvents(toolCallId, command, tool, handlers, { cwd = process.cwd() } = {}) {
-	// tool_call：捕获 before 快照
-	for (const handler of handlers["tool_call"] ?? []) {
-		await handler({ toolName: "bash", toolCallId, input: { command } }, { cwd, mode: "tui" });
-	}
-	const result = await tool.execute(
+	// 执行者架构：execute 自己完成识别/执行/VM（观察者机制已删除，handlers 仅保留签名兼容）。
+	return tool.execute(
 		toolCallId,
 		{ command },
 		undefined,
 		undefined,
 		createExecutionContext(cwd),
 	);
-	// tool_result：注入结构化 view model
-	let details;
-	for (const handler of handlers["tool_result"] ?? []) {
-		const outcome = await handler(
-			{ toolName: "bash", toolCallId, input: { command }, content: result.content, isError: false },
-			{ cwd },
-		);
-		if (outcome?.details) details = outcome.details;
-	}
-	console.error("DBG runWithEvents details:", details ? Object.keys(details) : "undefined");
-	return { ...result, details };
 }
 
 function createExecutionContext(cwd) {
@@ -257,7 +280,7 @@ test("single-quoted apply_patch invocation uses the compact pending renderer", a
 	const output = renderText(tool.renderCall({ command }, createTheme(), createContext(command)));
 
 	assert.match(output, /apply_patch Add file note\.txt/);
-	assert.doesNotMatch(output, /^\$ apply_patch /);
+	assert.match(output, /^\$ apply_patch /);
 });
 
 test("completed TUI row replaces the raw patch call with the confirmed result UI", async () => {
@@ -289,7 +312,31 @@ test("completed TUI row replaces the raw patch call with the confirmed result UI
 		"apply_patch Move file src/from.ts -> src/to.ts",
 		"apply_patch Delete file src/dead.ts",
 	]);
-	assert.doesNotMatch(output, /\$ apply_patch|\*\*\* Begin Patch/);
+	assert.match(output, /\$ apply_patch/);
+	assert.doesNotMatch(output, /\*\*\* Begin Patch/);
+});
+
+test("renderResult reuses the view model container across frames", async () => {
+	const { tool } = await loadRegisteredTool();
+	const successText = "Success. Updated the following files:\nA src/new.ts\nM src/old.ts\nM src/to.ts\nD src/dead.ts";
+	const viewModel = await buildViewModel({ tool, command: MULTI_OPERATION_COMMAND, text: successText });
+	const details = detailsWith(viewModel);
+	const state = {};
+	const context = createContext(MULTI_OPERATION_COMMAND, { executionStarted: true, state });
+	const first = tool.renderResult(
+		{ content: [{ type: "text", text: successText }], details },
+		{ expanded: false, isPartial: false },
+		createTheme(),
+		context,
+	);
+	// 第二帧：pi 传入上一帧组件作为 lastComponent → 同一实例复用（容器 clear 后重建内容）。
+	const second = tool.renderResult(
+		{ content: [{ type: "text", text: successText }], details },
+		{ expanded: false, isPartial: false },
+		createTheme(),
+		{ ...context, lastComponent: first },
+	);
+	assert.equal(second, first);
 });
 
 test("successful result renders confirmed affected paths", async () => {
@@ -365,7 +412,7 @@ test("partial result renders the apply_patch block once the complete result is r
 	]);
 	assert.match(output, /\+\s+│ export const created = true;/);
 	assert.match(output, /-\s+│ export const old = true;/);
-	assert.doesNotMatch(output, /^\$ apply_patch/);
+	assert.match(output, /^\$ apply_patch/);
 });
 
 test("partial result with incomplete changes retains the built-in bash renderer", async () => {
@@ -389,10 +436,12 @@ test("partial result collapses trailing output beyond the preview window", async
 	const { tool } = await loadRegisteredTool();
 	const pytestLines = Array.from({ length: 30 }, (_, index) => `test_case_${index} passed`).join("\n");
 	const mixedOutput = `Success. Updated the following files:\nA src/new.ts\nM src/old.ts\nM src/to.ts\nD src/dead.ts\n\n${pytestLines}`;
+	// 流式契约：terminal block 完整后 registry observe 注入 view model，渲染层消费 details。
+	const viewModel = await buildViewModel({ tool, command: MULTI_OPERATION_COMMAND, text: mixedOutput });
 	const output = renderText(tool.renderResult(
 		{
 			content: [{ type: "text", text: mixedOutput }],
-			details: undefined,
+			details: detailsWith(viewModel),
 		},
 		{ expanded: false, isPartial: true },
 		createTheme(),
@@ -478,6 +527,54 @@ test("renderCall records the start time once execution begins", async () => {
 	assert.equal(typeof state.startedAt, "number");
 });
 
+test("renderCall memoizes plan recognition per command string", async () => {
+	const { tool } = await loadRegisteredTool();
+	const state = {};
+	const context = createContext(MULTI_OPERATION_COMMAND, { executionStarted: true, state });
+	tool.renderCall({ command: MULTI_OPERATION_COMMAND }, createTheme(), context);
+	assert.equal(state.planCache.command, MULTI_OPERATION_COMMAND);
+	assert.ok(state.planCache.plan);
+	// 同一 command 第二帧命中缓存：plan 对象同一（识别器未重跑）。
+	const plan = state.planCache.plan;
+	tool.renderCall({ command: MULTI_OPERATION_COMMAND }, createTheme(), context);
+	assert.equal(state.planCache.plan, plan);
+	// 不同 command 失效（非 plan 命令的 undefined 也缓存）。
+	tool.renderCall({ command: "echo hi" }, createTheme(), context);
+	assert.equal(state.planCache.command, "echo hi");
+	assert.equal(state.planCache.plan, undefined);
+});
+
+test("renderCall memoizes highlight segments per command string", async () => {
+	const { tool } = await loadRegisteredTool();
+	const state = {};
+	const context = createContext("echo hi", { executionStarted: true, state });
+	tool.renderCall({ command: "echo hi" }, createTheme(), context);
+	assert.equal(state.segCache.command, "echo hi");
+	const segs = state.segCache.segs;
+	// 同一 command 第二帧命中缓存：seg 数组同一（词法未重扫）。
+	tool.renderCall({ command: "echo hi" }, createTheme(), context);
+	assert.equal(state.segCache.segs, segs);
+});
+
+test("renderCall reuses the highlight Text instance across frames", async () => {
+	const { tool } = await loadRegisteredTool();
+	const state = {};
+	const context = createContext("echo hi", { executionStarted: true, state });
+	const first = tool.renderCall({ command: "echo hi" }, createTheme(), context);
+	// 第二帧：pi 传入上一帧组件作为 lastComponent → 同一实例复用（setText 原地更新）。
+	const second = tool.renderCall({ command: "echo hi" }, createTheme(), { ...context, lastComponent: first });
+	assert.equal(second, first);
+});
+
+test("renderCall reuses the empty container across frames", async () => {
+	const { tool } = await loadRegisteredTool();
+	const state = {};
+	const context = createContext(MULTI_OPERATION_COMMAND, { executionStarted: true, state });
+	const first = tool.renderCall({ command: MULTI_OPERATION_COMMAND }, createTheme(), context);
+	const second = tool.renderCall({ command: MULTI_OPERATION_COMMAND }, createTheme(), { ...context, lastComponent: first });
+	assert.equal(second, first);
+});
+
 test("successful result renders the wall-clock runtime", async () => {
 	const { tool } = await loadRegisteredTool();
 	const successText = "Success. Updated the following files:\nA src/new.ts\nM src/old.ts\nM src/to.ts\nD src/dead.ts";
@@ -555,7 +652,7 @@ test("result without renderer state omits the runtime line", async () => {
 	assert.doesNotMatch(output, /Elapsed|Took/);
 });
 
-test("failure JSON with a successful overall exit still renders the failure UI", async () => {
+test("failure JSON short-circuits and renders the failure UI", async () => {
 	// apply_patch 失败后后续命令（echo 等）让 bash 整体 exit 0（isError=false）：
 	// 失败 JSON 仍是事实，必须渲染失败 UI，后续输出归入 trailing。
 	const command = `cd /tmp/temp && apply_patch <<'PATCH'
@@ -663,7 +760,7 @@ PATCH`;
 		"apply_patch Update file src/context-only.ts",
 		"chunk 0 · no +/- lines · must contain an insertion or deletion",
 	]);
-	assert.doesNotMatch(output, /^\$ apply_patch/);
+	assert.match(output, /^\$ apply_patch/);
 });
 
 test("mixed update renders only the context-only chunk warning", async () => {
@@ -680,7 +777,7 @@ PATCH`;
 	const { tool } = await loadRegisteredTool();
 	const output = renderText(tool.renderCall({ command }, createTheme(), createContext(command)));
 
-	assert.match(output, /apply_patch Update file src\/mixed\.ts 2 changed · \+1 · -1/);
+	assert.match(output, /apply_patch Update file src\/mixed\.ts \+1 -1/);
 	assert.equal(output.match(/no \+\/- lines/g)?.length, 1);
 	assert.match(output, /chunk 1 · no \+\/- lines · must contain an insertion or deletion/);
 });
@@ -718,7 +815,7 @@ PATCH`;
 		"Update hunk must contain an insertion or deletion",
 		"failed update src/context-only.ts · chunk 0",
 	]);
-	assert.doesNotMatch(output, /^\$ apply_patch/);
+	assert.match(output, /^\$ apply_patch/);
 });
 
 test("compound shell commands with cd prefix are recognized as apply_patch", async () => {
@@ -732,7 +829,7 @@ test("compound shell commands with cd prefix are recognized as apply_patch", asy
 		"apply_patch Move file src/from.ts -> src/to.ts",
 		"apply_patch Delete file src/dead.ts",
 	]);
-	assert.doesNotMatch(output, /^\$ cd nested && apply_patch/);
+	assert.match(output, /^\$ cd nested && apply_patch/);
 });
 
 test("apply_patch heredoc followed by additional shell commands is recognized", async () => {
@@ -785,23 +882,10 @@ test("multiple apply_patch results render each invocation independently", async 
 		},
 		appliedPrefix: [],
 	}));
-	const resultText = [
-		failures[0],
-		"Success. Updated the following files:",
-		"M src/second.ts",
-		failures[1],
-		"ERROR: not found: test_missing",
-		"Command exited with code 4",
-	].join("\n");
-	const { tool, handlers } = await loadRegisteredTool();
-	let details;
-	for (const handler of handlers["tool_result"] ?? []) {
-		const outcome = await handler(
-			{ toolName: "bash", toolCallId: "batch-result", input: { command }, content: [{ type: "text", text: resultText }], isError: true },
-			{ cwd: "/tmp/pi-bash-ui-workspace" },
-		);
-		if (outcome?.details) details = outcome.details;
-	}
+	// 执行者架构：inv1 失败即短路（&& 语义），VM 只有第一个 failure 块。
+	const resultText = failures[0];
+	const { tool } = await loadRegisteredTool();
+	const details = detailsWith(await buildViewModel({ tool, command, text: resultText }));
 	const output = renderText(tool.renderResult(
 		{ content: [{ type: "text", text: resultText }], details },
 		{ expanded: false, isPartial: false },
@@ -812,11 +896,8 @@ test("multiple apply_patch results render each invocation independently", async 
 	assertAppearsInOrder(output, [
 		"failed update src/first.ts · chunk 0",
 		"Update file src/first.ts",
-		"apply_patch Update file src/second.ts · 2 changed · +1 · -1",
-		"failed update src/third.ts · chunk 0",
-		"Update file src/third.ts",
-		"ERROR: not found: test_missing",
 	]);
+	assert.doesNotMatch(output, /src\/second\.ts|src\/third\.ts|ERROR: not found/);
 	assert.doesNotMatch(output, /\{"ok":false|Success\. Updated the following files:/);
 });
 
@@ -842,15 +923,8 @@ test("consecutive successful patches to one file render as one aggregated file r
 	const command = [...transitions.map(([before, after]) => updatePatch(before, after)), "npm test"].join("\n");
 	const success = "Success. Updated the following files:\nM src/repeated.ts";
 	const resultText = `${transitions.map(() => success).join("\n")}\nFAIL src/repeated.test.ts`;
-	const { tool, handlers } = await loadRegisteredTool();
-	let details;
-	for (const handler of handlers["tool_result"] ?? []) {
-		const outcome = await handler(
-			{ toolName: "bash", toolCallId: "repeated-success", input: { command }, content: [{ type: "text", text: resultText }], isError: true },
-			{ cwd: "/tmp/pi-bash-ui-workspace" },
-		);
-		if (outcome?.details) details = outcome.details;
-	}
+	const { tool } = await loadRegisteredTool();
+	const details = detailsWith(await buildViewModel({ tool, command, text: resultText }));
 	const output = renderText(tool.renderResult(
 		{ content: [{ type: "text", text: resultText }], details },
 		{ expanded: false, isPartial: false },
@@ -858,7 +932,7 @@ test("consecutive successful patches to one file render as one aggregated file r
 		createContext(command, { executionStarted: true, isError: true }),
 	));
 
-	assert.match(output, /apply_patch Update file src\/repeated\.ts · 12 changed · \+6 · -6 · 6 patches/);
+	assert.match(output, /apply_patch Update file src\/repeated\.ts · \+6 -6 · 6 patches/);
 	assert.equal(output.match(/apply_patch Update file src\/repeated\.ts/g)?.length, 1);
 	assert.match(output, /FAIL src\/repeated\.test\.ts/);
 	assert.doesNotMatch(output, /Success\. Updated the following files:/);
@@ -957,7 +1031,7 @@ test("batch renders the final located diff in collapsed and expanded views", asy
 		createContext(command, { toolCallId, executionStarted: true }),
 	));
 
-	assert.match(collapsed, /apply_patch Update file state\.txt · 2 changed · \+1 · -1 · 2 patches/);
+	assert.match(collapsed, /apply_patch Update file state\.txt · \+1 -1 · 2 patches/);
 	assert.match(collapsed, /-1   │ one/);
 	assert.match(collapsed, /\+  1 │ three/);
 	assert.doesNotMatch(collapsed, /two/);
@@ -1059,19 +1133,10 @@ test("executing render clears the pending call slot", async () => {
 	assert.doesNotMatch(output, /^\$ apply_patch/);
 });
 
-async function buildDetailsViaHandlers(toolCallId, command, handlers, text, { cwd, isError = false } = {}) {
-	for (const handler of handlers["tool_call"] ?? []) {
-		await handler({ toolName: "bash", toolCallId, input: { command } }, { cwd, mode: "tui" });
-	}
-	let details;
-	for (const handler of handlers["tool_result"] ?? []) {
-		const outcome = await handler(
-			{ toolName: "bash", toolCallId, input: { command }, content: [{ type: "text", text }], isError },
-			{ cwd },
-		);
-		if (outcome?.details) details = outcome.details;
-	}
-	return details;
+async function buildDetailsViaHandlers(toolCallId, command, tool, text, { cwd, isError = false, withBefore = false, withAfter = false } = {}) {
+	// 执行者架构：details 由 execute 产出；渲染测试直接构造等价 payload（VM 形状契约不变）。
+	const viewModel = await buildViewModel({ tool, command, text, cwd, withBefore, withAfter });
+	return detailsWith(viewModel);
 }
 
 test("delete followed by add of the same file renders a single rewrite", async ({ temp }) => {
@@ -1083,9 +1148,9 @@ test("delete followed by add of the same file renders a single rewrite", async (
 +new content
 *** End Patch
 PATCH`;
-	const { tool, handlers } = await loadRegisteredTool();
-	const details = await buildDetailsViaHandlers("rewrite-call", command, handlers,
-		"Success. Updated the following files:\nD a.txt\nA a.txt", { cwd: temp });
+	const { tool } = await loadRegisteredTool();
+	const details = await buildDetailsViaHandlers("rewrite-call", command, tool,
+		"Success. Updated the following files:\nD a.txt\nA a.txt", { cwd: temp, withBefore: true });
 	const output = renderText(tool.renderResult(
 		{ content: [{ type: "text", text: "Success. Updated the following files:\nD a.txt\nA a.txt" }], details, isError: false },
 		{ expanded: false, isPartial: false },
@@ -1122,15 +1187,8 @@ PATCH`;
 			newContent: "alpha\nnew\nomega\n",
 		}],
 	};
-	const { tool, handlers } = await loadRegisteredTool();
-	let details;
-	for (const handler of handlers["tool_result"] ?? []) {
-		const outcome = await handler(
-			{ toolName: "bash", toolCallId: "content-call", input: { command }, content: [{ type: "text", text: JSON.stringify(failure) }], isError: true },
-			{ cwd: "/tmp/pi-bash-ui-workspace" },
-		);
-		if (outcome?.details) details = outcome.details;
-	}
+	const { tool } = await loadRegisteredTool();
+	const details = detailsWith(await buildViewModel({ tool, command, text: JSON.stringify(failure) }));
 	const output = renderText(tool.renderResult(
 		{ content: [{ type: "text", text: JSON.stringify(failure) }], details, isError: true },
 		{ expanded: false, isPartial: false },
@@ -1169,8 +1227,8 @@ PATCH`;
 			{ index: 1, operation: "add", path: "a.txt" },
 		],
 	};
-	const { tool, handlers } = await loadRegisteredTool();
-	const details = await buildDetailsViaHandlers("rewrite-fail-call", command, handlers, JSON.stringify(failure), { cwd: temp, isError: true });
+	const { tool } = await loadRegisteredTool();
+	const details = await buildDetailsViaHandlers("rewrite-fail-call", command, tool, JSON.stringify(failure), { cwd: temp, withBefore: true });
 	const output = renderText(tool.renderResult(
 		{ content: [{ type: "text", text: JSON.stringify(failure) }], details, isError: true },
 		{ expanded: false, isPartial: false },
@@ -1216,15 +1274,8 @@ PATCH`;
 			message: "Invalid patch hunk on line 7: Add File lines must start with '+'",
 		}],
 	};
-	const { tool, handlers } = await loadRegisteredTool();
-	let details;
-	for (const handler of handlers["tool_result"] ?? []) {
-		const outcome = await handler(
-			{ toolName: "bash", toolCallId: "skipped-call", input: { command }, content: [{ type: "text", text: JSON.stringify(failure) }], isError: true },
-			{ cwd: "/tmp/pi-bash-ui-workspace" },
-		);
-		if (outcome?.details) details = outcome.details;
-	}
+	const { tool } = await loadRegisteredTool();
+	const details = detailsWith(await buildViewModel({ tool, command, text: JSON.stringify(failure) }));
 	const output = renderText(tool.renderResult(
 		{ content: [{ type: "text", text: JSON.stringify(failure) }], details, isError: true },
 		{ expanded: false, isPartial: false },
@@ -1274,13 +1325,13 @@ PATCH`;
 			message: "Invalid patch hunk on line 2: file path must not have leading or trailing whitespace",
 		}],
 	};
-	const { tool, handlers } = await loadRegisteredTool();
+	const { tool } = await loadRegisteredTool();
 	const details = await buildDetailsViaHandlers(
 		"unparseable-skipped-call",
 		command,
-		handlers,
+		tool,
 		JSON.stringify(failure),
-		{ cwd: "/tmp/pi-bash-ui-workspace", isError: true },
+		{ cwd: "/tmp/pi-bash-ui-workspace" },
 	);
 	const output = renderText(tool.renderResult(
 		{ content: [{ type: "text", text: JSON.stringify(failure) }], details, isError: true },
@@ -1320,8 +1371,8 @@ PATCH`;
 		},
 		appliedPrefix: [],
 	};
-	const { tool, handlers } = await loadRegisteredTool();
-	const details = await buildDetailsViaHandlers("mismatch-call", command, handlers, JSON.stringify(failure), { cwd: temp, isError: true });
+	const { tool } = await loadRegisteredTool();
+	const details = await buildDetailsViaHandlers("mismatch-call", command, tool, JSON.stringify(failure), { cwd: temp, withBefore: true });
 	const output = renderText(tool.renderResult(
 		{ content: [{ type: "text", text: JSON.stringify(failure) }], details, isError: true },
 		{ expanded: true, isPartial: false },
@@ -1352,8 +1403,8 @@ apply_patch <<'PATCH2'
 *** End Patch
 PATCH2`;
 	const text = "Success. Updated the following files:\nD a.txt\nSuccess. Updated the following files:\nA a.txt";
-	const { tool, handlers } = await loadRegisteredTool();
-	const details = await buildDetailsViaHandlers("batch-rewrite-call", command, handlers, text, { cwd: temp });
+	const { tool } = await loadRegisteredTool();
+	const details = await buildDetailsViaHandlers("batch-rewrite-call", command, tool, text, { cwd: temp, withBefore: true });
 	const output = renderText(tool.renderResult(
 		{ content: [{ type: "text", text }], details, isError: false },
 		{ expanded: false, isPartial: false },
@@ -1397,7 +1448,7 @@ PATCH`;
 	assert.doesNotMatch(output, /Success\. Updated the following files:/);
 });
 
-test("streaming renders the patch once and reuses the cached view model on later chunks", async ({ temp }) => {
+test("execute runs invocations, trailing and returns the view model in details", async ({ temp }) => {
 	await fs.promises.writeFile(path.join(temp, "stream.ts"), "oldValue;\n", "utf8");
 	const command = `cd ${temp} && apply_patch <<'PATCH'
 *** Begin Patch
@@ -1406,52 +1457,32 @@ test("streaming renders the patch once and reuses the cached view model on later
 -oldValue;
 +newValue;
 *** End Patch
-PATCH`;
+PATCH
+printf 'pytest 1 passed'`;
 	const toolCallId = "stream-cache";
-	const { tool, handlers } = await loadRegisteredTool();
-	for (const handler of handlers["tool_call"] ?? []) {
-		await handler({ toolName: "bash", toolCallId, input: { command } }, { cwd: temp, mode: "tui" });
-	}
-	const context = createContext(command, { toolCallId, executionStarted: true, isPartial: true });
-
-	const first = renderText(tool.renderResult(
-		{ content: [{ type: "text", text: "Success. Updated the following files:\nM stream.ts" }], details: undefined },
-		{ expanded: false, isPartial: true },
-		createTheme(),
-		context,
-	));
-	assert.match(first, /apply_patch Update file stream\.ts/);
-	assert.match(first, /-\s+│ oldValue;/);
-
-	// 长尾命令副作用改写了文件：缓存视图不得重读文件（diff 保持构建时的状态）。
+	const { tool } = await loadRegisteredTool();
+	// 执行者架构：execute 自己完成快照 bracket + 执行 + trailing + VM。
+	const result = await tool.execute(
+		toolCallId,
+		{ command },
+		undefined,
+		() => {},
+		createExecutionContext(temp),
+	);
+	assert.ok(result.content, "expected execute output");
+	assert.match(result.content[0].text, /Success\. Updated the following files:/);
+	assert.ok(result.details?.bashUi, "execute 应注入结构化 view model");
+	// 长尾命令副作用改写了文件：视图不得重读（diff 保持执行时 bracket 的状态，渲染层只消费 details）。
 	await fs.promises.writeFile(path.join(temp, "stream.ts"), "rewrittenByTailCommand;\n", "utf8");
-
-	const second = renderText(tool.renderResult(
-		{ content: [{ type: "text", text: "Success. Updated the following files:\nM stream.ts\n\npytest 1 passed" }], details: undefined },
-		{ expanded: false, isPartial: true },
-		createTheme(),
-		context,
-	));
-	assert.match(second, /-\s+│ oldValue;/);
-	assert.doesNotMatch(second, /rewrittenByTailCommand/);
-	assert.match(second, /pytest 1 passed/);
-
-	// tool_result 复用流式缓存（不重建、不重读），trailing 用完整输出刷新。
-	let details;
-	for (const handler of handlers["tool_result"] ?? []) {
-		const outcome = await handler(
-			{ toolName: "bash", toolCallId, input: { command }, content: [{ type: "text", text: "Success. Updated the following files:\nM stream.ts\n\npytest 1 passed" }], isError: false },
-			{ cwd: temp },
-		);
-		if (outcome?.details) details = outcome.details;
-	}
+	const context = createContext(command, { toolCallId, executionStarted: true });
 	const completed = renderText(tool.renderResult(
-		{ content: [{ type: "text", text: "Success. Updated the following files:\nM stream.ts\n\npytest 1 passed" }], details },
+		result,
 		{ expanded: false, isPartial: false },
 		createTheme(),
 		context,
 	));
-	assert.match(completed, /-\s+│ oldValue;/);
+	assert.match(completed, /apply_patch Update file stream\.ts/);
+	assert.match(completed, /-1   │ oldValue;/);
 	assert.doesNotMatch(completed, /rewrittenByTailCommand/);
 	assert.match(completed, /pytest 1 passed/);
 });

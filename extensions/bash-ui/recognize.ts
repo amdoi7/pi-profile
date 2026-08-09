@@ -34,11 +34,13 @@ export type PlannedPatchOperation = {
 	destinationAbsolutePath?: string;
 };
 
-/** 一次 apply_patch invocation：自己的 cwd + patch + absolute-path identity。 */
+/** 一次 apply_patch invocation：自己的 cwd + patch + envelope 原文 + absolute-path identity。 */
 export type ApplyPatchInvocation = {
 	index: number;
 	cwd: string;
 	patch: ParsedPatch;
+	/** heredoc body 原文（marker 行之间）：执行者架构用它重建执行命令，不经 shell 重解析。 */
+	envelope: string;
 	operations: readonly PlannedPatchOperation[];
 };
 
@@ -53,6 +55,17 @@ export type ApplyPatchPlan = {
 	trailingCommand?: string;
 };
 
+/** 解析域共享原语：CLI 文本行规范化（CRLF → LF，尾部换行不产生空行）。 */
+export function normalizeLines(text: string): string[] {
+	const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+	return normalized.endsWith("\n") ? normalized.slice(0, -1).split("\n") : normalized.split("\n");
+}
+
+/** 解析域共享原语：类型守卫（object 且非 null）。 */
+export function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
 const OPERATION_HEADER = /^\*\*\* (Add|Delete|Update) File: (.+)$/;
 const OPERATION_HEADER_PREFIXES = ["*** Add File: ", "*** Delete File: ", "*** Update File: "] as const;
 const APPLY_PATCH_HEREDOC =
@@ -61,11 +74,6 @@ const CD_PREFIX = /(?:^|&&)[ \t]*cd[ \t]+(\S+)/;
 
 function isOperationHeader(line: string): boolean {
 	return OPERATION_HEADER_PREFIXES.some((prefix) => line.startsWith(prefix));
-}
-
-function normalizeLines(text: string): string[] {
-	const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-	return normalized.endsWith("\n") ? normalized.slice(0, -1).split("\n") : normalized.split("\n");
 }
 
 function extractSingleQuotedPatch(line: string): string | undefined {
@@ -238,6 +246,7 @@ export function buildApplyPatchPlan(command: string, initialCwd: string): ApplyP
 				index: invocations.length,
 				cwd,
 				patch,
+				envelope,
 				operations: planOperations(invocations.length, cwd, patch),
 			});
 			lastEndLine = end;
@@ -257,6 +266,7 @@ export function buildApplyPatchPlan(command: string, initialCwd: string): ApplyP
 						index: 0,
 						cwd: initialCwd,
 						patch,
+						envelope: source,
 						operations: planOperations(0, initialCwd, patch),
 					}],
 				};

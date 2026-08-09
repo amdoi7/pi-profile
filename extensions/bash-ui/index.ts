@@ -1,34 +1,29 @@
 import {
 	createBashToolDefinition,
-	isBashToolResult,
-	isToolCallEventType,
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
 
 import { renderBashCall, renderBashResult } from "./bash-renderer.ts";
-import { warmUpDiffWorker } from "../_shared/diff-service.ts";
-import { buildApplyPatchPlan } from "./patch-command.ts";
-import { resultText } from "./patch-result.ts";
-import { ApplyPatchRunRegistry } from "./patch-run-registry.ts";
-import { captureBeforeSnapshots } from "./patch-snapshot.ts";
+import { disposeDiffService, warmUpDiffWorker } from "../_shared/diff-service.ts";
+import { buildApplyPatchPlan, type ApplyPatchPlan } from "./recognize.ts";
+import { executeApplyPatchPlan } from "./execute.ts";
 
 /**
  * bash-ui（edit 模式）：bash 只是命令执行与输出识别来源，语义零改动。
  *
- *   command-policy tool_call      -> mutate/block command（settings.json 中先于 bash-ui 加载）
- *   bash-ui tool_call             -> parse authoritative plan -> 捕获 before 快照
- *                                    （并行 sibling execute 开始前的最早观察点）
- *   wrapped bash.execute          -> 验证 params.command 与 plan.command 一致
- *                                    -> delegate built-in execution（不改 input/output/error/order）
- *                                    -> 观察 accumulated update -> terminal block 完整时冻结 after
- *                                    -> 提交不可变 DiffRequest 到长期 worker
- *   tool_result                   -> 最后识别 -> await finalization -> 合并 BashUiDetails -> 清理 run
- *   renderCall/renderResult       -> 维护 wall-clock 耗时状态（startedAt/endedAt/interval，
- *                                    与 built-in 一致：执行开始记时，partial 每 1s tick，
- *                                    最终/错误冻结），renderResult 只消费 view model 否则 delegate
+ * 执行者架构（终局）：识别 canonical apply_patch shape 后自己执行 patch invocations，
+ * 语义从源头就是结构（见 execute.ts）。观察者机制（tool_call 提前快照、freeze 状态机、
+ * sink/revision、tool_result 注入）整体删除：生命周期 = execute 作用域。
  *
- * 所有 mode 都注入 namespaced details（RPC/HTML export/session restore 消费）；
- * 只有 TUI 在 tool_call 捕获文件快照；RPC/JSON/print 走轻量 run（intent diff，不读文件）。
+ *   recognize（非 plan）   -> delegate built-in execute（语义零改动，永久不变量）
+ *   recognize（plan）      -> 逐 invocation：withFileMutationQueue + before/after 快照
+ *                             bracket + 短路 + trailing 原生委托 -> VM 进 result.details
+ *   renderCall/renderResult -> 渲染树结构与观察者架构相同：只消费 details.bashUi，
+ *                              P4 memo 缓存与聚合语义设计原封保留
+ *
+ * bash 语义零改动承诺（保留）：input/output/error/order 原样；content 是 CLI 真实
+ * 输出的忠实拼接；非识别命令 delegate 原样。worker 不可用 → intent diff 是唯一定义的
+ * 降级（保留）。VM 是唯一持久产物；restore/HTML export 不依赖内存（保留）。
  */
 export default function bashUiExtension(pi: ExtensionAPI) {
 	const baseBash = createBashToolDefinition(process.cwd());
@@ -38,71 +33,23 @@ export default function bashUiExtension(pi: ExtensionAPI) {
 	if (!baseRenderCall || !baseRenderResult) {
 		throw new Error("bash-ui requires built-in bash renderCall/renderResult; upgrade pi or disable bash-ui");
 	}
-	const runs = new ApplyPatchRunRegistry();
 
-	pi.on("session_shutdown", () => runs.clear());
-
-	pi.on("tool_call", async (event, ctx) => {
-		if (!isToolCallEventType("bash", event)) return;
-		if (ctx.mode !== "tui") return; // 非 TUI 的轻量 run 在 execute 创建（无文件 IO）
-		const plan = buildApplyPatchPlan(event.input.command, ctx.cwd);
-		if (!plan) return;
-		// 启动 diff worker（不等待）：cold start 与 shell execution 重叠。
-		warmUpDiffWorker();
-		// tool_call 时捕获：sibling mutation tools 尚未开始执行。
-		const before = await captureBeforeSnapshots(plan);
-		runs.capture(event.toolCallId, plan, before);
-	});
-
-	pi.on("tool_result", async (event, ctx) => {
-		if (!isBashToolResult(event)) return;
-		const viewModel = await runs.finalize(event.toolCallId, resultText(event));
-		if (!viewModel) return;
-		// BashUiDetails：保留 built-in metadata（truncation/fullOutputPath），
-		// bashUi 只承载 view model（tool_result 的 details 整体替换，必须合并）。
-		return { details: { ...event.details, bashUi: { applyPatch: viewModel } } };
-	});
+	// 长期 diff worker 的生命周期接线（worker 本身 lazy 创建）。
+	pi.on("session_shutdown", () => disposeDiffService());
 
 	pi.registerTool({
 		...baseBash,
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			if (ctx.mode === "tui") {
-				const plan = buildApplyPatchPlan(params.command, ctx.cwd);
-				if (plan) {
-					// 验证 captured plan 与 final params 一致：policy mutation 可能发生在
-					// bash-ui 的 tool_call 之后（extension 顺序异常）。不一致时放弃旧快照
-					// （sibling tools 可能已开始，重新捕获不可靠），基于 final command 建轻量 run。
-					const captured = runs.capturedPlanCommand(toolCallId);
-					if (captured !== undefined && captured !== plan.command) {
-						console.error(
-							`bash-ui plan mismatch toolCallId=${toolCallId} ` +
-							`captured=${JSON.stringify(captured)} executed=${JSON.stringify(plan.command)} ` +
-							`action="rebuilding run without snapshots (intent diff)"`,
-						);
-						runs.capture(toolCallId, plan);
-					}
-				} else {
-					runs.remove(toolCallId);
-				}
-			} else {
-				// 非 TUI：轻量 run（只保留 plan，intent diff），不读文件。
-				const plan = buildApplyPatchPlan(params.command, ctx.cwd);
-				if (plan) runs.capture(toolCallId, plan);
-			}
-
-			let executeActive = true;
-			runs.attachSink(toolCallId, (update) => {
-				if (executeActive) onUpdate?.(update);
-			});
-			try {
-				const result = await baseExecute(toolCallId, params, signal, (update) => {
-					onUpdate?.(runs.observe(toolCallId, update));
-				}, ctx);
-				return result;
-			} finally {
-				executeActive = false;
-				runs.detachSink(toolCallId);
-			}
+			const plan = buildApplyPatchPlan(params.command, ctx.cwd);
+			if (!plan) return baseExecute(toolCallId, params, signal, onUpdate, ctx);
+			// 启动 diff worker（不等待）：cold start 与 patch 执行重叠。
+			warmUpDiffWorker();
+			const outcome = await executeApplyPatchPlan(plan, { signal, timeout: params.timeout, ctx, onUpdate });
+			return {
+				content: [{ type: "text", text: outcome.content }],
+				isError: outcome.isError,
+				details: outcome.details,
+			};
 		},
 		renderCall(args, theme, context) {
 			// 执行开始即记时（所有命令，含 apply_patch plan 路径）：
@@ -112,7 +59,16 @@ export default function bashUiExtension(pi: ExtensionAPI) {
 				state.startedAt = Date.now();
 				state.endedAt = undefined;
 			}
-			const plan = context.argsComplete ? buildApplyPatchPlan(args.command, context.cwd) : undefined;
+			// P4 memo：plan 识别结果按 command 字符串缓存（1s tick 不重跑识别器；
+			// 非 plan 命令的 undefined 也缓存——识别器只跑一次）。
+			const memo = state as typeof state & { planCache?: { command: string; plan: ApplyPatchPlan | undefined } };
+			let plan: ApplyPatchPlan | undefined;
+			if (context.argsComplete) {
+				if (!memo.planCache || memo.planCache.command !== args.command) {
+					memo.planCache = { command: args.command, plan: buildApplyPatchPlan(args.command, context.cwd) };
+				}
+				plan = memo.planCache.plan;
+			}
 			return renderBashCall(args, theme, context, baseRenderCall, plan);
 		},
 		renderResult(result, options, theme, context) {

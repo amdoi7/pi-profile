@@ -10,19 +10,30 @@ import {
 	type FileMutationRenderItem,
 } from "../_shared/file-mutation-view.ts";
 import { renderCwdFilePathLink } from "../_shared/file-link.ts";
-import type { ApplyPatchPlan, PatchOperation, PlannedPatchOperation } from "./patch-command.ts";
+import { isRecord, type ApplyPatchPlan, type PatchOperation, type PlannedPatchOperation } from "./recognize.ts";
 import {
-	isRecord,
 	parseRenderedResultPayload,
 	operationKindWord,
 	type ApplyPatchUnapplied,
 	type ApplyPatchFileDiff,
 	type ApplyPatchSingleResultViewModel,
 	type ApplyPatchResultViewModel,
-} from "./view-model.ts";
+} from "./view-model-codec.ts";
 
 // 后续命令输出（pytest 等）预览：总量沿用 20 行，首尾各半以同时保留失败标题与 summary。
 const TRAILING_PREVIEW_LINES = 20;
+
+/**
+ * 命令的 shell 前缀：heredoc body（`*** Begin Patch` 起）之前的 shell 部分。
+ * 结构化 UI 已用操作头展示 patch 内容，command 行只显示 shell 命令（避免刷屏）。
+ */
+function shellPrefix(command: string): string {
+	const bodyIndex = command.indexOf("*** Begin Patch");
+	if (bodyIndex === -1) return command;
+	const head = command.slice(0, bodyIndex);
+	// heredoc：body 前是换行结尾的 shell 行；单引号形式：body 紧跟引号（截断后补 …）。
+	return head.endsWith("\n") ? head.slice(0, -1) : `${head}…`;
+}
 
 export type PatchRenderContext = {
 	args: { command: string };
@@ -55,7 +66,7 @@ function renderOperationPath(operation: PatchOperation, cwd: string, theme: Them
 }
 
 /**
- * 一行一个操作，edit 风格：`apply_patch <Kind> file <path> · N changed · +A · -D`。
+ * 一行一个操作，edit 风格：`apply_patch <Kind> file <path> · +A -D`。
  * confirmed=false 时 Kind muted（计划，未发生）；true 时 success（CLI 已确认）。
  */
 function renderOperationRow(
@@ -116,6 +127,12 @@ export function renderPendingApplyPatch(
 	context: PatchRenderContext,
 ): Container {
 	const container = beginPendingFileMutationRender(context);
+	// 主命令行（pending 状态也保留 `$ <cmd>` 头，与 built-in 一致；heredoc body 用操作头展示）。
+	const command = shellPrefix(context.args.command);
+	if (command.length > 0) {
+		container.addChild(new Text(renderShellCommandCall({ command }, theme), 0, 0));
+		container.addChild(new Spacer(1));
+	}
 	const rows = plan.invocations.flatMap((invocation) =>
 		invocation.operations.map((planned) => ({ planned, cwd: invocation.cwd })));
 	const multiple = rows.length > 1;
@@ -284,7 +301,17 @@ export function renderResultViewModel(
 	context: PatchRenderContext,
 ): Container {
 	const container = beginFileMutationResultRender(context);
-	if (viewModel.kind === "apply-patch-batch-result" && viewModel.finalFiles) {
+	// 主命令行（与 built-in bash 一致：结果上方保留 `$ <cmd>` 头；heredoc body 用操作头展示）。
+	const command = shellPrefix(context.args.command);
+	if (command.length > 0) {
+		container.addChild(new Text(renderShellCommandCall({ command }, theme), 0, 0));
+		container.addChild(new Spacer(1));
+	}
+	// 聚合 diff 是 intent（无快照）时无净变更可展示，expanded 展开每个 invocation；
+	// located 聚合（有快照，净 diff）在 collapsed 与 expanded 都显示聚合。
+	const aggregatedIsIntent = viewModel.kind === "apply-patch-batch-result" && viewModel.finalFiles !== undefined &&
+		viewModel.finalFiles.some((file) => file.isIntent === true);
+	if (viewModel.kind === "apply-patch-batch-result" && viewModel.finalFiles && (!options.expanded || !aggregatedIsIntent)) {
 		appendFileMutationBatch(
 			container,
 			viewModel.finalFiles.map((file) => fileResultItem(file, theme, context, file.patchCount)),
