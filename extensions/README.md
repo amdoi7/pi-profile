@@ -8,7 +8,8 @@
 
 ### Runtime 与 memory
 
-- `memory/` — `Issue -> Task` work control-plane owner；负责 project scaffold、prompt injection、issue/task/lesson contract 与 context features；无 CLI/graph，issues/tasks/lessons 由普通编辑工具按 project-memory skill 维护。
+- `memory/` — 项目跨会话记忆：`issues/` 一个交付物一个文件 + `lessons.md` 可复用规则；负责 scaffold 与 compact prompt injection；无索引文件（目录即索引）、无 CLI/graph，文件由普通编辑工具按 project-memory skill 维护。
+- `context-ui/` — `/context` 统计与 HUD：上下文用量分析、overlay 渲染（自 memory 剥离，独立演进）。
 - `_shared/` — sibling extensions 共用 helper；非 extension 入口；结构化 diff 为纯 TS 引擎：公共前后缀剥离 + 无共享行 fast path（整体/核心段，O(N)）+ `jsdiff` Myers（250ms tripwire）分流出 located hunk；展示保持 unified 块形态（不重排），配对仅在预算内（65536 对 / 2M cells）计算词级高亮，未配对整行高亮；可证明 whole rewrite 走 O(N) rewrite path；计算在每进程一个长期 worker 中串行执行（batch 提交、5s 超时 watchdog、崩溃/超时自动重建），主线程零阻塞。
 
 ### Tool ownership
@@ -20,7 +21,7 @@
 
 ### Workflow
 
-- `btw/` — side-channel assistant overlay；提供 `/btw` 侧聊与 handoff summary。
+- `btw/` — side-channel assistant overlay；提供 `/btw` 侧聊与 handoff summary。提交即清空输入框（问题移入 transcript，不等回答结束）；transcript 以 ↑/↓ 行滚动、ctrl+PgUp/ctrl+PgDn 翻页（fullscreen 下裸 PgUp/PgDn 与滚轮被 alt-screen viewport listener 抢先消费，滚的是背后主 transcript，overlay 收不到）；dialog 高度按 overlay `maxHeight` 预算裁剪，避免输入行被 TUI 从底部切掉。
 - `session-breakdown/` — session/context inspection UI；统计 sessions、messages、tokens、cost 与 model/cwd/time breakdown。
 
 ### UI polish
