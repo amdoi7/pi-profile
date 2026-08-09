@@ -46,6 +46,8 @@ export type SessionStatsHandle = {
   rebuild(entries: readonly CacheEntry[], models: CacheWasteModels): void;
   /** 当前快照（O(1) 读）。 */
   getSnapshot(): SessionStats;
+  /** 订阅快照变化（渲染 hook，commit 语义）：addMessage/rebuild 后触发。返回退订。 */
+  onChange(callback: () => void): () => void;
 };
 
 function emptyWaste(): CacheWaste {
@@ -58,6 +60,10 @@ export function createSessionStats(): SessionStatsHandle {
   let waste = emptyWaste();
   /** cache-waste 相邻消息对基线；compaction/branch_summary 时重置。 */
   let prev: PrevRequest | undefined;
+  const changeCallbacks = new Set<() => void>();
+  const notify = () => {
+    for (const callback of changeCallbacks) callback();
+  };
 
   return {
     addMessage(message, models) {
@@ -73,6 +79,7 @@ export function createSessionStats(): SessionStatsHandle {
         waste.missCount += 1;
       }
       prev = asPreviousRequest(entry, prev?.reportedCache ?? false) ?? prev;
+      notify();
     },
     rebuild(entries, models) {
       flow = { input: 0, output: 0, reasoning: 0 };
@@ -100,6 +107,7 @@ export function createSessionStats(): SessionStatsHandle {
         localPrev = asPreviousRequest(entry, localPrev?.reportedCache ?? false) ?? localPrev;
       }
       prev = localPrev;
+      notify();
     },
     getSnapshot() {
       return {
@@ -107,6 +115,12 @@ export function createSessionStats(): SessionStatsHandle {
           flow.input === 0 && flow.output === 0 && flow.reasoning === 0 ? null : flow,
         cost,
         waste,
+      };
+    },
+    onChange(callback) {
+      changeCallbacks.add(callback);
+      return () => {
+        changeCallbacks.delete(callback);
       };
     },
   };

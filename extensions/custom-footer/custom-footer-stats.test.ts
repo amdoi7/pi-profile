@@ -137,4 +137,33 @@ describe("custom footer session stats", () => {
     expect(stats.getSnapshot().flow).toBeNull();
     expect(stats.getSnapshot().cost).toBe(0);
   });
+
+  test("change hook fires on addMessage and rebuild (commit semantics)", () => {
+    let changes = 0;
+    const stats = createSessionStats();
+    stats.onChange(() => {
+      changes += 1;
+    });
+
+    stats.addMessage(assistantMessage(usage({ input: 10, output: 5 })), models);
+    expect(changes).toBe(1);
+    stats.rebuild([], models);
+    expect(changes).toBe(2);
+    // 只读不触发
+    stats.getSnapshot();
+    expect(changes).toBe(2);
+  });
+
+  test("change hook unsubscribes", () => {
+    let changes = 0;
+    const stats = createSessionStats();
+    const off = stats.onChange(() => {
+      changes += 1;
+    });
+    off();
+
+    stats.addMessage(assistantMessage(usage({ input: 10, output: 5 })), models);
+    stats.rebuild([], models);
+    expect(changes).toBe(0);
+  });
 });

@@ -86,12 +86,13 @@ export function formatSessionRow(
     /** 上下文窗口容量：`443k/1M`（用量/容量），compact 决策直接可读。 */
     contextWindow: number;
     cost: number;
+    /** 最近完成一轮（用户消息 → 不再输出）的平均吞吐；进行中为 null。 */
     tps: number | null;
     /** 进行中一轮的经过时间（毫秒）：`本轮12s`，每秒增长。 */
     currentElapsedMs: number | null;
     /** 最近一轮的总时长（毫秒）：`本轮1m5s`（完成态）。 */
     turnMs: number | null;
-    /** 最近完成消息的首字时间（TTFB，毫秒）：`ttfb1.2s`。 */
+    /** 最近一轮的首字时间（TTFB，毫秒）：`ttfb1.2s`。 */
     ttfbMs: number | null;
     flow: TokenFlow | null;
     waste: CacheWaste | null;
@@ -114,20 +115,22 @@ export function formatSessionRow(
   }
   sessionParts.push(theme.fg("muted", formatCost(opts.cost)));
   rows.push(sessionParts.join(" "));
-  // 本轮动态段：tps/ttfb/本轮时长——都是本轮级，独立一段。
-  // 所有字段独立显示（有数据就显示，不做状态互斥）：tps/ttfb 是最近完成消息
-  // 的值（一直显示）；本轮时长进行中显示实时值，完成后显示总时长。
+  // 本轮动态段：tps/ttfb/本轮时长——同一轮（用户消息 → 不再输出）内同源同构。
+  // 进行中：只显示实时经过时间（tps/ttfb 属于已完成轮，混搭会自相矛盾
+  // ——如 ttfb 大于进行中轮长）；完成态：同轮完整一组。
   const tail: string[] = [];
-  if (opts.tps != null) {
-    tail.push(theme.fg("muted", `${Math.round(opts.tps)} t/s`));
-  }
-  if (opts.ttfbMs != null && opts.tps != null) {
-    tail.push(theme.fg("muted", `ttfb${(opts.ttfbMs / 1000).toFixed(1)}s`));
-  }
   if (opts.currentElapsedMs != null) {
     tail.push(theme.fg("muted", `本轮${formatDuration(opts.currentElapsedMs)}`));
-  } else if (opts.turnMs != null) {
-    tail.push(theme.fg("muted", `本轮${formatDuration(opts.turnMs)}`));
+  } else {
+    if (opts.tps != null) {
+      tail.push(theme.fg("muted", `${Math.round(opts.tps)} t/s`));
+    }
+    if (opts.ttfbMs != null && opts.tps != null) {
+      tail.push(theme.fg("muted", `ttfb${(opts.ttfbMs / 1000).toFixed(1)}s`));
+    }
+    if (opts.turnMs != null) {
+      tail.push(theme.fg("muted", `本轮${formatDuration(opts.turnMs)}`));
+    }
   }
   if (tail.length > 0) rows.push(tail.join(" "));
   return rows.join(theme.fg("muted", " │ "));

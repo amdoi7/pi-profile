@@ -54,14 +54,15 @@ fetcher 有 60s TTL 与失败退避（5min）；刷新成功返回 `true` 触发
 
 ## 模块
 
-- `index.ts` — extension 入口；`session_start` 注册 footer，`message_start/end` 采集 tps，`thinking_level_select`/`model_select` 即时 flush，`onBranchChange` + gitDir watch（外部 git 变化即时重渲染）触发，30s 定时兜底。
+- `index.ts` — extension 入口；`session_start` 注册 footer，`agent_start/agent_settled` 定义本轮边界（用户消息 → 不再输出），`message_update/end` 采集 tps/ttfb，`thinking_level_select`/`model_select` 即时 flush，`onBranchChange` + gitDir watch（外部 git 变化即时重渲染）触发，30s 定时兜底。事件处理器只更新数据；渲染由数据源 onChange hook 集中调度（live 节流 / commit 立即）。
 - `custom-footer-format.ts` — 纯格式化与布局：段函数（model/cwd/ctx/git/usage）、token flow 聚合（`computeTokenFlow`）、网格布局（`layoutFooter`）。
 - `custom-footer-usage.ts` — 额度 fetcher 工厂 + TTL/退避缓存。
 - `custom-footer-git.ts` — git status 缓存（TTL + mtime 校验，含操作标记文件）+ 操作状态检测（`detectGitState`）+ gitDir watch（`createGitWatcher`，目录级监听，失败静默降级）。
-- `custom-footer-tps.ts` — 最近请求吞吐（t/s）tracker。
+- `custom-footer-tps.ts` — 本轮（用户消息 → 不再输出）吞吐（t/s）、TTFB、时长 tracker（agent_start → agent_settled）；t/s = 本轮累计 output / 本轮累计流式时间（各消息首块 → 结束之和，工具间隙不稀释），含 onChange 渲染 hook。
+- `custom-footer-stats.ts` — 会话聚合（flow/cost/waste）增量/全量快照，含 onChange 渲染 hook。
 
 ## 测试
 
 ```bash
-npx vitest run   # 93 tests：format 纯函数、usage fetcher（含 kimi 刷新链路 mock）、git 缓存与操作状态检测与 watcher、tps、session stats、index 集成
+npx vitest run   # 95 tests：format 纯函数、usage fetcher（含 kimi 刷新链路 mock）、git 缓存与操作状态检测与 watcher、tps、session stats、index 集成（含事件接线）
 ```

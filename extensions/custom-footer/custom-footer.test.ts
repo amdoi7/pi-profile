@@ -197,6 +197,63 @@ describe("custom footer extension statusline", () => {
   });
 });
 
+describe("custom footer extension round metrics wiring", () => {
+  test("agent events drive round duration and message_end feeds session stats", async () => {
+    const handlers = new Map<string, (event: unknown, ctx: any) => unknown>();
+    const pi = {
+      getThinkingLevel: () => "off",
+      on(event: string, handler: (event: unknown, ctx: any) => unknown) {
+        handlers.set(event, handler);
+      },
+    };
+    customFooterExtension(pi as never);
+
+    let footerFactory: any;
+    const ctx = {
+      mode: "tui",
+      getContextUsage: () => undefined,
+      model: { id: "test-model" },
+      sessionManager: {
+        getCwd: () => "/tmp",
+        getEntries: () => [],
+      },
+      modelRegistry: { find: () => undefined, getProviderDisplayName: () => "test" },
+      ui: {
+        setFooter(factory: unknown) {
+          footerFactory = factory;
+        },
+      },
+    };
+    await handlers.get("session_start")?.({ reason: "startup" }, ctx);
+
+    const footer = footerFactory(
+      { requestRender() {} },
+      { fg: (_name: string, text: string) => text },
+      {
+        getExtensionStatuses: () => new Map(),
+        onBranchChange: () => () => {},
+      },
+    );
+
+    // 事件接线：agent_start/agent_settled → 本轮时长；
+    // message_update(首块) → TTFB 点；message_end → 输出累计 + 会话聚合。
+    await handlers.get("agent_start")?.({}, ctx);
+    await handlers.get("message_update")?.({ message: { role: "assistant" } }, ctx);
+    await handlers.get("message_end")?.(
+      { message: { role: "assistant", usage: { input: 100, output: 200 } } },
+      ctx,
+    );
+    await handlers.get("agent_settled")?.({}, ctx);
+
+    const [, row] = footer.render(120);
+    // 完成态本轮时长（agent_start → agent_settled 接线）
+    expect(row).toContain("本轮");
+    // message_end → 会话聚合（flow 累计）接线
+    expect(row).toContain("↑100 ↓200");
+    footer.dispose();
+  });
+});
+
 describe("custom footer extension model hook", () => {
   test("model_select triggers an immediate footer render", async () => {
     const handlers = new Map<string, (event: unknown, ctx: any) => unknown>();

@@ -49,7 +49,8 @@ export default function (pi: ExtensionAPI) {
 	const readStats = createSessionStats();
 
 	// 统一渲染调度：流式期间（message_update 每 token 块）节流到 1s 一次
-	// （本轮时长是 1s 粒度，更高的渲染频率零收益）；消息/轮完成或配置变化立即 flush。
+	// （本轮时长是 1s 粒度，更高的渲染频率零收益）；commit（消息/轮完成）
+	// 与配置变化立即 flush。调度由下方数据源 onChange hook 驱动。
 	let renderPending = false;
 	let renderTimer: ReturnType<typeof setTimeout> | undefined;
 	const scheduleRender = () => {
@@ -67,36 +68,37 @@ export default function (pi: ExtensionAPI) {
 		footerTui?.requestRender();
 	};
 
+	// 渲染 hook 集中调度：数据源变化时通知，事件处理器只更新数据不碰渲染。
+	// tps：live（流式/等待期）节流，commit（消息/轮完成）立即。
+	readTps.onChange((change) => {
+		if (change === "commit") flushRender();
+		else scheduleRender();
+	});
+	// 会话聚合（flow/cost/waste）变化 → 立即（消息完成/entries 重建）。
+	readStats.onChange(() => flushRender());
+
 	on(pi, "thinking_level_select", () => flushRender(), ["tui"]);
 
 	// 模型切换：hook 即时刷新，不等 30s 轮询兜底。
 	on(pi, "model_select", () => flushRender(), ["tui"]);
 
-	on(pi, "turn_start", async (event, ctx) => {
-		// 本轮经过时间的起点（React 模式一轮含多次消息/思考，轮级时长是用户体感）；
-		// 同时是 TTFB 起点：pi 在 LLM 请求发出前同步触发此事件（message_start 在
-		// 响应头到达时才触发，与首块同批毫秒级，作起点测得恒 0）。
-		readTps.onTurnStart(ctx.sessionManager.getCwd());
-		scheduleRender();
+	on(pi, "agent_start", async (_event, ctx) => {
+		// 本轮（用户发送消息 → 不再输出）起点：agent_start 在用户消息提交时触发，
+		// 也是 TTFB 起点（pi 的 message_start 在响应头到达时才触发，与首块同批
+		// 毫秒级，作起点测得恒 0）。retry/compaction 后的 continue 会再次触发，
+		// tracker 内幂等（不重置起点）。渲染由 tps onChange hook 驱动。
+		readTps.onAgentStart(ctx.sessionManager.getCwd());
 	}, ["tui"]);
 
-	on(pi, "turn_end", async (event, ctx) => {
-		readTps.onTurnEnd(ctx.sessionManager.getCwd());
-		// 一轮完成：立即渲染本轮总时长（固定值，实时已失效）。
-		flushRender();
-	}, ["tui"]);
-
-	on(pi, "message_start", async (event, ctx) => {
-		if (event.message.role !== "assistant") return;
-		// 响应流开始（非 TTFB 起点：事件在响应头到达时才触发，见 turn_start 注释）。
-		readTps.onMessageStart(ctx.sessionManager.getCwd());
+	on(pi, "agent_settled", async (_event, ctx) => {
+		readTps.onAgentSettled(ctx.sessionManager.getCwd());
 	}, ["tui"]);
 
 	on(pi, "message_update", async (event, ctx) => {
 		if (event.message.role !== "assistant") return;
-		// TTFB 点：首个响应块到达（幂等，后续块不重置）。
+		// TTFB 点：本轮首个响应块（幂等）；同时记录本条消息首块
+		// （流式时间用，message_end 后重置，下一条消息重新记录）。
 		readTps.onFirstChunk(ctx.sessionManager.getCwd());
-		scheduleRender();
 	}, ["tui"]);
 
 	on(pi, "message_end", async (event, ctx) => {
@@ -107,8 +109,6 @@ export default function (pi: ExtensionAPI) {
 		readStats.addMessage(m, {
 			find: (provider, modelId) => ctx.modelRegistry.find(provider, modelId),
 		});
-		// 完成时刻立即渲染最终值（不等节流）。
-		flushRender();
 	}, ["tui"]);
 
 	on(pi, "session_start", async (event, ctx) => {
@@ -121,11 +121,11 @@ export default function (pi: ExtensionAPI) {
 
 		ctx.ui.setFooter((tui, theme, footerData) => {
 			footerTui = tui;
-			const unsub = footerData.onBranchChange(() => tui.requestRender());
+			const unsub = footerData.onBranchChange(() => flushRender());
 			// 外部 git 变化（其他终端改文件、merge 冲突等）→ 即时重渲染；
 			// watch 不可用时静默降级，30s 轮询兜底。
 			const stopWatchingGit = watchGitChanges(ctx.sessionManager.getCwd(), () =>
-				tui.requestRender(),
+				flushRender(),
 			);
 			let usageProvider: UsageProviderName = null;
 			let usageFetcher: ProviderUsageFetcher | null = null;
@@ -144,7 +144,7 @@ export default function (pi: ExtensionAPI) {
 			const timer = setInterval(() => {
 				const fetcher = ensureUsageFetcher(detectUsageProvider(ctx.model?.provider));
 				void fetcher?.refresh().then((updated) => {
-					if (updated) tui.requestRender();
+					if (updated) flushRender();
 				});
 				tui.requestRender();
 			}, 30000);
@@ -184,7 +184,7 @@ export default function (pi: ExtensionAPI) {
 						cost: snapshot.cost,
 						tps: readTps.getLast(cwd),
 						ttfbMs: readTps.getLastTtfbMs(cwd),
-						// 进行中：该 turn 的经过时间（每秒增长）；完成态：最近一轮总时长。
+						// 进行中：该轮经过时间（每秒增长）；完成态：最近一轮总时长。
 						currentElapsedMs: readTps.getCurrentElapsedMs(cwd),
 						turnMs: readTps.getLastTurnMs(cwd),
 						flow: snapshot.flow,
@@ -213,15 +213,14 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// session_tree（/tree 导航）与 session_compact（自动/手动压缩）都会替换
-	// entries 且无 message_end 增量信号——全量重建（pi 在两者触发时 entries 已更新）。
+	// entries 且无 message_end 增量信号——全量重建（pi 在两者触发时 entries 已更新）；
+	// 渲染由 readStats 的 onChange hook 驱动（rebuild 内部 notify）。
 	on(pi, "session_tree", async (_event, ctx) => {
 		rebuildStats(ctx);
-		flushRender();
 	}, ["tui"]);
 
 	on(pi, "session_compact", async (_event, ctx) => {
 		rebuildStats(ctx);
-		flushRender();
 	}, ["tui"]);
 
 	function rebuildStats(ctx: ExtensionContext) {
