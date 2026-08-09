@@ -1,7 +1,6 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve, sep } from "node:path";
-import { ENTRYPOINT_NAME } from "./memory-contract.ts";
+import { join, resolve } from "node:path";
 
 export const MISSING_GIT_ROOT_PREFIX = "memory extension requires a git project root; none found above ";
 
@@ -50,33 +49,4 @@ export function tryResolveProjectMemoryDir(cwd: string): string | undefined {
     return undefined;
   }
   return join(resolvePiHome(), ".pi", "memory", flattenProjectRoot(root));
-}
-
-export function resolveProjectMemoryIndexPath(cwd: string): string {
-  return join(resolveProjectMemoryDir(cwd), ENTRYPOINT_NAME);
-}
-
-export function tryResolveProjectMemoryIndexPath(cwd: string): string | undefined {
-  const memoryDir = tryResolveProjectMemoryDir(cwd);
-  if (memoryDir === undefined) {
-    return undefined;
-  }
-  return join(memoryDir, ENTRYPOINT_NAME);
-}
-
-export function isWithinProjectMemoryDir(cwd: string, inputPath: string): boolean {
-  const memoryDir = tryResolveProjectMemoryDir(cwd);
-  if (memoryDir === undefined) {
-    return false;
-  }
-  const absolutePath = resolve(cwd, inputPath);
-  return absolutePath === memoryDir || absolutePath.startsWith(`${memoryDir}${sep}`);
-}
-
-export function isProjectMemoryEntrypoint(cwd: string, inputPath: string): boolean {
-  const indexPath = tryResolveProjectMemoryIndexPath(cwd);
-  if (indexPath === undefined) {
-    return false;
-  }
-  return resolve(cwd, inputPath) === indexPath;
 }

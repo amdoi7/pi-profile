@@ -2,15 +2,9 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
-  buildDefaultEntrypointContent,
-  buildDefaultIssueIndexContent,
   buildDefaultLessonsContent,
-  buildDefaultTaskIndexContent,
-  ENTRYPOINT_HEADER,
-  ENTRYPOINT_NAME,
   ISSUE_DETAILS_DIR,
-  MEMORY_SURFACES,
-  TASK_DETAILS_DIR,
+  LESSONS_FILE_NAME,
 } from "./memory-contract.ts";
 import { resolveProjectMemoryDir } from "./paths.ts";
 
@@ -34,13 +28,7 @@ export async function ensureMemoryDir(cwd: string): Promise<void> {
   const memoryDir = resolveProjectMemoryDir(cwd);
   await mkdir(memoryDir, { recursive: true });
   await mkdir(join(memoryDir, ISSUE_DETAILS_DIR), { recursive: true });
-  await mkdir(join(memoryDir, TASK_DETAILS_DIR), { recursive: true });
-
-  const indexPath = join(memoryDir, ENTRYPOINT_NAME);
-  await ensureFileIfMissing(join(memoryDir, MEMORY_SURFACES.issues.name), buildDefaultIssueIndexContent());
-  await ensureFileIfMissing(join(memoryDir, MEMORY_SURFACES.tasks.name), buildDefaultTaskIndexContent());
-  await ensureFileIfMissing(join(memoryDir, MEMORY_SURFACES.lessons.name), buildDefaultLessonsContent());
-  await ensureFileIfMissing(indexPath, buildDefaultEntrypointContent(ENTRYPOINT_HEADER));
+  await ensureFileIfMissing(join(memoryDir, LESSONS_FILE_NAME), buildDefaultLessonsContent());
 }
 
 export function buildPromptTemplateValues(ctx: ExtensionContext): MemoryPromptTemplateValues {

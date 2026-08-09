@@ -1,72 +1,48 @@
 ---
 name: project-memory
-description: Maintain the Issue -> Task work control plane in project memory. Use when creating or updating issues, task artifacts, lessons, ownership, acceptance, evidence, or handoff state.
+description: Project memory workflow reference for issues/ deliverables and lessons.md.
 disable-model-invocation: true
 ---
 
 # Project Memory
 
-Use this skill for tracked work in the project memory workspace.
-
-## Control Plane
-
-- `issues.md` indexes current issues.
-- `issues/<issue-id>.md` is the authoritative record for one deliverable.
-- `tasks.md` indexes task artifacts.
-- `tasks/<task-id>.md` contains one self-contained deliverable linked from an issue.
-- `lessons.md` contains canonical reusable workspace rules.
-- Pi sessions contain execution activity.
-
-Core flow: `Issue -> Task`.
-
-## Issue Contract
-
-An issue owns:
-
-- outcome
-- scope
-- constraints
-- acceptance criteria
-- status
-- active owner
-- task links
-
-Use one issue ledger per deliverable. One active agent or session owns updates to an issue and its task links. Other agents may read the issue but must not mutate it until ownership changes.
-
-## Task Contract
-
-A task is a self-contained final-state artifact. Keep these fields complete and current:
-
-- objective
-- scope
-- constraints
-- acceptance criteria
-- result
-- evidence
-
-Link every task from an issue. Keep implementation detail in the deliverable itself and execution activity in the Pi session. Apply user feedback directly to the current task content.
-
-## Lessons Contract
-
-Keep one canonical current rule per concept in `lessons.md`.
-
-- `MUST`: hard workspace rule
-- `SHOULD`: default workspace behavior that may yield to issue constraints
-- `MAY`: optional technique or preference
-- `OBSERVED`: verified workspace fact without normative force
+Project memory lives in the project memory directory: `issues/<id>.md` holds one deliverable per file across its full lifecycle; `lessons.md` holds one reusable rule per concept. One deliverable, one file.
 
 ## Workflow
 
-1. Read `issues.md` and the relevant issue ledger.
-2. Confirm the issue owner, scope, constraints, and acceptance criteria.
-3. Create or update a linked task artifact.
-4. Produce and verify the deliverable.
-5. Record the task result and evidence.
-6. Update current issue status and acceptance state.
-7. Add a lesson only when the result establishes a reusable workspace rule.
+1. **Read the relevant memory.** List `issues/`, then read the deliverable and lessons that bear on this task. Done when: the task's goal, the current state, and every applicable rule are known.
+2. **Confirm the control-plane fields.** Status, owner, scope, constraints, and acceptance are present and valid, and no other active session owns the deliverable. Done when: the fields are complete and ownership is uncontested.
+3. **Deliver against acceptance.** Produce and verify the deliverable (test-first). Done when: every acceptance criterion holds with evidence.
+4. **Update the deliverable in place.** Record result, evidence, and status in the existing file. Done when: the file presents one coherent current state.
+5. **Persist only reusable lessons.** A lesson belongs in `lessons.md` only when it applies to future sessions, generalizes beyond this deliverable, and changes future behavior. Done when: every candidate rule either passes all three checks or stays out; execution detail stays in the session.
+6. **Reflect against recorded lessons.** While executing, check lessons against the current repo state; when they contradict, trust the measured state and update the record. Done when: `lessons.md` matches the repo.
 
-Use normal `read`, `edit`, and `write` tools for issue, task, and lesson files. Fail fast when required control-plane fields are missing or ownership is held by another active agent or session.
+## Deliverable Contract
 
-## Maintenance
+Split sub-deliverables into separate files linked from the parent.
 
-No CLI owns semantic decisions. Maintain issue and task files directly with normal `read`, `edit`, and `write` tools. Wiring is plain document file links: issue ledgers list `tasks/<task-id>.md` paths, and `issues.md` / `tasks.md` index those files. There is no graph state to validate.
+```markdown
+---
+status: active            # active | closed
+owner: unassigned         # session id, or unassigned
+summary: one-line outcome
+---
+# <id> <Title>
+
+## 目标
+## 范围
+## 约束
+## 验收
+## 结果
+## 证据
+## 遗留
+```
+
+## Lessons Contract
+
+Lesson strength:
+
+- `MUST`: hard workspace rule; violating it is a bug.
+- `SHOULD`: default workspace behavior that may yield to issue constraints.
+- `MAY`: optional technique or preference.
+- `OBSERVED`: verified workspace fact without normative force.

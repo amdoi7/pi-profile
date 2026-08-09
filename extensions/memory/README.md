@@ -2,87 +2,39 @@
 
 `memory` maintains project work as Markdown under `~/.pi/memory/<project>/`.
 
-Core flow: `Issue -> Task`.
+## Structure
 
-## Data Ownership
+- `issues/` — one Markdown file per deliverable, full lifecycle. The directory is the index; list it to see current work.
+- `lessons.md` — canonical reusable workspace rules, one rule per concept.
 
-- `MEMORY.md` points to the control-plane surfaces. Its body is read on demand, not injected into every model request.
-- `issues.md` indexes current issues.
-- `issues/<issue-id>.md` is the authoritative record for one deliverable.
-- `tasks.md` indexes task artifacts.
-- `tasks/<task-id>.md` contains one self-contained deliverable linked from an issue.
-- `lessons.md` contains canonical reusable workspace rules.
-- The repo contains implementation artifacts and their current behavior.
-- Pi sessions contain execution activity.
+No index files, no CLI, no graph state. Agents maintain files directly with normal `read`, `edit`, and `write` tools, guided by the `project-memory` skill.
 
-## Issue Contract
+## Deliverable Contract
 
-An issue owns its outcome, scope, constraints, acceptance criteria, status, active owner, and task links.
-
-```markdown
-# ISS-101
-
-status，open
-owner，unassigned
-summary，Implement the requested behavior
-
-## Intent
-
-- issue intent，current product requirement
-
-## Tasks
-
-- tasks/ISS-101-api.md
-- tasks/ISS-101-docs.md
-
-## Acceptance
-
-- observable acceptance criterion
-```
-
-One active agent or session owns updates to an issue and its task links. Agents read the `owner` field before mutation and use normal `edit` or `write` operations to keep the record current.
-
-## Task Contract
-
-Each task is a self-contained final-state artifact. Its content covers objective, scope, constraints, acceptance, result, and evidence.
+Each `issues/<id>.md` file covers the full lifecycle of one deliverable:
 
 ```markdown
 ---
-taskId: ISS-101-api
+status: active            # active | closed
+owner: unassigned         # session id, or unassigned
+summary: one-line outcome
 ---
+# <id> <Title>
 
-# Implement the API
-
-## Objective
-
-Current objective.
-
-## Scope
-
-Files and behavior owned by this task.
-
-## Constraints
-
-Applicable contracts and boundaries.
-
-## Acceptance
-
-Observable completion criteria.
-
-## Result
-
-Current delivered behavior.
-
-## Evidence
-
-Tests, commands, paths, commits, or PRs that establish the result.
+## 目标
+## 范围
+## 约束
+## 验收
+## 结果
+## 证据
+## 遗留
 ```
 
-Apply feedback directly to the task content so the file always presents one coherent current state. Keep execution activity in the Pi session.
+Split sub-deliverables into separate files linked from the parent. Apply feedback directly to the file so it always presents one coherent current state.
 
 ## Lessons Contract
 
-Keep one canonical current rule per concept.
+Keep one canonical current rule per concept. A lesson must change future behavior; facts specific to the current session stay in the session, not in lessons.md.
 
 - `MUST`: hard workspace rule
 - `SHOULD`: default workspace behavior that may yield to issue constraints
@@ -91,14 +43,10 @@ Keep one canonical current rule per concept.
 
 ## Runtime
 
-- `index.ts` registers session-scoped scaffold/prompt hooks and context features.
-- `scaffold.ts` creates missing control-plane files for Git projects.
-- `memory-contract.ts` owns generated Markdown contracts.
-- `prompt.ts` injects only the compact control-plane contract and resolved memory/session paths.
-- `pi-context/` owns context statistics and UI.
+- `index.ts` — session-scoped hooks and the single injection owner: scaffold on `session_start`, compact contract injection on `before_agent_start`; the memory prompt and the skill path live here.
+- `scaffold.ts` — creates the memory directory, `issues/`, and `lessons.md` for Git projects.
+- `memory-contract.ts` — owns the generated lessons template.
+- `paths.ts` — project-root resolution and memory directory paths.
+- Context statistics and HUD live in the separate `context-ui` extension.
 
 The runtime stays inactive outside Git projects.
-
-## Maintenance
-
-There is no `/memory` command and no graph state. Agents maintain issues, tasks, and lessons directly with normal `read`, `edit`, and `write` tools, guided by the `project-memory` skill. Wiring between records is plain document file links: an issue ledger lists `tasks/<task-id>.md` paths, and `issues.md` / `tasks.md` stay compact indexes pointing at those files.

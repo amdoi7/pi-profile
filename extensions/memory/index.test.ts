@@ -111,12 +111,10 @@ afterEach(() => {
 });
 
 describe("memory extension behavior", () => {
-  test("session_start creates the scaffold under ~/.pi/memory with a flattened project path", async () => {
+  test("session_start scaffolds only the issues directory and lessons.md", async () => {
     const projectDir = makeProjectDir();
-    const nestedDir = path.join(projectDir, "apps", "web");
-    fs.mkdirSync(nestedDir, { recursive: true });
-    const ctx = makeCtx(nestedDir);
-    const { hooks, tools, commands } = registerMemoryExtension();
+    const ctx = makeCtx(projectDir);
+    const { hooks } = registerMemoryExtension();
     const sessionStartHandler = hooks.get("session_start");
     if (!sessionStartHandler) throw new Error("session_start handler was not registered");
 
@@ -124,52 +122,39 @@ describe("memory extension behavior", () => {
 
     const memoryDir = projectMemoryDir(process.env.HOME!, projectDir);
     expect(fs.existsSync(memoryDir)).toBe(true);
-    expect(fs.existsSync(path.join(memoryDir, "MEMORY.md"))).toBe(true);
-    expect(fs.existsSync(path.join(memoryDir, "issues.md"))).toBe(true);
     expect(fs.existsSync(path.join(memoryDir, "issues"))).toBe(true);
-    expect(fs.existsSync(path.join(memoryDir, "tasks.md"))).toBe(true);
+    expect(fs.statSync(path.join(memoryDir, "issues")).isDirectory()).toBe(true);
     expect(fs.existsSync(path.join(memoryDir, "lessons.md"))).toBe(true);
-    expect(fs.existsSync(path.join(memoryDir, "tasks"))).toBe(true);
-    const memoryIndex = fs.readFileSync(path.join(memoryDir, "MEMORY.md"), "utf8");
-    const issuesIndex = fs.readFileSync(path.join(memoryDir, "issues.md"), "utf8");
-    const tasksIndex = fs.readFileSync(path.join(memoryDir, "tasks.md"), "utf8");
-    const lessonsIndex = fs.readFileSync(path.join(memoryDir, "lessons.md"), "utf8");
-    expect(memoryIndex).toContain("# MEMORY");
-    expect(memoryIndex).toContain("issues.md");
-    expect(memoryIndex).toContain("tasks.md");
-    expect(memoryIndex).toContain("lessons.md");
-    expect(memoryIndex).not.toContain("TASKS.md");
-    expect(memoryIndex).not.toContain("LESSONS.md");
-    expect(memoryIndex).not.toContain("TODO.md");
-    expect(issuesIndex).toContain("# Issues");
-    expect(issuesIndex).toContain("Core flow: Issue -> Task.");
-    expect(issuesIndex).toContain("issue owns outcome, scope, constraints, and acceptance");
-    expect(issuesIndex).not.toContain("Commit/PR -> Lesson");
-    expect(issuesIndex).not.toContain("## Intent granularity");
-    expect(issuesIndex).toContain("## Ownership contract");
-    expect(issuesIndex).toContain("one issue ledger per deliverable");
-    expect(tasksIndex).toContain("self-contained final-state artifact");
-    expect(tasksIndex).toContain("objective, scope, constraints, acceptance, result, and evidence");
-    expect(tasksIndex).not.toContain("draft");
-    expect(tasksIndex).not.toContain("review round");
-    expect(lessonsIndex).toContain("## Lesson strength");
-    expect(lessonsIndex).toContain("MUST");
-    expect(lessonsIndex).toContain("OBSERVED");
-    expect(lessonsIndex).not.toContain("supersedes");
-    expect(tasksIndex).toContain("# Tasks");
-    expect(tasksIndex).not.toContain("# TASKS");
-    expect(lessonsIndex).toContain("# Lessons");
-    expect(lessonsIndex).not.toContain("# LESSONS LEARNED");
-    expect(tools.size).toBe(0);
-    expect(commands.has("context")).toBe(true);
-    expect(commands.has("memory")).toBe(false);
-    expect(commands.size).toBe(1);
+    expect(fs.existsSync(path.join(memoryDir, "MEMORY.md"))).toBe(false);
+    expect(fs.existsSync(path.join(memoryDir, "issues.md"))).toBe(false);
+    expect(fs.existsSync(path.join(memoryDir, "tasks.md"))).toBe(false);
+    expect(fs.existsSync(path.join(memoryDir, "tasks"))).toBe(false);
 
-    expect(commands.get("context").description).toBe("Show context usage");
-    expect(hooks.has("tool_result")).toBe(false);
+    const lessons = fs.readFileSync(path.join(memoryDir, "lessons.md"), "utf8");
+    expect(lessons).toContain("# Lessons");
+    expect(lessons).toContain("MUST");
+    expect(lessons).toContain("OBSERVED");
+    expect(lessons).not.toContain("# LESSONS LEARNED");
   });
 
-  test("before_agent_start injects only the control-plane contract", async () => {
+  test("session_start leaves existing memory files untouched", async () => {
+    const projectDir = makeProjectDir();
+    const memoryDir = projectMemoryDir(process.env.HOME!, projectDir);
+    fs.mkdirSync(memoryDir, { recursive: true });
+    fs.mkdirSync(path.join(memoryDir, "issues"));
+    fs.writeFileSync(path.join(memoryDir, "lessons.md"), "# Lessons\n\ncustom\n", "utf8");
+
+    const ctx = makeCtx(projectDir);
+    const { hooks } = registerMemoryExtension();
+    const sessionStartHandler = hooks.get("session_start");
+    if (!sessionStartHandler) throw new Error("session_start handler was not registered");
+
+    await sessionStartHandler({}, ctx);
+
+    expect(fs.readFileSync(path.join(memoryDir, "lessons.md"), "utf8")).toBe("# Lessons\n\ncustom\n");
+  });
+
+  test("before_agent_start injects the compact memory contract", async () => {
     const projectDir = makeProjectDir();
     const ctx = makeCtx(projectDir);
     const { hooks } = registerMemoryExtension();
@@ -178,15 +163,20 @@ describe("memory extension behavior", () => {
     if (!sessionStartHandler) throw new Error("session_start handler was not registered");
     if (!beforeAgentStartHandler) throw new Error("before_agent_start handler was not registered");
     await sessionStartHandler({}, ctx);
-    const memoryDir = projectMemoryDir(process.env.HOME!, projectDir);
-    fs.appendFileSync(path.join(memoryDir, "MEMORY.md"), "\n- private-detail.md — do not inject\n", "utf8");
 
     const result = await beforeAgentStartHandler({ prompt: "", systemPrompt: "base" }, ctx);
 
-    expect(result.systemPrompt).toContain("Core flow: Issue -> Task.");
-    expect(result.systemPrompt).toContain("self-contained final-state artifact");
-    expect(result.systemPrompt).toContain("normal read/edit/write tools");
-    expect(result.systemPrompt).not.toContain("session task draft");
+    expect(result.systemPrompt).toContain(projectMemoryDir(process.env.HOME!, projectDir));
+    expect(result.systemPrompt).toContain("issues/");
+    expect(result.systemPrompt).toContain("lessons.md");
+    expect(result.systemPrompt).toContain("Before acting");
+    expect(result.systemPrompt).toContain("While acting");
+    expect(result.systemPrompt).toContain("After finishing");
+    expect(result.systemPrompt).toContain("only when it changes future behavior");
+    expect(result.systemPrompt).toMatch(/SKILL\.md/);
+    expect(result.systemPrompt).toContain(".pi/agent/extensions/memory/skills/project-memory/SKILL.md");
+    expect(result.systemPrompt).not.toContain("MEMORY.md");
+    expect(result.systemPrompt).not.toContain("tasks.md");
     expect(result.systemPrompt).not.toContain("private-detail.md");
   });
 
@@ -204,4 +194,9 @@ describe("memory extension behavior", () => {
     expect(fs.existsSync(path.join(process.env.HOME!, ".pi", "memory"))).toBe(false);
   });
 
+  test("memory registers no tools or commands", () => {
+    const { tools, commands } = registerMemoryExtension();
+    expect(tools.size).toBe(0);
+    expect(commands.size).toBe(0);
+  });
 });
