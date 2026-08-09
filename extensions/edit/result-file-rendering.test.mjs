@@ -1,4 +1,4 @@
-import test from "node:test";
+import { test } from "vitest";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -189,8 +189,27 @@ test("pending edit render shows only compact file headers", async () => {
 		),
 	);
 
-	assert.match(output, /edit file src\/example\.ts/);
+	assert.match(output, /edit src\/example\.ts/);
 	assert.doesNotMatch(output, /before|after/);
+});
+
+test("applied result header uses the compact +A -D summary", async () => {
+	initTheme("dark");
+	const tool = await loadRegisteredEditTool();
+	const output = renderText(tool.renderResult(
+		buildAgentResult({
+			path: "src/example.ts",
+			status: "applied",
+			firstChangedLine: 1,
+			previewDisplay: replacementDisplay(1, "before", "after"),
+			changeStats: { additions: 2, deletions: 1, changedLines: 3 },
+		}),
+		{ expanded: true },
+		createTheme(),
+		createRenderContext(),
+	));
+	assert.match(output, /edit src\/example\.ts · \+2 -1/);
+	assert.doesNotMatch(output, /changed/);
 });
 
 test("production result renderer uses Pi native diff rendering", async () => {
@@ -242,9 +261,9 @@ test("failed result shows the path only in its header", async () => {
 		buildAgentResult({
 			path: "src/example.ts",
 			status: "failed",
-			error: {
-				message: "oldText was not found. Re-read the file and copy oldText exactly, including whitespace.",
-			},
+				error: {
+					message: "oldText was not found.",
+				},
 		}),
 		{ expanded: true },
 		createTheme(),

@@ -61,7 +61,7 @@ export function renderCallViewModel(
 
 	const container = beginPendingFileMutationRender(context);
 	appendFileMutationBatch(container, [{
-		title: `${renderCallTitle(theme)} file ${renderCwdFilePathLink(viewModel.path, viewModel.path, context.cwd, theme)}`,
+		title: `${renderCallTitle(theme)} ${renderCwdFilePathLink(viewModel.path, viewModel.path, context.cwd, theme)}`,
 		outcome: "pending",
 	}], theme);
 	return container;
@@ -88,8 +88,8 @@ function fileResultTitle(
 	const summary = file.status === "applied"
 		? renderDiffSummary(file.changeStats, theme)
 		: theme.fg("error", "failed");
-	return `${renderCallTitle(theme)} file ${renderCwdFilePathLink(file.path, file.path, context.cwd, theme)}` +
-		`${theme.fg("muted", " · ")}${summary}`;
+	const suffix = summary.length > 0 ? `${theme.fg("muted", " · ")}${summary}` : "";
+	return `${renderCallTitle(theme)} ${renderCwdFilePathLink(file.path, file.path, context.cwd, theme)}` + suffix;
 }
 
 function fileResultItem(
