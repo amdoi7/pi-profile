@@ -2,7 +2,7 @@ import type { Theme, ToolRenderResultOptions } from "@earendil-works/pi-coding-a
 import type { Component } from "@earendil-works/pi-tui";
 import { Container } from "@earendil-works/pi-tui";
 
-import { highlightBashCall, HIGHLIGHT_BUDGET, tokenize, type Seg } from "./highlight.ts";
+import { highlightBashCall, tokenize, type Seg } from "./highlight.ts";
 import type { ApplyPatchPlan } from "./recognize.ts";
 import type { ApplyPatchResultViewModel } from "./view-model-codec.ts";
 import {
@@ -77,7 +77,7 @@ export function renderBashCall(
 		const state = context.state;
 		let segs = state.segCache?.segs;
 		if (!state.segCache || state.segCache.command !== args.command) {
-			segs = tokenize(args.command ?? "", process.cwd(), HIGHLIGHT_BUDGET);
+			segs = tokenize(args.command ?? "", process.cwd());
 			state.segCache = { command: args.command ?? "", segs };
 		}
 		return highlightBashCall(args, theme, context, baseRenderCall, segs) as Component;

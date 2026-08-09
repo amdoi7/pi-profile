@@ -337,7 +337,7 @@ interface RenderContext {
 	lastComponent?: unknown;
 }
 
-/** 高亮显示预算（字符）：与 assemble 的 maxRaw 一致；P4 每帧路径满预算即停词法。 */
+/** tokenize 的字符预算上限（异常守卫，非设计目标：命令不截断，仅防御病态输入）。 */
 export const HIGHLIGHT_BUDGET = 500;
 
 export function highlightBashCall<C extends RenderContext>(
@@ -352,8 +352,8 @@ export function highlightBashCall<C extends RenderContext>(
 
 	const cmd = args.command ?? "";
 	let text = theme.fg("toolTitle", theme.bold("$ "));
-	// segs 由渲染层 memo 提供（同一 command 的 tokenize 产物复用）；缺省时按预算词法。
-	text += assemble(segs ?? tokenize(cmd, process.cwd(), HIGHLIGHT_BUDGET), theme, HIGHLIGHT_BUDGET);
+	// 命令完整显示（与 built-in 一致，不截断）；segs 由渲染层 memo 提供（同一 command 的 tokenize 产物复用）。
+	text += assemble(segs ?? tokenize(cmd, process.cwd()), theme, Number.POSITIVE_INFINITY);
 	if (args.timeout) {
 		text += theme.fg("dim", ` (timeout: ${args.timeout}s)`);
 	}

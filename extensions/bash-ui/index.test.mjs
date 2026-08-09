@@ -556,6 +556,19 @@ test("renderCall memoizes highlight segments per command string", async () => {
 	assert.equal(state.segCache.segs, segs);
 });
 
+const LONG_COMMAND = "echo start\n" + "x".repeat(2000);
+
+test("long command renders in full without truncation", async () => {
+	const { tool } = await loadRegisteredTool();
+	const state = {};
+	const context = createContext(LONG_COMMAND, { executionStarted: true, state });
+	const output = renderText(tool.renderCall({ command: LONG_COMMAND }, createTheme(), context));
+	// 命令完整显示（与 built-in 一致）：尾部可见，无截断标记与提示。
+	assert.ok(output.includes("x".repeat(20)), "command tail must be visible");
+	assert.ok(!output.includes("…"), "full view must not show a truncation marker");
+	assert.ok(!output.includes("hidden"), "full view must not show a truncation hint");
+});
+
 test("renderCall reuses the highlight Text instance across frames", async () => {
 	const { tool } = await loadRegisteredTool();
 	const state = {};
