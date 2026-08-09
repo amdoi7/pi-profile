@@ -10,6 +10,7 @@ import {
 	type FileEditOperation,
 	type RecoverableEditErrorKind,
 } from "./edit-engine.ts";
+import { normalizeEditInput } from "./input-normalize.ts";
 
 const editOperationSchema = type({
 	oldText: "string",
@@ -25,7 +26,32 @@ const editRequestSchema = type({
 	edits: editOperationSchema.array().atLeastLength(1),
 }).onDeepUndeclaredKey("reject");
 
-export const editRequestParameters: ToolDefinition["parameters"] = editRequestSchema.toJsonSchema() as ToolDefinition["parameters"];
+/**
+ * arktype's toJsonSchema emits no per-field descriptions; inject them so the
+ * model sees the required-match and delete semantics before calling.
+ */
+export const editRequestParameters: ToolDefinition["parameters"] = (() => {
+	const schema = editRequestSchema.toJsonSchema() as {
+		properties?: Record<string, Record<string, unknown>>;
+	};
+	const properties = schema.properties;
+	if (properties) {
+		properties.path.description = "Path to the file to edit (relative or absolute).";
+		properties.edits.description =
+			"One or more targeted replacements, each matched against the original file.";
+		const items = properties.edits.items as Record<string, unknown> | undefined;
+		const itemProperties = items?.properties as Record<string, Record<string, unknown>> | undefined;
+		if (itemProperties) {
+			itemProperties.oldText.description =
+				"Exact text currently in the file to replace.";
+			itemProperties.newText.description =
+				"Replacement text. Use an empty string to delete oldText.";
+			itemProperties.replaceAll.description =
+				"Replace every occurrence of oldText instead of requiring a unique match.";
+		}
+	}
+	return schema as ToolDefinition["parameters"];
+})();
 
 export type EditRequest = typeof editRequestSchema.infer;
 
@@ -94,31 +120,6 @@ export function canonicalizePath(filePath: string, cwd: string): string {
 
 export function parseEditRequest(input: unknown): EditRequest {
 	return editRequestSchema.assert(normalizeEditInput(input));
-}
-
-/**
- * Tolerate edits as a JSON string, matching pi's built-in edit tool.
- * - edits as a JSON string (same tolerance as pi's built-in edit tool)
- * Anything else is left untouched so the schema rejects it loudly.
- */
-function normalizeEditInput(input: unknown): unknown {
-	if (!input || typeof input !== "object") {
-		return input;
-	}
-	const request = input as Record<string, unknown>;
-
-	if (typeof request.edits === "string") {
-		try {
-			const parsed = JSON.parse(request.edits);
-			if (Array.isArray(parsed)) {
-				return { ...request, edits: parsed };
-			}
-		} catch {
-			// fall through to the schema error for a non-array edits
-		}
-	}
-
-	return input;
 }
 
 export function buildCallToolViewModel(args: unknown): CallRenderViewModel {

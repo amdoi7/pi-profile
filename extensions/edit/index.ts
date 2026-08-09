@@ -32,11 +32,12 @@ export default function (pi: ExtensionAPI) {
         label: "edit",
         renderShell: "default",
         description:
-            "Exact text replacements in existing files. Use for small in-place edits with known oldText.",
+            "Edit a single file using exact text replacement: each edits[].oldText must match a unique, non-overlapping region of the original file.",
         promptSnippet: "Exact file edits",
         promptGuidelines: [
-            "For edit, copy oldText verbatim from the latest read output.",
-            "For edit, keep oldText short (1-3 lines) and unique; replaceAll: true replaces all matches.",
+            "For edit, read the target file first; copy oldText verbatim from the latest read output, including whitespace.",
+            "For edit, keep oldText short (1-3 lines).",
+            "For edit, if the intended target is still unclear after reading, ask the user instead of retrying with guessed text.",
         ],
         parameters: editRequestParameters,
         prepareArguments: parseEditRequest,

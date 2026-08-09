@@ -1,4 +1,4 @@
-import test from "node:test";
+import { test } from "vitest";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -8,7 +8,6 @@ import { generateFinalDiff, serializeDisplayDiff } from "../_shared/final-diff.t
 
 import {
 	applyEditsToNormalizedContent,
-	EditToolError,
 	executeFileEdits,
 } from "./edit-engine.ts";
 
@@ -75,11 +74,10 @@ test("not-found diagnostics omit the known path and first replacement index", as
 	await assert.rejects(
 		() => executeFileEdits(file, [{ oldText: 'needle\nfooter - untouched\n', newText: 'replaced\nfooter - untouched\n' }]),
 		(error) => {
-			assert.ok(error instanceof EditToolError);
 			assert.equal(error.kind, 'NOT_FOUND');
-			assert.equal(
+			assert.match(
 				error.message,
-				"oldText was not found. Re-read the file and copy oldText exactly, including whitespace.",
+				/^oldText was not found\.$/,
 			);
 			assert.doesNotMatch(error.message, /story\.txt|edits\[0\]/);
 			return true;
@@ -98,13 +96,34 @@ test("not-found diagnostics identify a later replacement without repeating the p
 			],
 		),
 		(error) => {
-			assert.ok(error instanceof EditToolError);
 			assert.equal(error.kind, "NOT_FOUND");
-			assert.equal(
+			assert.match(
 				error.message,
-				"replacement 2: oldText was not found. Re-read the file and copy oldText exactly, including whitespace.",
+				/^replacement 2: oldText was not found\.$/
 			);
 			assert.doesNotMatch(error.message, /story\.txt|edits\[/);
+			return true;
+		},
+	);
+});
+
+test("batch edits report every failure in one message", () => {
+	assert.throws(
+		() => applyEditsToNormalizedContent(
+			"first\nsecond\n",
+			[
+				{ oldText: "missing-one", newText: "replacement" },
+				{ oldText: "second", newText: "updated" },
+				{ oldText: "missing-two", newText: "replacement" },
+			],
+		),
+		(error) => {
+			assert.equal(error.kind, "NOT_FOUND");
+			// 批量失败聚合：每个失败都带 next 指令（replacement 编号前缀）。
+			assert.match(
+				error.message,
+				/^edit failed \(2 of 3\):\n  oldText was not found\.\n  replacement 3: oldText was not found\.$/
+			);
 			return true;
 		},
 	);
@@ -122,11 +141,10 @@ test("duplicate matches report their count and recovery", () => {
 	assert.throws(
 		() => applyEditsToNormalizedContent('aaaa', [{ oldText: 'aaa', newText: 'bbb' }]),
 		(error) => {
-			assert.ok(error instanceof EditToolError);
 			assert.equal(error.kind, 'DUPLICATE_MATCH');
 			assert.equal(
 				error.message,
-				"oldText matched 2 locations. Add more lines or set replaceAll: true",
+				"oldText matched 2 locations (L1)",
 			);
 			return true;
 		},
@@ -159,11 +177,10 @@ test("replaceAll false keeps duplicate-match guidance", () => {
 			[{ oldText: 'oldName', newText: 'newName', replaceAll: false }],
 		),
 		(error) => {
-			assert.ok(error instanceof EditToolError);
 			assert.equal(error.kind, 'DUPLICATE_MATCH');
 			assert.equal(
 				error.message,
-				"oldText matched 2 locations. Add more lines or set replaceAll: true",
+				"oldText matched 2 locations (L1)",
 			);
 			return true;
 		},
@@ -230,9 +247,8 @@ test("identical replacement fails closed as a structured no-change edit error", 
 			[{ oldText: "const answer = 42;", newText: "const answer = 42;" }],
 		),
 		(error) => {
-			assert.ok(error instanceof EditToolError);
 			assert.equal(error.kind, "NO_CHANGE");
-			assert.equal(error.message, "Replacement is identical; the patch may already be applied.");
+			assert.equal(error.message, "No change: newText normalizes to oldText");
 			return true;
 		},
 	);

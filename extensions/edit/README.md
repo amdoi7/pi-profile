@@ -29,7 +29,17 @@
 - 未设置 `replaceAll` 时，`oldText` 必须只匹配一个位置
 - `replaceAll: true` 时，替换该文件内的全部匹配
 - 每个 `edits[].oldText` 都针对原始文件匹配，不按前一个 replacement 增量匹配
+
+### 输入容错
+
+以下 legacy/退化形状会被归一化（语义无歧义才接受，否则照常拒绝）：
+
 - `edits` 的 JSON 字符串形式会被解析，以兼容内置 `edit` 的输入容错
+- flat legacy 形状 `{ path, oldText, newText }` 合并为 `edits[0]`（与内置 `edit` 对齐；顶层 `replaceAll` 一并合并）
+- `oldText2/newText2`…（顶层或 edit 对象内）成对出现时按序追加为额外 edit，绝不静默丢弃
+- `expectedOccurrences` 被丢弃（legacy 字段；其默认语义即本工具的 unique-match 契约）
+
+其余未知 key、缺 `path`、缺 `oldText` 仍拒绝，错误消息为 arktype 错误原文。
 
 ## Execution
 
@@ -41,11 +51,13 @@
 
 ## Failures
 
-失败信息只保留失败原因与下一步：
+服务对象是 LLM agent：错误正文只传增量（事实 + 必要定位/原因），修复协议已在 promptGuidelines/schema 中声明，不重复传递：
 
-- `NOT_FOUND`：重新读取文件，逐字复制 `oldText`，包括空白
-- `DUPLICATE_MATCH`：增加最小上下文，或设置 `replaceAll: true`
-- `NO_CHANGE`：确认补丁是否已经应用
+- `NOT_FOUND`：`oldText was not found.`——模型自会 fetch/copy/retry，不传任何诊断或指令
+- `DUPLICATE_MATCH`：匹配行号
+- `NO_CHANGE`：`newText` 归一化后等于 `oldText`（替换不产生任何变化）
+- 重叠：`replacement N overlaps replacement M`
+- 参数校验失败：arktype 错误原文
 
 `path` 独立保存在结果字段和 UI 标题中，不在错误正文重复。首个 replacement 不显示内部数组下标；后续 replacement 显示为 `replacement N`。
 
@@ -71,7 +83,7 @@
 
 - pending 阶段只显示文件标题，不读取文件或预计算 diff
 - 成功时标题后显示统计和最终 diff；旧/新行号分列，changed word 使用反显，折叠行显示省略数量，源码空行保留 gutter
-- 失败时标题是路径的唯一展示位置，正文只显示恢复信息
+- 失败时标题是路径的唯一展示位置，正文只显示错误消息
 
 ## Structure
 

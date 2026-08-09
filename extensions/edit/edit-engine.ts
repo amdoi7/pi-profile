@@ -1,3 +1,4 @@
+import { type } from "arktype";
 import { constants } from "node:fs";
 import { access, readFile, stat, writeFile } from "node:fs/promises";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
@@ -34,20 +35,22 @@ export type ExecutedFileEditResult = {
 // Hard file-size gate. Files larger than this are rejected before reading.
 export const MAX_EDIT_FILE_SIZE_BYTES = 8 * 1024 * 1024; // 8 MB
 
-export type RecoverableEditErrorKind = "NOT_FOUND" | "DUPLICATE_MATCH" | "NO_CHANGE";
+export const editToolErrorSchema = type({
+	kind: "'NOT_FOUND' | 'DUPLICATE_MATCH' | 'NO_CHANGE'",
+	message: "string",
+});
 
-export class EditToolError extends Error {
-	readonly kind: RecoverableEditErrorKind;
-
-	constructor(message: string, kind: RecoverableEditErrorKind) {
-		super(message);
-		this.name = "EditToolError";
-		this.kind = kind;
-	}
-}
+export type RecoverableEditErrorKind = typeof editToolErrorSchema.infer.kind;
+export type EditToolError = Error & typeof editToolErrorSchema.infer;
 
 export function isEditToolError(error: unknown): error is EditToolError {
-	return error instanceof EditToolError;
+	return error instanceof Error && editToolErrorSchema.allows(error);
+}
+
+function editError(message: string, kind: RecoverableEditErrorKind): EditToolError {
+	const error = new Error(message) as EditToolError;
+	error.kind = kind;
+	return error;
 }
 
 export type EditEngineOperations = {
@@ -147,29 +150,33 @@ function replacementPrefix(editIndex: number): string {
 	return editIndex === 0 ? "" : `replacement ${editIndex + 1}: `;
 }
 
-function getNotFoundError(editIndex: number): EditToolError {
-	return new EditToolError(
-		`${replacementPrefix(editIndex)}oldText was not found. Re-read the file and copy oldText exactly, including whitespace.`,
-		"NOT_FOUND",
-	);
+function lineNumberAt(content: string, index: number): number {
+	let line = 1;
+	for (let cursor = 0; cursor < index && cursor < content.length; cursor += 1) {
+		if (content[cursor] === "\n") line += 1;
+	}
+	return line;
 }
 
-function getDuplicateError(editIndex: number, occurrences: number): EditToolError {
-	return new EditToolError(
-		`${replacementPrefix(editIndex)}oldText matched ${occurrences} locations. Add more lines or set replaceAll: true`,
+function lineNumbersAt(content: string, indices: number[]): number[] {
+	// 同一行多次匹配去重：L1, L1 → L1。
+	return [...new Set(indices.map((index) => lineNumberAt(content, index)))];
+}
+
+function getNotFoundError(editIndex: number): EditToolError {
+	return editError(`${replacementPrefix(editIndex)}oldText was not found.`, "NOT_FOUND");
+}
+
+function getDuplicateError(editIndex: number, occurrences: number, lineNumbers: number[]): EditToolError {
+	const locations = lineNumbers.length > 0 ? ` (L${lineNumbers.join(", L")})` : "";
+	return editError(
+		`${replacementPrefix(editIndex)}oldText matched ${occurrences} locations${locations}`,
 		"DUPLICATE_MATCH",
 	);
 }
 
 function getEmptyOldTextError(editIndex: number): Error {
 	return new Error(`${replacementPrefix(editIndex)}oldText must not be empty.`);
-}
-
-function getNoChangeError(): EditToolError {
-	return new EditToolError(
-		"Replacement is identical; the patch may already be applied.",
-		"NO_CHANGE",
-	);
 }
 
 function resolveEditMatches(
@@ -183,7 +190,7 @@ function resolveEditMatches(
 	const exactMatches = findAllMatchIndices(content, oldText);
 	if (exactMatches.length > 0) {
 		if (!replaceAll && exactMatches.length > 1) {
-			throw getDuplicateError(editIndex, exactMatches.length);
+			throw getDuplicateError(editIndex, exactMatches.length, lineNumbersAt(content, exactMatches));
 		}
 		// replaceAll explicitly applies the replacement to every exact match.
 		return exactMatches.map((matchIndex) => ({
@@ -199,7 +206,7 @@ function resolveEditMatches(
 		throw getNotFoundError(editIndex);
 	}
 	if (!replaceAll && fuzzyMatches.length > 1) {
-		throw getDuplicateError(editIndex, fuzzyMatches.length);
+		throw getDuplicateError(editIndex, fuzzyMatches.length, lineNumbersAt(content, fuzzyMatches));
 	}
 	// replaceAll explicitly applies the replacement to every fuzzy match.
 
@@ -292,19 +299,30 @@ export function applyEditsToNormalizedContent(normalizedContent: string, edits: 
 	}
 
 	// Normalize edits and resolve matches in a single pass — avoids allocating
-	// a separate normalizedEdits array.
+	// a separate normalizedEdits array. 全部校验后再应用：任一失败时聚合报告
+	// 所有失败点（agent 一次修正全部，而非逐个失败逐个重读）。
 	const matchedEdits: MatchedEdit[] = [];
+	const failures: EditToolError[] = [];
 	for (let index = 0; index < edits.length; index += 1) {
 		const edit = edits[index]!;
 		const oldText = normalizeToLF(edit.oldText);
 		const newText = normalizeToLF(edit.newText);
-		const resolvedMatches = resolveEditMatches(
-			normalizedContent,
-			oldText,
-			edit.replaceAll === true,
-			index,
-			getFuzzyContent(),
-		);
+		let resolvedMatches: ResolvedMatch[];
+		try {
+			resolvedMatches = resolveEditMatches(
+				normalizedContent,
+				oldText,
+				edit.replaceAll === true,
+				index,
+				getFuzzyContent(),
+			);
+		} catch (error) {
+			if (isEditToolError(error)) {
+				failures.push(error);
+				continue;
+			}
+			throw error;
+		}
 		for (const resolvedMatch of resolvedMatches) {
 			matchedEdits.push({
 				editIndex: index,
@@ -313,6 +331,15 @@ export function applyEditsToNormalizedContent(normalizedContent: string, edits: 
 				newText: preserveQuoteStyle(oldText, resolvedMatch.actualOldText, newText),
 			});
 		}
+	}
+	if (failures.length === 1) {
+		throw failures[0]!;
+	}
+	if (failures.length > 1) {
+		throw editError(
+			`edit failed (${failures.length} of ${edits.length}):\n${failures.map((failure) => `  ${failure.message}`).join("\n")}`,
+			failures[0]!.kind,
+		);
 	}
 
 	// Sort only when there are multiple edits — single-edit is already sorted.
@@ -323,7 +350,7 @@ export function applyEditsToNormalizedContent(normalizedContent: string, edits: 
 		const previous = matchedEdits[index - 1]!;
 		const current = matchedEdits[index]!;
 		if (previous.matchIndex + previous.matchLength > current.matchIndex) {
-			throw new Error(`replacement ${current.editIndex + 1} overlaps replacement ${previous.editIndex + 1}. Merge them into one edit or target disjoint regions.`);
+			throw new Error(`replacement ${current.editIndex + 1} overlaps replacement ${previous.editIndex + 1}`);
 		}
 	}
 
@@ -340,7 +367,10 @@ export function applyEditsToNormalizedContent(normalizedContent: string, edits: 
 	segments.push(normalizedContent.substring(cursor));
 	const newContent = segments.join("");
 	if (newContent === normalizedContent) {
-		throw getNoChangeError();
+		throw editError(
+			"No change: newText normalizes to oldText",
+			"NO_CHANGE",
+		);
 	}
 	// matchedEdits already has matchIndex/matchLength/newText — reuse as MatchedEditSpan[].
 	return { newContent, matchedSpans: matchedEdits };

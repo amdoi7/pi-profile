@@ -1,4 +1,4 @@
-import test from "node:test";
+import { test } from "vitest";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -87,13 +87,13 @@ test("failed execution outcome carries errorKind for recoverable edit errors", a
 	assert.equal(outcome.status, "failed");
 	if (outcome.status !== "failed") throw new Error("expected failed");
 	assert.equal(outcome.errorKind, "NOT_FOUND");
-	assert.equal(outcome.error, "oldText was not found. Re-read the file and copy oldText exactly, including whitespace.");
+	assert.match(outcome.error, /^oldText was not found\.$/);
 	assert.deepEqual(JSON.parse(buildOutcomeAgentContent(outcome)), {
 		status: "failed",
 		path: file,
 		error: {
 			kind: "NOT_FOUND",
-			message: "oldText was not found. Re-read the file and copy oldText exactly, including whitespace.",
+			message: "oldText was not found.",
 		},
 	});
 });
