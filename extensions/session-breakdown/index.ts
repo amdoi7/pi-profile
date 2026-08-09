@@ -1719,7 +1719,9 @@ export default function sessionBreakdownExtension(pi: ExtensionAPI) {
 	pi.registerCommand("session-breakdown", {
 		description: "Interactive breakdown of last 7/30/90 days of ~/.pi session usage (sessions/messages/tokens + cost by model)",
 		handler: async (_args, ctx: ExtensionContext) => {
-			if (!ctx.hasUI) {
+			// TUI-only interactive view: RPC mode has hasUI=true but custom() returns
+			// undefined, so route non-TUI modes to the non-interactive fallback.
+			if (!ctx.hasUI || ctx.mode !== "tui") {
 				// Non-interactive fallback: just notify.
 				const data = await computeBreakdown(undefined);
 				const range = data.ranges.get(30)!;
