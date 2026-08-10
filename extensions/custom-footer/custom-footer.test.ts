@@ -1,4 +1,4 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { createGitStatusCache, type GitRepoMtimes } from "./custom-footer-git.ts";
 import customFooterExtension from "./index.ts";
 
@@ -251,6 +251,68 @@ describe("custom footer extension round metrics wiring", () => {
     // message_end → 会话聚合（flow 累计）接线
     expect(row).toContain("↑100 ↓200");
     footer.dispose();
+  });
+});
+
+describe("custom footer extension live tick", () => {
+  test("refreshes every second during an active round, stops at settle", async () => {
+    vi.useFakeTimers();
+    try {
+      const handlers = new Map<string, (event: unknown, ctx: any) => unknown>();
+      const pi = {
+        getThinkingLevel: () => "off",
+        on(event: string, handler: (event: unknown, ctx: any) => unknown) {
+          handlers.set(event, handler);
+        },
+      };
+      customFooterExtension(pi as never);
+
+      let footerFactory: any;
+      const ctx = {
+        mode: "tui",
+        getContextUsage: () => undefined,
+        model: { id: "test-model" },
+        sessionManager: {
+          getCwd: () => "/tmp",
+          getEntries: () => [],
+        },
+        modelRegistry: { find: () => undefined, getProviderDisplayName: () => "test" },
+        ui: {
+          setFooter(factory: unknown) {
+            footerFactory = factory;
+          },
+        },
+      };
+      await handlers.get("session_start")?.({ reason: "startup" }, ctx);
+
+      let renderCalls = 0;
+      const footer = footerFactory(
+        { requestRender() { renderCalls += 1; } },
+        { fg: (_name: string, text: string) => text },
+        {
+          getExtensionStatuses: () => new Map(),
+          onBranchChange: () => () => {},
+        },
+      );
+      footer.render(120);
+
+      // 进行中:先消费 agent_start 的事件驱动渲染(节流 1s),再统计纯 tick
+      await handlers.get("agent_start")?.({}, ctx);
+      vi.advanceTimersByTime(1_000);
+      const before = renderCalls;
+      vi.advanceTimersByTime(3_000); // 纯 thinking 期:每秒 tick 一次
+      expect(renderCalls - before).toBe(3);
+
+      // settled:停止 tick
+      await handlers.get("agent_settled")?.({}, ctx);
+      const afterSettle = renderCalls;
+      vi.advanceTimersByTime(3_000);
+      expect(renderCalls - afterSettle).toBe(0);
+
+      footer.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

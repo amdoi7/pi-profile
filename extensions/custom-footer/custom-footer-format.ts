@@ -116,7 +116,7 @@ export function formatSessionRow(
   sessionParts.push(theme.fg("muted", formatCost(opts.cost)));
   rows.push(sessionParts.join(" "));
   // 本轮动态段：tps/ttfb/本轮时长——同一轮（用户消息 → 不再输出）内同源同构。
-  // 进行中：只显示实时经过时间（tps/ttfb 属于已完成轮，混搭会自相矛盾
+  // 进行中：只显示实时经过时间（tps/ttfb 是最近完成消息的值，混搭会自相矛盾
   // ——如 ttfb 大于进行中轮长）；完成态：同轮完整一组。
   const tail: string[] = [];
   if (opts.currentElapsedMs != null) {

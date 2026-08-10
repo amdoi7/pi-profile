@@ -136,6 +136,22 @@ describe("formatSessionRow", () => {
 			}),
 		).toBe("ctx: 12k/1M 52% │ $0.10 │ 本轮12s");
 	});
+	test("live round omits tps/ttfb until the first chunk arrives", () => {
+		expect(
+			formatSessionRow(theme, {
+				used: 12_000,
+				pct: 52.3,
+				contextWindow: 1_000_000,
+				cost: 0.1,
+				tps: null,
+				ttfbMs: null,
+				currentElapsedMs: 5_000,
+				turnMs: null,
+				flow: null,
+				waste: null,
+			}),
+		).toBe("ctx: 12k/1M 52% │ $0.10 │ 本轮5s");
+	});
 	test("renders zero cost when the model has no price table", () => {
 		expect(
 			formatSessionRow(theme, { used: 12_000, pct: 52.3, contextWindow: 1_000_000, cost: 0, tps: null, ttfbMs: null, currentElapsedMs: null, turnMs: null, flow: null, waste: null }),

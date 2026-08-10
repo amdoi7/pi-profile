@@ -68,6 +68,19 @@ export default function (pi: ExtensionAPI) {
 		footerTui?.requestRender();
 	};
 
+	// 进行中每秒 tick：事件驱动（message_update）之外兜底——纯 thinking 期
+	// （首块未到）与工具执行期无事件，实时值（本轮 Xs）会停摆；tick 保证
+	// 有进行中的轮时每秒刷新。agent_start 启动、agent_settled 停止。
+	let liveTick: ReturnType<typeof setInterval> | undefined;
+	const startLiveTick = () => {
+		if (liveTick) return;
+		liveTick = setInterval(() => footerTui?.requestRender(), 1000);
+	};
+	const stopLiveTick = () => {
+		if (liveTick) clearInterval(liveTick);
+		liveTick = undefined;
+	};
+
 	// 渲染 hook 集中调度：数据源变化时通知，事件处理器只更新数据不碰渲染。
 	// tps：live（流式/等待期）节流，commit（消息/轮完成）立即。
 	readTps.onChange((change) => {
@@ -83,27 +96,37 @@ export default function (pi: ExtensionAPI) {
 	on(pi, "model_select", () => flushRender(), ["tui"]);
 
 	on(pi, "agent_start", async (_event, ctx) => {
-		// 本轮（用户发送消息 → 不再输出）起点：agent_start 在用户消息提交时触发，
-		// 也是 TTFB 起点（pi 的 message_start 在响应头到达时才触发，与首块同批
-		// 毫秒级，作起点测得恒 0）。retry/compaction 后的 continue 会再次触发，
-		// tracker 内幂等（不重置起点）。渲染由 tps onChange hook 驱动。
+		// 轮级：本轮（用户发送消息 → 不再输出）起点，agent_start 在用户消息提交时触发，
+		// retry/compaction 后的 continue 会再次触发，tracker 内幂等（不重置起点）。
+		// 渲染由 tps onChange hook 驱动；每秒 tick 保证无事件期实时值刷新。
 		readTps.onAgentStart(ctx.sessionManager.getCwd());
+		startLiveTick();
 	}, ["tui"]);
 
 	on(pi, "agent_settled", async (_event, ctx) => {
 		readTps.onAgentSettled(ctx.sessionManager.getCwd());
+		stopLiveTick();
+	}, ["tui"]);
+
+	on(pi, "turn_start", async (_event, ctx) => {
+		// turn 级（每条 LLM 响应）：本条消息的 TTFB 起点。
+		// 边界：初始 turn_start 配消息1（用户消息 → 首块 = 用户首字等待）；
+		// toolResult/user 消息无 turn_start，不会污染配对。
+		readTps.onTurnStart(ctx.sessionManager.getCwd());
 	}, ["tui"]);
 
 	on(pi, "message_update", async (event, ctx) => {
 		if (event.message.role !== "assistant") return;
-		// TTFB 点：本轮首个响应块（幂等）；同时记录本条消息首块
-		// （流式时间用，message_end 后重置，下一条消息重新记录）。
+		// message 级：本条消息首块（TTFB 点 + 流式起点）。幂等；
+		// message_end 后重置，无输出消息不污染下一条。
 		readTps.onFirstChunk(ctx.sessionManager.getCwd());
 	}, ["tui"]);
 
 	on(pi, "message_end", async (event, ctx) => {
 		if (event.message.role !== "assistant") return;
 		const m = event.message as AssistantMessage;
+		// message 级：本条消息完成——速率/ttfb 计算（tps 分子含 thinking）。
+		// user/toolResult 消息也触发 message_end，被 role 过滤。
 		readTps.onMessageEnd(ctx.sessionManager.getCwd(), m.usage?.output ?? 0);
 		// 会话聚合增量（O(1)）：flow/cost/cache-waste 只在消息完成时变化。
 		readStats.addMessage(m, {
@@ -155,6 +178,7 @@ export default function (pi: ExtensionAPI) {
 					unsub();
 					stopWatchingGit();
 					clearInterval(timer);
+					stopLiveTick();
 					// 清理节流渲染 timer（防止 session 切换后幽灵触发）。
 					if (renderTimer) clearTimeout(renderTimer);
 					renderTimer = undefined;
@@ -182,6 +206,7 @@ export default function (pi: ExtensionAPI) {
 						pct: usage?.percent,
 						contextWindow: usage?.contextWindow,
 						cost: snapshot.cost,
+						// 最近完成消息的可见输出速率（完成态显示；进行中由 format 隐藏）。
 						tps: readTps.getLast(cwd),
 						ttfbMs: readTps.getLastTtfbMs(cwd),
 						// 进行中：该轮经过时间（每秒增长）；完成态：最近一轮总时长。
