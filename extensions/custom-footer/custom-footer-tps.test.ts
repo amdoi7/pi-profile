@@ -129,7 +129,7 @@ describe("custom footer tps tracker (message rate + per-message ttfb)", () => {
     expect(tracker.getLastTurnMs("/repo")).toBe(6_000); // 7000-1000
   });
 
-  test("keeps the previous values until the new round completes", () => {
+  test("new round keeps the previous rate; turn duration stays until it completes", () => {
     let nowMs = 1_000;
     const tracker = createTpsTracker({ getNowMs: () => nowMs });
 
@@ -143,7 +143,7 @@ describe("custom footer tps tracker (message rate + per-message ttfb)", () => {
     tracker.onAgentSettled("/repo");
     expect(tracker.getLast("/repo")).toBeCloseTo(100, 5);
 
-    // 新轮开始:完成前仍显示上一轮的值(显示层进行中不渲染 tps)
+    // 新轮开始:保留上一轮的值,本轮时长保留(完成态显示用)
     nowMs = 5_000;
     tracker.onAgentStart("/repo");
     expect(tracker.getLast("/repo")).toBeCloseTo(100, 5);
@@ -226,6 +226,51 @@ describe("custom footer tps tracker (message rate + per-message ttfb)", () => {
     nowMs = 30_000;
     expect(tracker.getLastTurnMs("/repo")).toBe(4_000); // 固定
     expect(tracker.getCurrentElapsedMs("/repo")).toBeNull();
+  });
+
+  test("keeps the previous rate/ttfb across rounds (no clearing)", () => {
+    let nowMs = 1_000;
+    const tracker = createTpsTracker({ getNowMs: () => nowMs });
+
+    tracker.onAgentStart("/repo");
+    tracker.onTurnStart("/repo");
+    nowMs = 2_000;
+    tracker.onFirstChunk("/repo");
+    nowMs = 3_000;
+    tracker.onMessageEnd("/repo", 100);
+    expect(tracker.getLast("/repo")).toBeCloseTo(100, 5);
+    expect(tracker.getLastTtfbMs("/repo")).toBe(1_000);
+
+    nowMs = 4_000;
+    tracker.onAgentSettled("/repo");
+    nowMs = 5_000;
+    tracker.onAgentStart("/repo"); // 新轮:保留上一轮的值(不清空)
+    expect(tracker.getLast("/repo")).toBeCloseTo(100, 5);
+    expect(tracker.getLastTtfbMs("/repo")).toBe(1_000);
+
+    nowMs = 6_000;
+    tracker.onTurnStart("/repo");
+    nowMs = 6_500;
+    tracker.onFirstChunk("/repo");
+    nowMs = 7_000;
+    tracker.onMessageEnd("/repo", 200); // 新消息完成:替换为它的值
+    expect(tracker.getLast("/repo")).toBeCloseTo(400, 5); // 200/500ms
+    expect(tracker.getLastTtfbMs("/repo")).toBe(500); // 6500-6000
+  });
+
+  test("in-round values survive continue (same round keeps its values)", () => {
+    let nowMs = 1_000;
+    const tracker = createTpsTracker({ getNowMs: () => nowMs });
+
+    tracker.onAgentStart("/repo");
+    tracker.onTurnStart("/repo");
+    nowMs = 2_000;
+    tracker.onFirstChunk("/repo");
+    nowMs = 3_000;
+    tracker.onMessageEnd("/repo", 100);
+    nowMs = 4_000;
+    tracker.onAgentStart("/repo"); // continue:不重置轮内值
+    expect(tracker.getLast("/repo")).toBeCloseTo(100, 5);
   });
 
   test("notifies the change hook: live events throttle, commits flush", () => {

@@ -115,22 +115,19 @@ export function formatSessionRow(
   }
   sessionParts.push(theme.fg("muted", formatCost(opts.cost)));
   rows.push(sessionParts.join(" "));
-  // 本轮动态段：tps/ttfb/本轮时长——同一轮（用户消息 → 不再输出）内同源同构。
-  // 进行中：只显示实时经过时间（tps/ttfb 是最近完成消息的值，混搭会自相矛盾
-  // ——如 ttfb 大于进行中轮长）；完成态：同轮完整一组。
+  // 本轮动态段：tps/ttfb/本轮时长。tps/ttfb 恒为最近完成消息的值（跨轮保留，
+  // 新消息完成时替换）；本轮进行中显示实时经过，完成态显示锁定总时长。
   const tail: string[] = [];
+  if (opts.tps != null) {
+    tail.push(theme.fg("muted", `${Math.round(opts.tps)} t/s`));
+  }
+  if (opts.ttfbMs != null && opts.tps != null) {
+    tail.push(theme.fg("muted", `ttfb${(opts.ttfbMs / 1000).toFixed(1)}s`));
+  }
   if (opts.currentElapsedMs != null) {
     tail.push(theme.fg("muted", `本轮${formatDuration(opts.currentElapsedMs)}`));
-  } else {
-    if (opts.tps != null) {
-      tail.push(theme.fg("muted", `${Math.round(opts.tps)} t/s`));
-    }
-    if (opts.ttfbMs != null && opts.tps != null) {
-      tail.push(theme.fg("muted", `ttfb${(opts.ttfbMs / 1000).toFixed(1)}s`));
-    }
-    if (opts.turnMs != null) {
-      tail.push(theme.fg("muted", `本轮${formatDuration(opts.turnMs)}`));
-    }
+  } else if (opts.turnMs != null) {
+    tail.push(theme.fg("muted", `本轮${formatDuration(opts.turnMs)}`));
   }
   if (tail.length > 0) rows.push(tail.join(" "));
   return rows.join(theme.fg("muted", " │ "));

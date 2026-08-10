@@ -120,7 +120,7 @@ describe("formatSessionRow", () => {
 			}),
 		).toBe("ctx: 12k/1M 52% │ ↑3k ↓400 (τ69%) $0.10 │ 42 t/s 本轮1m5s");
 	});
-	test("live round shows only the live elapsed (no cross-round tps/ttfb mix)", () => {
+	test("live round shows same-round tps/ttfb once a message completed", () => {
 		expect(
 			formatSessionRow(theme, {
 				used: 12_000,
@@ -134,7 +134,7 @@ describe("formatSessionRow", () => {
 				flow: null,
 				waste: null,
 			}),
-		).toBe("ctx: 12k/1M 52% │ $0.10 │ 本轮12s");
+		).toBe("ctx: 12k/1M 52% │ $0.10 │ 42 t/s ttfb1.2s 本轮12s");
 	});
 	test("live round omits tps/ttfb until the first chunk arrives", () => {
 		expect(

@@ -58,10 +58,10 @@ fetcher 有 60s TTL 与失败退避（5min）；刷新成功返回 `true` 触发
 - `custom-footer-format.ts` — 纯格式化与布局：段函数（model/cwd/ctx/git/usage）、token flow 聚合（`computeTokenFlow`）、网格布局（`layoutFooter`）。
 - `custom-footer-usage.ts` — 额度 fetcher 工厂 + TTL/退避缓存。
 - `custom-footer-git.ts` — git status 缓存（TTL + mtime 校验，含操作标记文件）+ 操作状态检测（`detectGitState`）+ gitDir watch（`createGitWatcher`，目录级监听，失败静默降级）。
-- `custom-footer-tps.ts` — 本轮（用户消息 → 不再输出）时长 tracker（agent_start → agent_settled）；t/s = 最近完成消息的生成速率：分子 = output（含 thinking，服务端实际生成吞吐），分母 = 该消息 firstChunk → message_end 流式时间；ttfb = 本条消息首块 − 本条消息 turn_start（每条 LLM 响应独立测量，缺失回退轮起点）；完成态同轮显示，进行中只显示本轮实时，含 onChange 渲染 hook。- `custom-footer-stats.ts` — 会话聚合（flow/cost/waste）增量/全量快照，含 onChange 渲染 hook。
+- `custom-footer-tps.ts` — 本轮（用户消息 → 不再输出）时长 tracker（agent_start → agent_settled）；t/s = 最近完成消息的生成速率：分子 = output（含 thinking，服务端实际生成吞吐），分母 = 该消息 firstChunk → message_end 流式时间；ttfb = 本条消息首块 − 本条消息 turn_start（每条 LLM 响应独立测量，缺失回退轮起点）；速率/ttfb 跨轮保留（新消息完成时替换），含 onChange 渲染 hook。- `custom-footer-stats.ts` — 会话聚合（flow/cost/waste）增量/全量快照，含 onChange 渲染 hook。
 
 ## 测试
 
 ```bash
-npx vitest run   # 99 tests：format 纯函数、usage fetcher（含 kimi 刷新链路 mock）、git 缓存与操作状态检测与 watcher、tps、session stats、index 集成（含事件接线与每秒 tick）
+npx vitest run   # 101 tests：format 纯函数、usage fetcher（含 kimi 刷新链路 mock）、git 缓存与操作状态检测与 watcher、tps、session stats、index 集成（含事件接线与每秒 tick）
 ```

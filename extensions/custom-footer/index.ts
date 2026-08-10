@@ -206,7 +206,7 @@ export default function (pi: ExtensionAPI) {
 						pct: usage?.percent,
 						contextWindow: usage?.contextWindow,
 						cost: snapshot.cost,
-						// 最近完成消息的可见输出速率（完成态显示；进行中由 format 隐藏）。
+						// 新轮清零后 last* 恒为轮内最近完成消息的值（进行中/完成态同源，无混搭）。
 						tps: readTps.getLast(cwd),
 						ttfbMs: readTps.getLastTtfbMs(cwd),
 						// 进行中：该轮经过时间（每秒增长）；完成态：最近一轮总时长。
