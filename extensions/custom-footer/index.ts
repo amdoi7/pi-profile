@@ -108,6 +108,13 @@ export default function (pi: ExtensionAPI) {
 		stopLiveTick();
 	}, ["tui"]);
 
+	on(pi, "agent_end", async (event, ctx) => {
+		// tps 批量源（锁定值）：一次累加本 run 段全部 assistant 消息的 usage.output。
+		// 官方消息源——失败/aborted 消息无 message_end（agent-loop 错误路径直接
+		// emit agent_end），增量源漏计，批量源不依赖事件流完整性。
+		readTps.onAgentEnd(ctx.sessionManager.getCwd(), event.messages);
+	}, ["tui"]);
+
 	on(pi, "turn_start", async (_event, ctx) => {
 		// turn 级（每条 LLM 响应）：本条消息的 TTFB 起点。
 		// 边界：初始 turn_start 配消息1（用户消息 → 首块 = 用户首字等待）；
