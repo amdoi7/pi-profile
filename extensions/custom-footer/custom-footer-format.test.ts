@@ -6,6 +6,7 @@ import {
 	extensionStatusLines,
 	formatCacheWaste,
 	formatCompact,
+	formatDuration,
 	formatGitSegment,
 	formatModel,
 	formatSessionRow,
@@ -32,6 +33,21 @@ describe("formatCompact", () => {
 		expect(formatCompact(1_000_000)).toBe("1M");
 		expect(formatCompact(1_500_000)).toBe("1.5M");
 		expect(formatCompact(2_000_000)).toBe("2M");
+	});
+});
+
+describe("formatDuration", () => {
+	test("seconds under a minute stay bare", () => {
+		expect(formatDuration(45_000)).toBe("45s");
+	});
+	test("minutes below an hour stay compact", () => {
+		expect(formatDuration(65_000)).toBe("1m5s");
+	});
+	test("minutes carry into hours", () => {
+		expect(formatDuration(90 * 60_000 + 51_000)).toBe("1h30m51s");
+	});
+	test("exact hour boundary", () => {
+		expect(formatDuration(3_600_000)).toBe("1h0m0s");
 	});
 });
 
@@ -330,26 +346,89 @@ describe("layoutFooter", () => {
 		cwd: "cwd: ~/repo",
 		branch: "⎇ main",
 	};
-	const sessionRow = "ctx";
+	const sessionRow = "ctx: 53k 20% │ ↑69k ↓29k │ 11 t/s";
 	const usageLine = "5h ████░░░░ 42% (1h 2m)";
+	// │ 的显示列(与 displayWidth 同口径:先剥 ANSI,CJK 双宽;
+	// UTF-16 索引在 CJK 前会偏:上次 2 字符占 4 列)。
+	const isWide = (c: number) =>
+		(c >= 0x1100 && c <= 0x115f) ||
+		(c >= 0x2e80 && c <= 0xa4cf) ||
+		(c >= 0xac00 && c <= 0xd7a3) ||
+		(c >= 0xf900 && c <= 0xfaff) ||
+		(c >= 0xfe30 && c <= 0xfe4f) ||
+		(c >= 0xff00 && c <= 0xff60) ||
+		(c >= 0xffe0 && c <= 0xffe6) ||
+		(c >= 0x20000 && c <= 0x2fffd);
+	const pipeCols = (s: string) => {
+		const clean = s.replace(/\x1b\[[0-9;]*m/g, "");
+		const cols: number[] = [];
+		let col = 0;
+		for (const ch of clean) {
+			if (ch === "│") cols.push(col);
+			col += isWide(ch.codePointAt(0) ?? 0) ? 2 : 1;
+		}
+		return cols;
+	};
 
-	test("wide layout pads the left column to the designed band", () => {
-		expect(layoutFooter(120, segments, sessionRow, usageLine, " │ ")).toEqual([
-			`cwd: ~/repo │ ⎇ main${" ".repeat(24)}${segments.model}`,
-			`ctx${" ".repeat(41)}${usageLine}`,
-		]);
+	test("grid shares both separator columns across rows (cwd|branch ↔ ctx|flow)", () => {
+		const [top, bottom] = layoutFooter(120, segments, sessionRow, usageLine, " │ ");
+		expect(top).toBe(
+			`cwd: ~/repo${" ".repeat(29)} │ ⎇ main${" ".repeat(3)} │ ${segments.model}`,
+		);
+		expect(bottom).toBe(
+			`ctx: 53k 20%${" ".repeat(28)} │ ↑69k ↓29k │ 11 t/s${" ".repeat(4)}${usageLine}`,
+		);
+		// 前后两处 │ 列上下同列
+		expect(pipeCols(top)).toEqual(pipeCols(bottom));
+	});
+	test("grid persists without usage, row 2 right side empty", () => {
+		const [top, bottom] = layoutFooter(120, segments, sessionRow, null, " │ ");
+		expect(bottom).toBe(`ctx: 53k 20%${" ".repeat(28)} │ ↑69k ↓29k │ 11 t/s`);
+		expect(pipeCols(top)).toEqual(pipeCols(bottom));
 	});
 	test("left content longer than the band extends the grid", () => {
-		const long = "ctx: 12k 52% $0.12";
-		expect(layoutFooter(120, segments, long, usageLine, " │ ")).toEqual([
-			`cwd: ~/repo │ ⎇ main${" ".repeat(24)}${segments.model}`,
-			`${long}${" ".repeat(44 - long.length)}${usageLine}`,
+		const long = "cwd: ~/abcdefghijklmnopqrstuvwxyz-0123456789";
+		const [top, bottom] = layoutFooter(120, { ...segments, cwd: long }, sessionRow, usageLine, " │ ");
+		expect(top).toBe(`${long} │ ⎇ main${" ".repeat(3)} │ ${segments.model}`);
+		expect(bottom).toBe(
+			`ctx: 53k 20%${" ".repeat(32)} │ ↑69k ↓29k │ 11 t/s${" ".repeat(4)}${usageLine}`,
+		);
+		expect(pipeCols(top)).toEqual(pipeCols(bottom));
+	});
+	test("CJK keeps both separator columns aligned (上次 = 2 终端列)", () => {
+		const cjk = "ctx: 5k 2% │ ↑5k ↓1k R26k W0 上次CH97% │ 11 t/s";
+		const [top, bottom] = layoutFooter(120, segments, cjk, usageLine, " │ ");
+		expect(top).toBe(
+			`cwd: ~/repo${" ".repeat(29)} │ ⎇ main${" ".repeat(19)} │ ${segments.model}`,
+		);
+		expect(bottom).toBe(
+			`ctx: 5k 2%${" ".repeat(30)} │ ↑5k ↓1k R26k W0 上次CH97% │ 11 t/s${" ".repeat(4)}${usageLine}`,
+		);
+		expect(pipeCols(top)).toEqual(pipeCols(bottom));
+	});
+	test("ANSI-wrapped segments do not inflate the grid (regression)", () => {
+		const ansi = (s: string) => `\x1b[38;2;1;2;3m${s}\x1b[0m`;
+		const cjk = `${ansi("ctx: 5k 2%")} │ ${ansi("↑5k ↓1k R26k W0 上次CH97%")} │ 11 t/s`;
+		const cwd = ansi("cwd: ~/repo");
+		const [top, bottom] = layoutFooter(120, { ...segments, cwd }, cjk, usageLine, " │ ");
+		expect(top).toBe(
+			`${cwd}${" ".repeat(29)} │ ⎇ main${" ".repeat(19)} │ ${segments.model}`,
+		);
+		expect(bottom).toBe(
+			`${ansi("ctx: 5k 2%")}${" ".repeat(30)} │ ${ansi("↑5k ↓1k R26k W0 上次CH97%")} │ 11 t/s${" ".repeat(4)}${usageLine}`,
+		);
+		expect(pipeCols(top)).toEqual(pipeCols(bottom));
+	});
+	test("without branch the right column aligns instead of the grid", () => {
+		expect(layoutFooter(120, { ...segments, branch: "" }, sessionRow, usageLine, " │ ")).toEqual([
+			`cwd: ~/repo${" ".repeat(33)}${segments.model}`,
+			`${sessionRow}${" ".repeat(11)}${usageLine}`,
 		]);
 	});
 	test("below 100 the grid follows content without the band", () => {
 		expect(layoutFooter(90, segments, sessionRow, usageLine, " │ ")).toEqual([
-			`cwd: ~/repo    ${segments.model}`,
-			`ctx${" ".repeat(12)}${usageLine}`,
+			`cwd: ~/repo${" ".repeat(26)}${segments.model}`,
+			`${sessionRow}${" ".repeat(4)}${usageLine}`,
 		]);
 	});
 	test("three rows between 52 and 71", () => {
@@ -365,42 +444,12 @@ describe("layoutFooter", () => {
 			sessionRow,
 		]);
 	});
-	test("grid omits branch segment when empty", () => {
-		expect(layoutFooter(120, { ...segments, branch: "" }, sessionRow, usageLine, " │ ")).toEqual([
-			`cwd: ~/repo${" ".repeat(33)}${segments.model}`,
-			`ctx${" ".repeat(41)}${usageLine}`,
-		]);
-	});
-	test("grid persists without usage, right column empty", () => {
-		expect(layoutFooter(120, segments, sessionRow, null, " │ ")).toEqual([
-			`cwd: ~/repo │ ⎇ main${" ".repeat(24)}${segments.model}`,
-			"ctx",
-		]);
-	});
-	test("CJK content keeps the shared right column (上次 = 2 终端列)", () => {
-		const cjk = "ctx: 5k 2% │ ↑5k ↓1k R26k W0 上次CH97%";
-		// JS 长度 36，终端宽度 38（上次 占 4 列）；右列仍与 ASCII 行同一起点 44
-		expect(layoutFooter(120, segments, cjk, usageLine, " │ ")).toEqual([
-			`cwd: ~/repo │ ⎇ main${" ".repeat(24)}${segments.model}`,
-			`${cjk}${" ".repeat(6)}${usageLine}`,
-		]);
-	});
-	test("ANSI-wrapped content does not inflate the grid (regression)", () => {
-		const ansi = (s: string) => `\x1b[38;2;1;2;3m${s}\x1b[0m`;
-		const cjk = ansi("ctx: 5k 2% │ ↑5k ↓1k R26k W0 上次CH97%");
-		const cwd = ansi("cwd: ~/repo");
-		// truecolor 转义每条 16 字符：若不剥 ANSI，行 1 右列会被推到 ~100 列外
-		expect(layoutFooter(120, { ...segments, cwd }, cjk, usageLine, " │ ")).toEqual([
-			`${cwd} │ ⎇ main${" ".repeat(24)}${segments.model}`,
-			`${cjk}${" ".repeat(6)}${usageLine}`,
-		]);
-	});
 });
 
 describe("extensionStatusLines", () => {
 	test("collects non-empty lines across statuses", () => {
 		const statuses = new Map([
-			["pi-sub", "review running\nimpl queued"],
+			["build", "review running\nimpl queued"],
 			["other", ""],
 			["multi", "  \nline with spaces  "],
 		]);

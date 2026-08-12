@@ -182,7 +182,7 @@ describe("custom footer extension statusline", () => {
       { requestRender() {} },
       { fg: (_name: string, text: string) => text },
       {
-        getExtensionStatuses: () => new Map([["pi-sub", "review running\nimpl queued"]]),
+        getExtensionStatuses: () => new Map([["build", "review running\nimpl queued"]]),
         onBranchChange: () => () => {},
       },
     );

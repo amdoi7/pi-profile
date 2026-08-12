@@ -90,7 +90,7 @@ export function formatSessionRow(
     tps: number | null;
     /** 进行中一轮的经过时间（毫秒）：`本轮12s`，每秒增长。 */
     currentElapsedMs: number | null;
-    /** 最近一轮的总时长（毫秒）：`本轮1m5s`（完成态）。 */
+    /** 最近一轮的总时长（毫秒）：`本轮1m5s` / `本轮1h30m51s`（完成态，≥60m 进位到 h）。 */
     turnMs: number | null;
     /** 最近一轮的首字时间（TTFB，毫秒）：`ttfb1.2s`。 */
     ttfbMs: number | null;
@@ -183,11 +183,15 @@ export function formatTokenFlow(theme: FooterTheme, flow: TokenFlow): string {
   return parts.join(" ");
 }
 
-/** 思考时长显示：`42s` / `1m5s`（毫秒输入）。 */
+/** 思考时长显示：`42s` / `1m5s` / `1h30m51s`（毫秒输入，≥60m 进位到 h）。 */
 export function formatDuration(ms: number): string {
   const seconds = Math.round(ms / 1000);
-  if (seconds < 60) return `${seconds}s`;
-  return `${Math.floor(seconds / 60)}m${seconds % 60}s`;
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  if (h > 0) return `${h}h${m}m${s}s`;
+  if (m > 0) return `${m}m${s}s`;
+  return `${s}s`;
 }
 
 // --- git segment ------------------------------------------------------------
@@ -326,21 +330,21 @@ function isWideCode(code: number): boolean {
 }
 
 /**
- * Two-row dashboard on a designed grid. Left column is the session environment
- * (cwd + git branch), right column the runtime config (model, usage). Column
- * positions stay stable: right column starts at max(content, regime band
- * minimum) + COLUMN_GAP, never stretching to the terminal edge.
+ * Two-row dashboard on a shared column grid. With a git branch present
+ * (>=100 columns) both rows render as `col1 │ col2 │ col3`: row 1
+ * `cwd │ branch │ model`, row 2 `ctx │ flow+cost │ tail`. Each "│" column
+ * is the max display width of the same-position segment across the two rows
+ * (padding lands before the "│", row starts stay at column 0), so the
+ * separators line up vertically — one formula for both rows (isomorphic),
+ * applied to the front (col1|col2) and back (col2|col3) boundaries alike.
+ * Column 1 keeps a design minimum (LEFT_BAND) so short paths don't crowd
+ * the grid; column 2 is content-driven (branch vs flow).
  *
- * Git branch joins the cwd segment (semantic grouping: repo state is a
- * property of the working directory), so branch changes (commit / dirty count /
- * switch) move the right column — accepted trade-off for left-column
- * continuity, kept to ≥100 columns to protect narrow terminals.
- * One formula in both grid regimes: column start = max(content, regime
- * band minimum) + COLUMN_GAP. The band minimum applies at >=100 columns
- * (where the branch segment also appears); below it the minimum is zero
- * and the grid follows content. The grid applies at >=72 columns; the
- * right column of row 2 stays empty when usage is unavailable, so the
- * label alignment (cwd:/ctx:) persists across providers. Narrow fallback:
+ * Without a branch (or below 100 columns) the layout falls back to a shared
+ * right column: right column starts at max(content, band minimum) +
+ * COLUMN_GAP, never stretching to the terminal edge. The right side of row 2
+ * (usage) stays empty when unavailable, so the label alignment (cwd:/ctx:)
+ * persists across providers. Narrow fallback:
  * - 52-71: cwd, provider-only model | ctx | usage
  * - <52:   cwd only, usage row omitted
  */
@@ -355,10 +359,28 @@ export function layoutFooter(
   separator: string,
 ): string[] {
   if (width >= 72) {
-    const leftTop =
-      width >= 100 && segments.branch.length > 0
-        ? `${segments.cwd}${separator}${segments.branch}`
-        : segments.cwd;
+    // 三列网格(≥100 且有 branch):行1 `cwd │ branch │ model`、行2
+    // `ctx │ flow+cost │ tail`(sessionRow 按分隔符拆段)。"│" 列两行共享:
+    // 每列宽度 = 两行同段 display width 的最大值,短列在 "│" 前补空格。
+    const grid = width >= 100 && segments.branch.length > 0;
+    if (grid) {
+      const top = [segments.cwd, segments.branch, segments.model];
+      const bottom = sessionRow.split(separator);
+      const col1 = Math.max(LEFT_BAND, displayWidth(top[0]), displayWidth(bottom[0] ?? ""));
+      const col2 = Math.max(displayWidth(top[1]), displayWidth(bottom[1] ?? ""));
+      const pad = (s: string, target: number): string =>
+        displayWidth(s) >= target ? s : `${s}${" ".repeat(target - displayWidth(s))}`;
+      const topLine = [pad(top[0], col1), pad(top[1], col2), top[2]].join(separator);
+      const bottomLine =
+        bottom.length >= 2
+          ? [pad(bottom[0], col1), pad(bottom[1], col2), ...bottom.slice(2)].join(separator)
+          : bottom.join(separator);
+      return usageLine !== null
+        ? [topLine, `${bottomLine}${" ".repeat(COLUMN_GAP)}${usageLine}`]
+        : [topLine, bottomLine];
+    }
+    // 无 branch 档位:右列起点 = max(内容, 档宽下限) + COLUMN_GAP,两行共享。
+    const leftTop = segments.cwd;
     const rightTop = segments.model;
     const leftWidth = Math.max(displayWidth(leftTop), displayWidth(sessionRow));
     const start = Math.max(leftWidth, width >= 100 ? LEFT_BAND : 0) + COLUMN_GAP;

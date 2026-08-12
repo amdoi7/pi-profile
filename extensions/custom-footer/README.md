@@ -7,8 +7,8 @@
 ## 布局
 
 ```
-cwd: ~/.pi                                  Kimi For Coding/k3-256k · think:max │ ⎇ main ↑2
-ctx: 53k 20% │ ↑69k ↓29k R973k W0 │ miss 143k (2×)      5h ▎░░░░░░░ 3% (2h 39m) │ Weekly ▏░░░░░░░ 1% (1d 9h)
+cwd: ~/.pi                               │ ⎇ main ↑2                               │ Kimi For Coding/k3-256k · think:max
+ctx: 53k 20%                             │ ↑69k ↓29k R973k W0 miss 143k (2×) $0.87 │ 11 t/s ttfb1.2s 本轮42s    5h ▎░░░░░░░ 3% (2h 39m) │ Weekly ▏░░░░░░░ 1% (1d 9h)
 ```
 
 - 行1（静态）：`cwd:` 工作目录（home 相对 `~` 路径，>30 列折叠中段）、`provider/model · think:level`（level 按 thinking* 主题 token 着色，与编辑器边框同色）、git branch（`⎇` + dirty `*` + ahead/behind `↑↓`，diverged 为 `↑3↓2` 紧凑式）；rebase/merge/cherry-pick/revert/bisect 进行中时追加操作标签（`REBASING 3/5`、`MERGING`…，warning 色）。
@@ -20,9 +20,11 @@ ctx: 53k 20% │ ↑69k ↓29k R973k W0 │ miss 143k (2×)      5h ▎░░░
   订阅额度窗口（`5h` / `Weekly` 用量条，`(elapsed)` 已用时长）。
 - 零值不抑制（`W0` 即诊断信息）；订阅制 provider（claude/codex/kimi）
   隐藏成本（恒 $0.00）；用量条为八分之一块精度（`▏▎▍▌▋▊▉█`），低用量保留刻度。
-- 网格为设计量尺：左栏补齐到 40 单位，右列固定在其后 4 单位
-  （`start = max(内容, 档宽下限) + 栏距`，一个公式两个档位），不随终端宽度漂移；
-  档宽下限仅在宽 ≥100 时生效（branch 同时出现）。usage 缺失或宽 <72 时退化为三行流式。
+- 网格为设计量尺：两行共享三列（行1 `cwd │ branch │ model`，行2
+  `ctx │ flow+cost │ tail`），每列宽度 = 两行同段显示宽度的最大值，短列在 `│`
+  前补空格 —— 两个 `│` 列上下对齐（同构公式，前后同规则），行首不动；
+  列1 补齐到 40 单位下限，列2 内容驱动。无 branch 或宽 <100 时退化为右列对齐，
+  usage 缺失或宽 <72 时退化为三行流式。
 
 ## 颜色（FooterColor，由 pi 主题注入）
 
