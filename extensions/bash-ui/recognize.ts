@@ -69,7 +69,7 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
 const OPERATION_HEADER = /^\*\*\* (Add|Delete|Update) File: (.+)$/;
 const OPERATION_HEADER_PREFIXES = ["*** Add File: ", "*** Delete File: ", "*** Update File: "] as const;
 const APPLY_PATCH_HEREDOC =
-	/(?:^[ \t]*apply_patch[ \t]+|[ \t]*&&[ \t]*apply_patch[ \t]+)<<'([A-Za-z_][A-Za-z0-9_]*)'[ \t]*$/;
+	/(?:^[ \t]*(?:(?:\/[^\s/]*)*\/)?apply_patch[ \t]+|[ \t]*&&[ \t]*(?:(?:\/[^\s/]*)*\/)?apply_patch[ \t]+)<<[ \t]*'([A-Za-z_][A-Za-z0-9_]*)'[ \t]*$/;
 const CD_PREFIX = /(?:^|&&)[ \t]*cd[ \t]+(\S+)/;
 
 function isOperationHeader(line: string): boolean {
@@ -78,7 +78,7 @@ function isOperationHeader(line: string): boolean {
 
 function extractSingleQuotedPatch(line: string): string | undefined {
 	const normalized = line.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-	const prefix = normalized.match(/^[ \t]*apply_patch[ \t]+/);
+	const prefix = normalized.match(/^[ \t]*(?:(?:\/[^\s/]*)*\/)?apply_patch[ \t]+/);
 	if (!prefix || normalized[prefix[0].length] !== "'") return undefined;
 
 	let index = prefix[0].length;

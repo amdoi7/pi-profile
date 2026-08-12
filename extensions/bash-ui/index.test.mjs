@@ -274,6 +274,76 @@ test("canonical heredoc renders compact pending operation headers", async () => 
 	assert.doesNotMatch(output, /\*\*\* Begin Patch/);
 });
 
+test("heredoc with spaced redirect `<< 'PATCH'`(bash 合法)也识别并渲染", async () => {
+	const command = `apply_patch << 'PATCH'
+*** Begin Patch
+*** Add File: src/spaced.ts
++export const spaced = true;
+*** End Patch
+PATCH`;
+	const { tool } = await loadRegisteredTool();
+	const output = renderText(
+		tool.renderCall({ command }, createTheme(), createContext(command)),
+	);
+
+	assert.match(output, /apply_patch Add file src\/spaced\.ts/);
+	assert.doesNotMatch(output, /\*\*\* Begin Patch/);
+});
+
+test("cd && apply_patch with spaced heredoc `<< 'PATCH'` 也识别", async () => {
+	const command = `cd /tmp/temp && apply_patch << 'PATCH'
+*** Begin Patch
+*** Update File: a.ts
+@@
+-x
++y
+*** End Patch
+PATCH`;
+	const { tool } = await loadRegisteredTool();
+	const output = renderText(
+		tool.renderCall({ command }, createTheme(), createContext(command)),
+	);
+
+	assert.match(output, /apply_patch Update file a\.ts/);
+});
+
+test("路径形式:绝对路径识别渲染,相对路径不识别(delegate built-in)", async () => {
+	const { tool } = await loadRegisteredTool();
+	for (const bin of ["/usr/local/bin/apply_patch", "/Users/amdoi7/.pi/agent/bin/apply_patch"]) {
+		const command = `${bin} << 'PATCH'
+*** Begin Patch
+*** Add File: src/path.ts
++export const viaPath = true;
+*** End Patch
+PATCH`;
+		const output = renderText(
+			tool.renderCall({ command }, createTheme(), createContext(command)),
+		);
+		assert.match(output, /apply_patch Add file src\/path\.ts/, `绝对路径 ${bin} 应渲染`);
+		assert.doesNotMatch(output, /\*\*\* Begin Patch/, `绝对路径 ${bin} 不应露 raw patch`);
+	}
+	for (const bin of ["bin/apply_patch", "./bin/apply_patch", "~/bin/apply_patch"]) {
+		const command = `${bin} << 'PATCH'
+*** Begin Patch
+*** Add File: src/path.ts
++export const viaPath = true;
+*** End Patch
+PATCH`;
+		const output = renderText(
+			tool.renderCall({ command }, createTheme(), createContext(command)),
+		);
+		assert.doesNotMatch(output, /apply_patch Add file/, `相对路径 ${bin} 不应识别为 patch UI`);
+	}
+});
+
+test("绝对路径单引号 standalone 也识别", async () => {
+	const command = "/usr/local/bin/apply_patch '*** Begin Patch\n*** Add File: note.txt\n+path form\n*** End Patch'";
+	const { tool } = await loadRegisteredTool();
+	const output = renderText(tool.renderCall({ command }, createTheme(), createContext(command)));
+
+	assert.match(output, /apply_patch Add file note\.txt/);
+});
+
 test("single-quoted apply_patch invocation uses the compact pending renderer", async () => {
 	const command = "apply_patch '*** Begin Patch\n*** Add File: note.txt\n+it'\\''s ready\n*** End Patch'";
 	const { tool } = await loadRegisteredTool();
