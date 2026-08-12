@@ -1,6 +1,6 @@
 ## Governance
 
-内阁执行,司礼监批红:
+质量契约:
 
 - 所有任务必须定义测试过程:代码任务先基于问题描述与代码事实(evidence)分析根因,再写测试(红灯)再实现(绿灯),以测试结果核验;非代码任务定义等价核验步骤。无测试过程的改动不视为完成。
 - 测试取舍:测试对准真实回归与不变式,不为覆盖率、对称性或“代码改了”而测;取舍细则见 tdd skill。
@@ -8,16 +8,57 @@
 - 完成定义:改动通过其定义的测试过程,无临时产物残留,未破坏 Delivery 契约,方为完成。
 - 呈报格式:改动、原因、核验证据(测试结果)、遗留问题,四要素齐备;不呈报中间过程。
 
-思危、思退、思变:
+思危、思退、思变(memory):
 
-- 执行前读取项目 memory 的相关面(issues/tasks/lessons)与匹配 skill;skill 规则与本文件冲突时 grill——冲突即一方过时,不静默选边,解决后更新过时方。
-- 执行中对照既有认知反思;记录与当前 repo 状态冲突时,以实测为准并更新记录。
-- 完成后更新受影响的 issue/task/lesson,写入当前认知。
+- 路径:项目内 `.pi/memory/`——`issues/` 一个交付物一个文件,`lessons.md` 一个概念一条
+  现行规则;目录即索引,发现用 ls/rg。锚定会话 cwd,不依赖 git。
+  issue 文件名 = 主题 slug(kebab-case):序号/日期前缀是低保真,禁用;
+  scope 漂移即重命名,互链 rg 同步。
+- scaffold(缺失时):`mkdir -p .pi/memory/issues`;存在 .gitignore 则确保含 `.pi/memory/`
+  条目;
+- 执行前:ls issues/ 读相关 deliverable + lessons;目标、现状、适用规则齐备再动手。
+  skill 规则与本文件冲突时 grill——冲突即一方过时,不静默选边,解决后更新过时方。
+- 执行中:对照既有认知反思;记录与 repo 实测冲突时,以实测为准并更新记录。
+- 完成后:原地更新受影响 deliverable(结果/证据/status),写入当前认知;lesson 仅当
+  三条件齐备——适用未来会话、可泛化、改变未来行为;执行细节留 session 不进 lessons。
+- Deliverable 契约:frontmatter `status: active|closed|rejected`、`type: fix|feature|investigation`、
+  `owner: <session id>|unassigned`、`summary: 一行产出`;可选 `verdict: 通过|打回|丢弃|强制放行`
+  (终审结论留痕,审查闭环的 memory 事实源;verdict ≠ 通过的 closed 即「已拒交付物」,
+  索引区分用 rg 过滤 verdict;单字段后审覆盖先审,覆盖即历史归档)与 `needs: evidence|decision`
+  (验收证据缺失/等人类裁决的持久化标记;needs 解决的交付物更新时同步清除 needs 字段;
+  needs 非空时 status 必须为 active);正文 目标/范围/约束/验收/结果/证据/遗留;
+  子交付物拆分互链。verdict 由验收方落笔,worker 不写自己交付物的 verdict。
+  `status: closed|rejected` 是终态,需验收方/用户显式裁决后落笔;执行者完成工作后保持
+  `status: active` 等裁决,不自标 closed。豁免:oneshot 交付物创建时合约即裁决,
+  报告送达后执行者可落 closed(文件注明 oneshot);归因「收益递减」= 放弃交付物,
+  落 `rejected` + verdict 丢弃。
+- frontmatter 完整性:交付物落盘时校验契约字段(status/type/owner/summary 四字段齐全;
+  缺即红灯,补全才算完成)与裁决一致性(active + verdict 打回 必须已 message 重派或转
+  rejected,不留悬空;新交付物 closed 必须有 verdict,存量历史豁免)——执行与检查分离
+  在 memory 层的落地;会话结束前补查。
+- Lesson 强度:MUST 硬规则,违反即 bug;SHOULD 默认行为,可让位于 issue 约束;
+  MAY 可选技巧;OBSERVED 已核验事实,无规范力。
 
 黄河水清,长江水浊:
 
-- 按任务需求动态引入 agent:任务超出当前能力、或并行收益明确时,以独立 pi 会话引入子 agent,不建自研 agent 工具。
-- 子 agent 以产出与测试结果论功;表现不符即撤换,不保留固定班底。
+- 按任务需求动态引入 worker:任务超出当前能力、或并行收益明确、或需独立上下文时,经
+  pi_worker 工具分发。run 立即返回,结果以回调送达,不轮询;机制语义、状态约束与
+  回调格式以 pi_worker 工具描述为准(tool.ts,父侧契约面,改契约改模块)。
+- worker 合约要件:task 必填且自含;验收写成可证伪断言清单(读产物或跑命令可判定),
+  写不出清单退回重派。worker 行为治理(四要素呈报/先回执/失败归因/事实核验)由模块
+  charter 注入子进程(条款有 tripwire 测试兜底)——父侧不复制,验收按回调 <report>
+  四要素核验,事实核验优先级:repo 产物与测试结果 > 回调呈报 > 子 session 审计
+  (<cwd>/.pi/worker/sessions/,session-id = id)。
+- 金杯共汝饮,白刃不相饶:worker 以产出与测试结果论功;失败先归因输入(任务合约、
+  验收命令、边界),收紧输入重派,输入干净仍不符即撤换,不保留固定班底。
+- 并行:仅限无依赖的读/隔离任务;同 repo 写任务不并行,写隔离用 git worktree。
+- 撤换(kill)与收尾(stop)按归因分流:stop 收尾双路径(settled 软 / failed 硬终止,
+  见工具描述);kill/stop 转 failed 均按归因分流——输入 → 修合约同 name 重派(合约变
+  自动新 id);能力 → 同 name 带 model/thinking 重派;胜任度 → 换 name(仅稳定 name 在
+  lessons 记「<name> 不胜任 <任务类>」);收益递减 → 父 agent 收尾;无需归因的收尾
+  失败直接 collect 清账。
+
+三花聚顶本是幻,脚下腾云亦非真——不神化任何 agent、头衔或工具;贤黜唯凭产出。
 
 ## Decision Boundary
 
@@ -47,8 +88,11 @@
 - Cross-file mechanical edits: scope with `rg -l` and verify the match set
   before running; use `sg` or `perl -pi` instead of regex for syntax-aware
   shapes (identifiers, calls, AST).
-- Single-file edits beyond a few known lines: `apply_patch` by default.
-  Patch context must come from current file content.
+- 文件修改优先 `apply_patch`(默认路径,含单文件与多文件;已在 bash env PATH);
+  envelope 格式见 ~/.pi/agent/cli/apply-patch/patch-authoring.md。Patch context 必须取
+  自当前文件内容。
+- 仅当需要重复替换(同一文本多处出现、patch context 无法唯一锚定)时用 `edit` tool
+  的 replaceAll/多 edits;单处锚定的改动一律 apply_patch。
 - Mutate files with `edit`, `apply_patch`, or `perl` only. Never use python
   heredoc scripts for file mutation: `str.replace` fails silently, the
   failure is invisible, and the change cannot be audited as a diff.

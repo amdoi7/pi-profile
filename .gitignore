@@ -13,7 +13,6 @@
 
 # Locally built tools
 /bin/apply_patch
-/bin/pi-sub
 
 # Runtime state, local caches, and cloned repositories
 /git/
@@ -36,3 +35,5 @@
 /skills/idiomatic-go
 /skills/modern-python
 /skills/skillshare
+/.pi/memory/
+/bin/tmux-bridge
