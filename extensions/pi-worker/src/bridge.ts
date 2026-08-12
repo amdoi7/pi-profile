@@ -1,0 +1,113 @@
+/**
+ * 回调格式化(纯函数,可单测)。发送由 watcher 调用 pi.sendMessage。
+ * 两种互斥消息类型:
+ *   settled id= name= <报告全文>
+ *   failed id= exit= stderr尾
+ */
+export type CallbackEvent =
+	| {
+			type: "settled";
+			id: string;
+			name: string;
+			/** run 合约角色标注(自由文本);仅指定时输出 <role>,缺省省略 */
+			role?: string;
+			report: string;
+			reportError?: string;
+			stats?: unknown;
+			/** 完成轮数(摘要行 ⎿ N turns) */
+			turns?: number;
+	  }
+	| {
+			type: "failed";
+			id: string;
+			exitCode: number | null;
+			exitSignal: string | null;
+			stderrTail: string;
+	  };
+
+export interface CallbackMessage {
+	customType: string;
+	content: string;
+	details: Record<string, unknown>;
+}
+
+export const CALLBACK_TYPE = "pi-worker";
+
+/** XML 文本转义:report/name 是自由文本(用户与 LLM 可输入),防模板破坏。 */
+function xmlEscape(s: string): string {
+	return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** 数字字段(仅有限数字输出,与 present.ts 同判空风格)。 */
+function num(v: unknown): number | undefined {
+	return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}
+
+/**
+ * settled 结构化注入(对标 Claude Code task-notification / opencode subagent):
+ * 首行摘要保留既有契约,随后 XML 模板携带机器可断言的字段(status/turns/usage),
+ * 报告全文进 <report>(渲染层仍读 details.report 纯文本,不受影响)。
+ * 无 stats → 无 <usage>;字段缺省省略,模板始终可解析。
+ */
+function formatSettledContent(ev: Extract<CallbackEvent, { type: "settled" }>): string {
+	const id = xmlEscape(ev.id);
+	const name = xmlEscape(ev.name);
+	const report =
+		ev.report || (ev.reportError ? `(呈报获取失败: ${ev.reportError})` : "(无呈报)");
+	const lines = [`settled id=${ev.id} name=${ev.name}`, "<worker-settled>"];
+	lines.push(`<id>${id}</id>`, `<name>${name}</name>`);
+	if (ev.role) lines.push(`<role>${xmlEscape(ev.role)}</role>`);
+	lines.push("<status>settled</status>");
+	if (typeof ev.turns === "number") lines.push(`<turns>${ev.turns}</turns>`);
+	const stats = (ev.stats ?? {}) as {
+		tokens?: Record<string, unknown>;
+		toolCalls?: unknown;
+		cost?: unknown;
+	};
+	const usageBits: string[] = [];
+	const toolCalls = num(stats.toolCalls);
+	if (toolCalls !== undefined) usageBits.push(`<tool_calls>${toolCalls}</tool_calls>`);
+	const tokens = stats.tokens ?? {};
+	const tokBits: string[] = [];
+	for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"] as const) {
+		const v = num(tokens[key]);
+		if (v !== undefined) tokBits.push(`<${key}>${v}</${key}>`);
+	}
+	if (tokBits.length > 0) usageBits.push(`<tokens>${tokBits.join("")}</tokens>`);
+	const cost = num(stats.cost);
+	if (cost !== undefined) usageBits.push(`<cost>${cost}</cost>`);
+	if (usageBits.length > 0) lines.push("<usage>", ...usageBits, "</usage>");
+	lines.push(`<report>\n${xmlEscape(report)}\n</report>`, "</worker-settled>");
+	return lines.join("\n");
+}
+
+export function formatCallback(ev: CallbackEvent): CallbackMessage {
+	if (ev.type === "settled") {
+		return {
+			customType: CALLBACK_TYPE,
+			content: formatSettledContent(ev),
+			details: {
+				type: "settled",
+				id: ev.id,
+				name: ev.name,
+				role: ev.role,
+				report: ev.report,
+				reportError: ev.reportError,
+				stats: ev.stats,
+				turns: ev.turns,
+			},
+		};
+	}
+	const stderr = ev.stderrTail ? ` stderr=${ev.stderrTail}` : "";
+	return {
+		customType: CALLBACK_TYPE,
+		content: `failed id=${ev.id} exit=${ev.exitCode ?? ev.exitSignal ?? "?"}${stderr}`,
+		details: {
+			type: "failed",
+			id: ev.id,
+			exitCode: ev.exitCode,
+			exitSignal: ev.exitSignal,
+			stderrTail: ev.stderrTail,
+		},
+	};
+}
