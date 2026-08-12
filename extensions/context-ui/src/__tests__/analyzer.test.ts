@@ -7,7 +7,8 @@
  * - confidence states reflect actual knowledge
  */
 
-import { describe, test, expect } from "vitest";
+import { describe, test } from "node:test";
+import assert from "node:assert/strict";
 import { analyzeContext } from "../context-analyzer.ts";
 
 function sumBuckets(buckets: Record<string, number>): number {
@@ -15,8 +16,8 @@ function sumBuckets(buckets: Record<string, number>): number {
 }
 
 describe("ContextBreakdown", () => {
-  // Test 1: delta can be negative (estimator overestimate)
-  test("allows negative delta when estimator overestimates", () => {
+  // Test 1: 无锚点时无参照,delta 不定义;system prompt 作为 prefix 叠加进 estimated total
+  test("without an anchor, delta is null; system prompt adds to estimated total", () => {
     const inputs = {
       usage: { tokens: 100, contextWindow: 1000, compactionDetected: false },
       contextWindow: 1000,
@@ -32,11 +33,11 @@ describe("ContextBreakdown", () => {
 
     const breakdown = analyzeContext(inputs);
 
-    // Expected: measured=100, estimated=125+100=225, delta=-125
-    expect(breakdown.measuredTotal).toBe(100);
-    expect(breakdown.estimatedTotal).toBeGreaterThan(100);
-    expect(breakdown.delta).toBeLessThan(0); // Overestimate
-    expect(breakdown.delta).not.toBe(0); // Not clamped
+    // usage.tokens = pi 的纯消息估算(无 assistant usage 锚点),需叠加 prefix。
+    assert.equal(breakdown.measuredTotal, 100);
+    assert.equal(breakdown.estimatedTotal, 225); // 100(消息)+ 125(system prompt)
+    assert.equal(breakdown.delta, null); // 无锚点参照,差额不定义
+    assert.equal(breakdown.confidence, "estimated");
   });
 
   // Test 2: compaction sets measuredTotal=null and confidence=estimated
@@ -56,12 +57,12 @@ describe("ContextBreakdown", () => {
 
     const breakdown = analyzeContext(inputs);
 
-    expect(breakdown.measuredTotal).toBeNull();
+    assert.equal(breakdown.measuredTotal, null);
     // No measured data → available falls back to (contextWindow - estimatedTotal)
     // so the renderer can always show a free-space slice.
-    expect(breakdown.available).toBe(200000 - breakdown.estimatedTotal);
-    expect(breakdown.confidence).toBe("estimated");
-    expect(breakdown.metadata.compactionDetected).toBe(false); // usage is null, but not explicitly marked
+    assert.equal(breakdown.available, 200000 - breakdown.estimatedTotal);
+    assert.equal(breakdown.confidence, "estimated");
+    assert.equal(breakdown.metadata.compactionDetected, false); // usage is null, but not explicitly marked
   });
 
   // Test 3: assistant thinking is separate bucket
@@ -84,8 +85,8 @@ describe("ContextBreakdown", () => {
 
     const breakdown = analyzeContext(inputs);
 
-    expect(breakdown.buckets.assistantThinking).toBe(30);
-    expect(breakdown.buckets.assistantText).toBe(20);
+    assert.equal(breakdown.buckets.assistantThinking, 30);
+    assert.equal(breakdown.buckets.assistantText, 20);
   });
 
   // Test 4: tool call and tool result in separate buckets
@@ -112,9 +113,9 @@ describe("ContextBreakdown", () => {
 
     const breakdown = analyzeContext(inputs);
 
-    expect(breakdown.buckets.toolCalls).toBeGreaterThan(0);
-    expect(breakdown.buckets.toolResults).toBeGreaterThan(0);
-    expect(breakdown.buckets.toolCalls).not.toBe(breakdown.buckets.toolResults);
+    assert.ok(breakdown.buckets.toolCalls > 0);
+    assert.ok(breakdown.buckets.toolResults > 0);
+    assert.notEqual(breakdown.buckets.toolCalls, breakdown.buckets.toolResults);
   });
 
   // Test 5: confidence states
@@ -127,8 +128,8 @@ describe("ContextBreakdown", () => {
       activeToolDefs: [],
       messages: [{ role: "user" as const, content: "text" }],
     });
-    expect(measured.confidence).toBeDefined();
-    expect(["measured", "mixed", "estimated"]).toContain(measured.confidence);
+    assert.ok(measured.confidence !== undefined);
+    assert.ok(["measured", "mixed", "estimated"].includes(measured.confidence));
 
     // Estimated state (no measured)
     const estimated = analyzeContext({
@@ -138,35 +139,42 @@ describe("ContextBreakdown", () => {
       activeToolDefs: [],
       messages: [{ role: "user" as const, content: "text" }],
     });
-    expect(estimated.confidence).toBe("estimated");
+    assert.equal(estimated.confidence, "estimated");
   });
 
-  // Test 6: no silent clamping of unattributed
-  test("preserves signed delta without clamping", () => {
-    // Case 1: measured > estimated (positive delta)
+  // Test 6: no silent clamping of unattributed(仅锚点场景有差额)
+  test("preserves signed delta without clamping (anchor present)", () => {
+    const anchor = (total: number) => ({
+      role: "assistant" as const,
+      content: [{ type: "text", text: "ok" }],
+      stopReason: "stop" as const,
+      usage: { input: total, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: total, cost: { total: 0 } },
+    });
+
+    // Case 1: measured > selfTotal(positive delta)
     const positive = analyzeContext({
       usage: { tokens: 500, contextWindow: 1000, compactionDetected: false },
       contextWindow: 1000,
       systemPrompt: "x",
       activeToolDefs: [],
-      messages: [{ role: "user" as const, content: "y" }],
+      messages: [{ role: "user" as const, content: "y" }, anchor(500)],
     });
-    // delta = measured - estimated = 500 - ~1 = ~499
-    expect(positive.delta).toBeGreaterThan(0);
+    // delta = measured − 自算全量(prefix 1 + 消息 1+1)≈ 497
+    assert.ok(positive.delta !== null && positive.delta > 0);
+    assert.equal(positive.estimatedTotal, 500); // 锚点 = 全量,不加 prefix
 
-    // Case 2: measured < estimated (negative delta)
+    // Case 2: measured < selfTotal(negative delta)
     const negative = analyzeContext({
       usage: { tokens: 10, contextWindow: 1000, compactionDetected: false },
       contextWindow: 1000,
       systemPrompt: "x".repeat(100),
       activeToolDefs: [],
-      messages: [{ role: "user" as const, content: "y".repeat(100) }],
+      messages: [{ role: "user" as const, content: "y".repeat(100) }, anchor(10)],
     });
-    // delta = measured - estimated = 10 - (25+25) = negative
-    expect(negative.delta).toBeLessThan(0);
+    assert.ok(negative.delta !== null && negative.delta < 0);
   });
 
-  // Test 8: available calculation
+  // Test 8: available 计算
   test("calculates available space correctly", () => {
     const inputs = {
       usage: { tokens: 300, contextWindow: 1000, compactionDetected: false },
@@ -178,15 +186,13 @@ describe("ContextBreakdown", () => {
 
     const breakdown = analyzeContext(inputs);
 
-    if (breakdown.measuredTotal !== null) {
-      expect(breakdown.available).toBe(
-        1000 - breakdown.measuredTotal
-      );
-    }
+    // available = contextWindow − estimatedTotal(消息锚点 + 全部 prefix),
+    // 不漏减 system prompt/tools/skills/memory 开销。
+    assert.equal(breakdown.available, 1000 - breakdown.estimatedTotal);
   });
 
   // Test 9: when measured usage exists, displayed buckets should reflect the real session total
-  test("allocates displayed bucket totals to the measured session usage", () => {
+  test("displayed buckets are raw estimates; no absorption into custom", () => {
     const inputs = {
       usage: { tokens: 400, contextWindow: 1000, compactionDetected: false },
       contextWindow: 1000,
@@ -205,8 +211,42 @@ describe("ContextBreakdown", () => {
 
     const breakdown = analyzeContext(inputs);
 
-    expect(breakdown.measuredTotal).toBe(400);
-    expect(sumBuckets(breakdown.buckets)).toBe(400);
-    expect(breakdown.delta).not.toBe(0);
+    assert.equal(breakdown.measuredTotal, 400);
+    // 无锚点(消息无 usage):delta 不定义;桶 = 纯自算(prefix + 消息),
+    // estimatedTotal = measured(pi 消息估算)+ prefix,两者同源同口径。
+    assert.equal(breakdown.delta, null);
+    assert.equal(sumBuckets(breakdown.buckets), 30); // 5(system prompt)+ 18(tool-a)+ 3 + 4(消息)
+    assert.equal(breakdown.estimatedTotal, 423); // 400(measured)+ 23(prefix)
+  });
+
+  // Test 10: 估算口径与 pi 一致(image 固定 4800 chars;toolCall = name+arguments)
+  test("estimates images at pi's fixed chars and tool calls as name+arguments", () => {
+    const breakdown = analyzeContext({
+      usage: null,
+      contextWindow: 200000,
+      systemPrompt: "",
+      activeToolDefs: [],
+      messages: [
+        { role: "user" as const, content: [{ type: "image", source: "data" }] },
+        {
+          role: "assistant" as const,
+          content: [
+            { type: "toolCall", id: "c1", name: "read", arguments: { path: "/f" } },
+          ],
+        },
+        {
+          role: "toolResult" as const,
+          toolName: "read",
+          content: [{ type: "text", text: "ab" }, { type: "image", source: "x" }],
+        },
+      ],
+    });
+
+    assert.equal(breakdown.buckets.images, 1200); // 4800 chars / 4
+    assert.equal(
+      breakdown.buckets.toolCalls,
+      Math.ceil(("read".length + JSON.stringify({ path: "/f" }).length) / 4)
+    );
+    assert.equal(breakdown.buckets.toolResults, Math.ceil((2 + 4800) / 4)); // text + image
   });
 });

@@ -235,12 +235,76 @@ test("prefers the latest provider request tool payload when it matches the activ
   clearProviderToolPayloadSnapshot();
 });
 
+test("anchors messages to pi usage and subtracts the full estimated total from available", () => {
+  // pi 的 getContextUsage().tokens = estimateContextTokens(messages) = 仅消息
+  // (数组分支不含 systemPrompt/tools)。它应作为消息锚点,prefix 叠加后
+  // 再算 available——漏减 prefix 会让可用空间系统性偏大。
+  const breakdown = analyzeContext({
+    usage: { tokens: 800, contextWindow: 10000 },
+    contextWindow: 10000,
+    systemPrompt: "s".repeat(2000), // 500 tokens
+    activeToolDefs: [],
+    messages: [
+      { role: "user", content: "m".repeat(400) }, // 100 tokens
+    ],
+  });
+
+  assert.equal(breakdown.measuredTotal, 800);
+  assert.equal(breakdown.estimatedTotal, 1300); // 800(消息)+ 500(system prompt)
+  assert.equal(breakdown.available, 8700); // 10000 − 1300,不漏 prefix
+  // 无锚点(消息无 usage):delta 不定义,无吸收
+  assert.equal(breakdown.delta, null);
+  assert.equal(breakdown.buckets.custom, 0);
+  assert.equal(breakdown.confidence, "estimated"); // 无锚点参照,纯估算
+});
+
+test("with an assistant usage anchor, usage tokens are the full server total (no prefix double-count)", () => {
+  // “hi” 会话实测:assistant 的 usage.totalTokens = 服务端全量输入
+  // (system prompt/tools 已含在 input/cacheRead 里)。叠加 prefix 即双重计算。
+  const breakdown = analyzeContext({
+    usage: { tokens: 6000, contextWindow: 1000000 },
+    contextWindow: 1000000,
+    systemPrompt: "s".repeat(16000), // ~4000 tok
+    activeToolDefs: [],
+    messages: [
+      { role: "user", content: "hi" },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "你好" }],
+        stopReason: "stop",
+        usage: {
+          input: 5000,
+          output: 800,
+          cacheRead: 200,
+          cacheWrite: 0,
+          totalTokens: 6000,
+          cost: { total: 0 },
+        },
+      },
+    ],
+  });
+
+  assert.equal(breakdown.estimatedTotal, 6000); // 服务端全量,不再叠加 prefix
+  assert.equal(breakdown.available, 1000000 - 6000);
+  // delta = 实测全量 − 自算全量(独立呈现,不吸收进任何桶)
+  assert.equal(breakdown.delta, 6000 - (4000 + 2));
+  // 桶 = 纯自算:消息桶显示真实消息量,差额由 delta 行承载
+  assert.equal(breakdown.buckets.custom, 0);
+  assert.equal(breakdown.categoryBreakdown.messages, 2);
+  assert.equal(sumBuckets(breakdown.buckets), 4000 + 2);
+});
+
+function sumBuckets(buckets) {
+  return Object.values(buckets).reduce((a, v) => a + v, 0);
+}
+
 test("counts compaction and branch summaries in the summaries bucket", () => {
   const compactionSummary = "x".repeat(200); // 50 tokens
   const branchSummary = "y".repeat(120); // 30 tokens
 
   const breakdown = analyzeContext({
-    usage: { tokens: 20000, contextWindow: 200000 },
+    // usage 为 null:测纯估算分类路径(usage.tokens 已含 summaries,见锚点测试)
+    usage: null,
     contextWindow: 200000,
     systemPrompt: "",
     activeToolDefs: [],

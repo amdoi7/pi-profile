@@ -581,6 +581,18 @@ export async function collectContextInputs(ctx: any, pi: ExtensionAPI) {
  * Analyze working context and produce unified breakdown.
  * Output has no UI-motivated corrections, no silent clamping.
  * delta can be negative (estimator overestimate).
+ *
+ * 计算语义与 pi 源码对齐(estimate.ts / compaction.js):
+ * - 估算口径:chars/4 ceil;image 固定 4800 chars;assistant toolCall =
+ *   name.length + stringify(arguments).length;toolResult/custom 含 image;
+ *   bashExecution = command + output;branchSummary/compactionSummary =
+ *   summary 文本。
+ * - usage.tokens = pi 的 getContextUsage():estimateContextTokens(messages)。
+ *   锚点语义(有有效 assistant usage 时):usage 是服务端报告的请求用量,
+ *   input/cacheRead 已含 system prompt/tools——tokens 即全量,不再叠加
+ *   prefix(叠加即双重计算)。无锚点时是纯消息估算,需叠加 prefix。
+ * - delta:锚点存在 = 实测全量 − 自算全量(估算误差);无锚点 = 消息级差。
+ *   正差吸收进 custom 使桶总和与总量自洽,负差经 delta 可见不钳制。
  */
 export function analyzeContext(inputs: {
   usage: any;
@@ -593,6 +605,25 @@ export function analyzeContext(inputs: {
   memoryContent?: string;
   skillsContent?: string;
 }): ContextBreakdown {
+  const CHARS_PER_TOKEN = 4; // pi estimate.ts
+  const ESTIMATED_IMAGE_CHARS = 4800; // pi estimate.ts
+  const tokensFromChars = (chars: number): number => Math.ceil(chars / CHARS_PER_TOKEN);
+
+  /** pi estimateTextAndImageContentChars: text + image(4800),其余 stringify。 */
+  const textAndImageChars = (content: unknown): number => {
+    if (typeof content === "string") return content.length;
+    if (Array.isArray(content)) {
+      let chars = 0;
+      for (const part of content) {
+        if (part.type === "text") chars += part.text.length;
+        else if (part.type === "image") chars += ESTIMATED_IMAGE_CHARS;
+        else chars += JSON.stringify(part).length;
+      }
+      return chars;
+    }
+    return 0;
+  };
+
   // --- System prompt (with section details) ---
   const toolPromptAttribution = extractToolPromptAttribution(inputs.systemPrompt, inputs.activeToolDefs);
   const systemPromptSections = splitSystemPromptSections(toolPromptAttribution.strippedPrompt);
@@ -639,41 +670,46 @@ export function analyzeContext(inputs: {
   for (const m of inputs.messages) {
     if (m.role === "user") {
       if (typeof m.content === "string") {
-        msg.userText += estimateTokens(m.content);
+        msg.userText += tokensFromChars(m.content.length);
       } else if (Array.isArray(m.content)) {
         for (const part of m.content) {
           const p = part as any;
-          if (p.type === "text") msg.userText += estimateTokens(p.text);
-          else if (p.type === "image") msg.images += estimateTokens(JSON.stringify(p));
-          else msg.custom += estimateTokens(JSON.stringify(p));
+          if (p.type === "text") msg.userText += tokensFromChars(p.text.length);
+          else if (p.type === "image") msg.images += tokensFromChars(ESTIMATED_IMAGE_CHARS);
+          else msg.custom += tokensFromChars(JSON.stringify(p).length);
         }
       }
     } else if (m.role === "assistant") {
       if (typeof m.content === "string") {
-        msg.assistantText += estimateTokens(m.content);
+        msg.assistantText += tokensFromChars(m.content.length);
       } else if (Array.isArray(m.content)) {
         for (const part of m.content) {
           const p = part as any;
-          if (p.type === "text") msg.assistantText += estimateTokens(p.text);
+          if (p.type === "text") msg.assistantText += tokensFromChars(p.text.length);
           else if (p.type === "thinking")
-            msg.assistantThinking += estimateTokens(p.thinking ?? "");
+            msg.assistantThinking += tokensFromChars((p.thinking ?? "").length);
+          // pi 口径:toolCall = name + arguments(不含 type/id)
           else if (p.type === "toolCall")
-            msg.toolCalls += estimateTokens(JSON.stringify(p));
-          else msg.custom += estimateTokens(JSON.stringify(p));
+            msg.toolCalls += tokensFromChars(p.name.length + JSON.stringify(p.arguments ?? {}).length);
+          else msg.custom += tokensFromChars(JSON.stringify(p).length);
         }
       }
     } else if (m.role === "toolResult") {
-      msg.toolResults += estimateTokens(extractText(m.content));
+      // pi 口径:content 含 image(4800 chars)——extractText 丢 image,这里改用字符口径
+      msg.toolResults += tokensFromChars(textAndImageChars(m.content));
+    } else if (m.role === "custom") {
+      // pi 口径:custom 与 user 同(text + image)
+      msg.custom += tokensFromChars(textAndImageChars(m.content));
+    } else if (m.role === "bashExecution") {
+      msg.custom += tokensFromChars((m.command?.length ?? 0) + (m.output?.length ?? 0));
     } else if (m.role === "compactionSummary") {
-      summaryBreakdown.compactionSummaries += estimateTokens(m.summary ?? "");
+      summaryBreakdown.compactionSummaries += tokensFromChars((m.summary ?? "").length);
     } else if (m.role === "branchSummary") {
-      summaryBreakdown.branchSummaries += estimateTokens(m.summary ?? "");
+      summaryBreakdown.branchSummaries += tokensFromChars((m.summary ?? "").length);
     } else if (m.role === "summary" || m.type === "summary") {
-      summaryBreakdown.branchSummaries += estimateTokens(
-        extractText(m.content ?? m.text ?? ""),
-      );
+      summaryBreakdown.branchSummaries += tokensFromChars(extractText(m.content ?? m.text ?? "").length);
     } else {
-      msg.custom += estimateTokens(extractText(m.content ?? ""));
+      msg.custom += tokensFromChars(extractText(m.content ?? "").length);
     }
   }
 
@@ -690,42 +726,65 @@ export function analyzeContext(inputs: {
     msg.images +
     msg.custom;
 
-  const estimatedTotal =
-    systemPromptTokens +
-    systemToolsTokens +
-    skillsTokens +
-    memoryTokens +
-    summariesTokens +
-    messageTotal;
+  const prefixTokens =
+    systemPromptTokens + systemToolsTokens + skillsTokens + memoryTokens;
+
+  // --- pi 锚点语义(getContextUsage → estimateContextTokens 数组分支) ---
+  // 有有效 assistant usage 时:usage.tokens = 服务端真实上下文用量,
+  // input/cacheRead 已含 system prompt/tools(calculateContextTokens =
+  // totalTokens,实测 "hi" 会话 = 6k 全量)。此时不叠加 prefix——叠加即
+  // 双重计算。无锚点时 usage.tokens 是纯消息估算(数组分支),需叠加 prefix。
+  const hasAnchor = (() => {
+    for (let i = inputs.messages.length - 1; i >= 0; i--) {
+      const m = inputs.messages[i] as any;
+      if (m?.role !== "assistant" || !m.usage) continue;
+      if (m.stopReason === "aborted" || m.stopReason === "error") continue;
+      const u = m.usage;
+      if ((u.totalTokens || u.input + u.output + u.cacheRead + u.cacheWrite) > 0) return true;
+    }
+    return false;
+  })();
 
   // Treat a reported `tokens: 0` as "no measurement yet" — it shows up
   // on a fresh session before any turn has executed, and handing back
   // measuredTotal=0 leads the renderer to show Available=100% of window.
   const rawMeasured = inputs.usage?.tokens;
-  const measuredTotal =
+  const measuredMessages =
     typeof rawMeasured === "number" && rawMeasured > 0 ? rawMeasured : null;
   const contextWindow = inputs.contextWindow;
-  // Available space should be shown even pre-measurement so the grid
-  // always has a "free" slice. When we don't have a measurement we fall
-  // back to the estimated total.
-  const usedForAvailable =
-    measuredTotal !== null ? measuredTotal : estimatedTotal;
-  const available = Math.max(0, contextWindow - usedForAvailable);
+  const selfTotal = prefixTokens + messageTotal + summariesTokens;
+  // 三分支(与 pi estimateContextTokens 语义一致):
+  // - 锚点存在:usage.tokens 即全量,不加 prefix;delta = 实测全量 − 自算全量
+  //   (正 = 未归因,负 = 高估;显示层独立呈现,不吸收进任何桶);
+  // - 无锚点但 measured:纯消息估算,叠加 prefix;无参照,diff 不定义(null);
+  // - 无 measured:纯自算。
+  let estimatedTotal: number;
+  let delta: number | null;
+  if (measuredMessages !== null && hasAnchor) {
+    estimatedTotal = measuredMessages;
+    delta = measuredMessages - selfTotal;
+  } else if (measuredMessages !== null) {
+    estimatedTotal = measuredMessages + prefixTokens;
+    delta = null;
+  } else {
+    estimatedTotal = selfTotal;
+    delta = null;
+  }
+  const available = Math.max(0, contextWindow - estimatedTotal);
 
-  const delta = measuredTotal !== null ? measuredTotal - estimatedTotal : null;
-
+  // 只有锚点参照存在时 confidence 才有依据;否则纯估算。
   let confidence: "measured" | "mixed" | "estimated" = "estimated";
-  if (measuredTotal !== null) {
-    const absDelta = Math.abs(delta ?? 0);
+  if (delta !== null) {
+    const absDelta = Math.abs(delta);
     confidence = absDelta < 500 ? "measured" : "mixed";
   }
 
-  // Displayed buckets preserve raw per-category estimates so callers can
-  // trust that `assistantThinking`, `systemPrompt`, etc. reflect what we
-  // actually counted. When a measured total is available, any positive
-  // unattributed delta is absorbed into `custom` so the buckets sum to
-  // the real session total. Negative deltas (estimator overshoot) are
-  // left visible via `delta` without silently clamping the buckets.
+  // Displayed buckets are raw per-category estimates — each bucket is what
+  // we actually counted for that section, never padded. Any gap to the
+  // measured total is carried by `delta` and rendered as an unattributed/
+  // overcount line by the display layer. No absorption: a padded bucket
+  // would misrepresent the section (e.g. Messages showing the server-prefix
+  // estimation gap instead of the real message volume).
   const displayBuckets = {
     systemPrompt: systemPromptTokens,
     systemTools: systemToolsTokens,
@@ -740,10 +799,6 @@ export function analyzeContext(inputs: {
     summaries: summariesTokens,
     custom: msg.custom,
   };
-  if (measuredTotal !== null) {
-    const unattributed = measuredTotal - estimatedTotal;
-    if (unattributed > 0) displayBuckets.custom += unattributed;
-  }
 
   const displayMessageTotal =
     displayBuckets.userText +
@@ -759,7 +814,7 @@ export function analyzeContext(inputs: {
   const categoryFreeSpace = Math.max(0, available - autocompactBuffer);
 
   return {
-    measuredTotal,
+    measuredTotal: measuredMessages,
     contextWindow,
     available,
     estimatedTotal,
@@ -790,7 +845,7 @@ export function analyzeContext(inputs: {
     confidence,
     metadata: {
       compactionDetected: inputs.usage?.compactionDetected ?? false,
-      hasPostCompactionData: measuredTotal !== null,
+      hasPostCompactionData: measuredMessages !== null,
       buildSessionContextMessageCount: inputs.messages.length,
     },
   };
