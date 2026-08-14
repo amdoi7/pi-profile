@@ -91,7 +91,7 @@ test("a submit rejected as busy keeps the draft for editing", async () => {
 	harness.overlay.handleInput("\r");
 	await Promise.resolve();
 	assert.equal(harness.getDraft(), "second", "rejected submit must not lose the text");
-	assert.ok(harness.notices.some((n) => n.message.includes("still processing")));
+	assert.ok(harness.notices.some((n) => n.message.includes("still processing") && n.message.includes("Esc to stop")));
 
 	releasePrompt();
 	await Promise.all(harness.pending);

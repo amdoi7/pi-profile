@@ -33,8 +33,10 @@ export type PendingTurn = {
 	question: string;
 	answer: string;
 	toolCalls: ToolCallInfo[];
-	state: "running" | "failed";
+	state: "running" | "failed" | "stopped";
 	error?: string;
+	/** 用户主动停止(ESC)标记:abort 收尾走 stopped 路径,不报 error。 */
+	userStop?: boolean;
 };
 
 export type SideSessionLike = {
@@ -174,6 +176,17 @@ export class TurnRunner {
 		this.epoch += 1;
 	}
 
+	/**
+	 * 用户主动停止(ESC):标记在途 turn,后续 abort 收尾(resolve-aborted 与 reject
+	 * 两种形态)落 stopped 而非 failed。实际 abort 由调用方对 side session 执行。
+	 * 返回 false = 无在途 turn,调用方不必 abort。
+	 */
+	requestStop(): boolean {
+		if (!this.busy || !this.turn) return false;
+		this.turn.userStop = true;
+		return true;
+	}
+
 	applyEvent(event: AgentSessionEvent): string | null {
 		const turn = this.turn;
 		if (!turn || turn.state !== "running") {
@@ -193,7 +206,7 @@ export class TurnRunner {
 	async run(question: string, deps: TurnRunnerDeps): Promise<boolean> {
 		// Claim synchronously at entry: any later submit is rejected while this turn is in flight.
 		if (this.busy) {
-			deps.notify("BTW is still processing the previous message.", "warning");
+			deps.notify("BTW is still processing the previous message — Esc to stop.", "warning");
 			return false;
 		}
 		this.turn = { question, answer: "", toolCalls: [], state: "running" };
@@ -229,6 +242,10 @@ export class TurnRunner {
 				throw new Error("BTW request finished without a response.");
 			}
 			if (response.stopReason === "aborted") {
+				if (this.turn?.userStop) {
+					this.stopped(deps, epoch);
+					return;
+				}
 				throw new Error("BTW request aborted.");
 			}
 			if (response.stopReason === "error") {
@@ -254,8 +271,26 @@ export class TurnRunner {
 			this.turn = null;
 			deps.setStatus("Ready for the next side question.");
 		} catch (error) {
+			if (this.turn?.userStop) {
+				this.stopped(deps, epoch);
+				return;
+			}
 			this.fail(deps, error instanceof Error ? error.message : String(error), epoch);
 		}
+	}
+
+	/** 用户停止的收尾:stopped 是用户意图的终态,不是错误——不置 error,不报 error 级通知。 */
+	private stopped(deps: TurnRunnerDeps, epoch: number): void {
+		if (this.epoch !== epoch) {
+			return;
+		}
+		const turn = this.turn;
+		if (!turn) {
+			return;
+		}
+		turn.state = "stopped";
+		deps.setStatus("Stopped.");
+		deps.notify("BTW turn stopped.", "info");
 	}
 
 	private fail(deps: TurnRunnerDeps, message: string, epoch: number): void {

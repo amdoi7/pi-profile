@@ -252,6 +252,75 @@ test("aborted prompt surfaces as a failed turn", async () => {
 	assert.equal(runner.current?.error, "This operation was aborted");
 });
 
+test("用户停止(requestStop + resolve-aborted 形态)落 stopped,不落 failed", async () => {
+	const runner = new TurnRunner();
+	const statuses = [];
+	const notices = [];
+	const completed = [];
+	let releasePrompt;
+	const promptGate = new Promise((resolve) => {
+		releasePrompt = resolve;
+	});
+	const done = runner.run(
+		"question",
+		baseDeps({
+			ensureSideSession: async () => ({
+				prompt: async () => {
+					await promptGate;
+				},
+				getLastAssistantMessage: () => ({
+					content: [{ type: "text", text: "" }],
+					stopReason: "aborted",
+				}),
+			}),
+			setStatus: (s) => statuses.push(s),
+			notify: (message, level) => notices.push({ message, level }),
+			onTurnComplete: (d) => completed.push(d),
+		}),
+	);
+	assert.equal(runner.requestStop(), true, "busy 时 requestStop 接受");
+	releasePrompt();
+	await done;
+	assert.equal(runner.current?.state, "stopped");
+	assert.equal(runner.current?.error, undefined, "用户停止不是错误");
+	assert.equal(completed.length, 0, "停止的 turn 不入持久化线程");
+	assert.ok(statuses.includes("Stopped."), "status 反馈");
+	assert.ok(
+		notices.every((n) => n.level !== "error"),
+		"用户停止不报 error 级通知",
+	);
+	assert.equal(runner.busy, false, "stopped 后可接新 turn");
+});
+
+test("用户停止(reject 形态 abort)同样落 stopped", async () => {
+	const runner = new TurnRunner();
+	let releasePrompt;
+	const promptGate = new Promise((resolve) => {
+		releasePrompt = resolve;
+	});
+	const done = runner.run(
+		"question",
+		baseDeps({
+			ensureSideSession: async () => ({
+				prompt: async () => {
+					await promptGate;
+					throw new Error("This operation was aborted");
+				},
+				getLastAssistantMessage: () => null,
+			}),
+		}),
+	);
+	runner.requestStop();
+	releasePrompt();
+	await done;
+	assert.equal(runner.current?.state, "stopped");
+});
+
+test("requestStop: idle 时不接受", () => {
+	const runner = new TurnRunner();
+	assert.equal(runner.requestStop(), false);
+});
+
 test("reset clears the current turn", async () => {
 	const runner = new TurnRunner();
 	await runner.run(

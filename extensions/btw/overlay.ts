@@ -18,6 +18,21 @@ type BtwTheme = ExtensionContext["ui"]["theme"];
  */
 export const BTW_OVERLAY_MAX_HEIGHT_PERCENT = 78;
 
+/** ESC 语义:单 ESC 只是 stop(busy 停在途 turn,idle 无操作,永不关闭);
+ * 关闭只有窗口内双 ESC(不杀后台 turn)。 */
+export type EscapeAction = "stop" | "close" | "none";
+export function nextEscapeAction(
+	state: { lastEscapeAt: number },
+	now: number,
+	busy: boolean,
+	windowMs = 500,
+): EscapeAction {
+	const isDouble = now - state.lastEscapeAt <= windowMs;
+	state.lastEscapeAt = now;
+	if (isDouble) return "close";
+	return busy ? "stop" : "none";
+}
+
 /** Non-transcript dialog lines: 2 borders + title + hint + 2 separators + status + input + footer. */
 const CHROME_LINES = 9;
 const MIN_TRANSCRIPT_LINES = 3;
@@ -187,7 +202,7 @@ export class BtwOverlay extends Container implements Focusable {
 		const lines = [
 			this.borderLine(innerWidth, "top"),
 			this.frameLine(this.theme.fg("accent", this.theme.bold(" BTW side chat ")), innerWidth),
-			this.frameLine(this.theme.fg("dim", "Separate side conversation. Esc closes."), innerWidth),
+			this.frameLine(this.theme.fg("dim", "Separate side conversation. Esc stops · Esc×2 closes."), innerWidth),
 			this.theme.fg("borderMuted", `├${"─".repeat(innerWidth)}┤`),
 		];
 
@@ -203,7 +218,7 @@ export class BtwOverlay extends Container implements Focusable {
 		lines.push(
 			`${this.theme.fg("borderMuted", "│")}${inputLine}${this.theme.fg("borderMuted", "│")}`,
 		);
-		lines.push(this.frameLine(this.theme.fg("dim", "Enter submit · ↑↓ scroll · Esc close"), innerWidth));
+		lines.push(this.frameLine(this.theme.fg("dim", "Enter submit · ↑↓ scroll · Esc stop · Esc×2 close"), innerWidth));
 		lines.push(this.borderLine(innerWidth, "bottom"));
 
 		return lines;

@@ -27,7 +27,7 @@ import {
 } from "@earendil-works/pi-tui";
 
 import { on, registerCommand } from "../_shared/mode-gate.ts";
-import { BTW_OVERLAY_MAX_HEIGHT_PERCENT, BtwOverlay } from "./overlay.ts";
+import { BTW_OVERLAY_MAX_HEIGHT_PERCENT, BtwOverlay, nextEscapeAction } from "./overlay.ts";
 import { seedSideSessionMessages } from "./session-seeding.ts";
 import {
 	BTW_ENTRY_TYPE,
@@ -227,6 +227,7 @@ export default function (pi: ExtensionAPI) {
 	let overlayRuntime: OverlayRuntime | null = null;
 	let activeSideSession: SideSessionRuntime | null = null;
 	let overlayRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+	const overlayEscapeState = { lastEscapeAt: 0 };
 	const turnRunner = new TurnRunner();
 
 	const mdTheme = getMarkdownTheme();
@@ -314,7 +315,9 @@ export default function (pi: ExtensionAPI) {
 				lines.push(...renderToolCallLines(pending.toolCalls, theme, width));
 			}
 
-			if (pending.error) {
+			if (pending.state === "stopped") {
+				lines.push(theme.fg("dim", "■ Stopped."));
+			} else if (pending.error) {
 				lines.push(theme.fg("error", `❌ ${pending.error}`));
 			} else if (pending.answer) {
 				lines.push("");
@@ -473,6 +476,7 @@ export default function (pi: ExtensionAPI) {
 			.custom<void>(
 				async (tui, theme, keybindings, done) => {
 					runtime.setFinish(() => done());
+					overlayEscapeState.lastEscapeAt = 0; // 挂载重置:重开后首个 ESC 不继承上次窗口
 
 					const overlay = new BtwOverlay(
 						tui,
@@ -484,7 +488,13 @@ export default function (pi: ExtensionAPI) {
 							void submitFromOverlay(ctx, value);
 						},
 						() => {
-							void closeOverlayFlow(ctx);
+							const action = nextEscapeAction(overlayEscapeState, Date.now(), turnRunner.busy);
+							if (action === "stop") {
+								stopInFlightTurn();
+							} else if (action === "close") {
+								void closeOverlayFlow(ctx);
+							}
+							// none:idle 单 ESC 无操作,关闭只有双 ESC
 						},
 					);
 
@@ -584,6 +594,14 @@ export default function (pi: ExtensionAPI) {
 		} catch (error) {
 			notify(ctx, error instanceof Error ? error.message : String(error), "error");
 		}
+	}
+
+	/** 单 ESC 停止在途 side turn:abort side session,in-flight prompt 以 stopReason=aborted
+	 * 收尾,turn 落入 failed 态(overlay 保持打开,输入立即可用);关闭不杀活,杀活只此路径。 */
+	function stopInFlightTurn(): void {
+		const current = activeSideSession;
+		if (!turnRunner.requestStop() || !current) return;
+		void current.session.abort();
 	}
 
 	async function closeOverlayFlow(ctx: ExtensionCommandContext): Promise<void> {
