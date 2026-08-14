@@ -1,8 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { type } from "arktype";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Type, type Static } from "typebox";
 import type { ChangeStats, DisplayDiff } from "../_shared/final-diff.ts";
 import {
 	executeFileEdits,
@@ -12,48 +12,34 @@ import {
 } from "./edit-engine.ts";
 import { normalizeEditInput } from "./input-normalize.ts";
 
-const editOperationSchema = type({
-	oldText: "string",
-	newText: "string",
-	"replaceAll?": "boolean",
-}).onDeepUndeclaredKey("reject");
+const editOperationSchema = Type.Object(
+	{
+		oldText: Type.String({ description: "Exact text currently in the file to replace." }),
+		newText: Type.String({ description: "Replacement text. Use an empty string to delete oldText." }),
+		replaceAll: Type.Optional(Type.Boolean({
+			description: "Replace every occurrence of oldText instead of requiring a unique match.",
+		})),
+	},
+	{ additionalProperties: false },
+);
 
 // One file per call ({ path, edits }), matching pi's built-in edit tool so
 // models never have to learn a second shape. Multi-file edits are done with
 // one call per file; pi executes them in parallel.
-const editRequestSchema = type({
-	path: "string",
-	edits: editOperationSchema.array().atLeastLength(1),
-}).onDeepUndeclaredKey("reject");
+const editRequestSchema = Type.Object(
+	{
+		path: Type.String({ description: "Path to the file to edit (relative or absolute)." }),
+		edits: Type.Array(editOperationSchema, {
+			minItems: 1,
+			description: "One or more targeted replacements, each matched against the original file.",
+		}),
+	},
+	{ additionalProperties: false },
+);
 
-/**
- * arktype's toJsonSchema emits no per-field descriptions; inject them so the
- * model sees the required-match and delete semantics before calling.
- */
-export const editRequestParameters: ToolDefinition["parameters"] = (() => {
-	const schema = editRequestSchema.toJsonSchema() as {
-		properties?: Record<string, Record<string, unknown>>;
-	};
-	const properties = schema.properties;
-	if (properties) {
-		properties.path.description = "Path to the file to edit (relative or absolute).";
-		properties.edits.description =
-			"One or more targeted replacements, each matched against the original file.";
-		const items = properties.edits.items as Record<string, unknown> | undefined;
-		const itemProperties = items?.properties as Record<string, Record<string, unknown>> | undefined;
-		if (itemProperties) {
-			itemProperties.oldText.description =
-				"Exact text currently in the file to replace.";
-			itemProperties.newText.description =
-				"Replacement text. Use an empty string to delete oldText.";
-			itemProperties.replaceAll.description =
-				"Replace every occurrence of oldText instead of requiring a unique match.";
-		}
-	}
-	return schema as ToolDefinition["parameters"];
-})();
+export const editRequestParameters: ToolDefinition["parameters"] = editRequestSchema;
 
-export type EditRequest = typeof editRequestSchema.infer;
+export type EditRequest = Static<typeof editRequestSchema>;
 
 export type EditOutcome =
 	| {
@@ -77,20 +63,8 @@ export type CallToolViewModel = {
 	edits: FileEditOperation[];
 };
 
-export type FileResultView =
-	| {
-			path: string;
-			status: "applied";
-			previewDisplay: DisplayDiff;
-			previewStartLine?: number;
-			previewTruncated: boolean;
-			changeStats: ChangeStats;
-	  }
-	| {
-			path: string;
-			status: "failed";
-			error: string;
-	  };
+/** 文件结果统一为 _shared 的 FileMutationResult（label="edit"，构建时填入 cwd）。 */
+export type FileResultView = FileMutationResult;
 
 export type ResultToolViewModel = {
 	kind: "result";
@@ -118,8 +92,48 @@ export function canonicalizePath(filePath: string, cwd: string): string {
 	}
 }
 
+function invalidEditRequest(message: string): never {
+	throw new Error(message);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * 手写校验（schema 只做 provider 参数契约）：规则简单、错误消息带字段路径，
+ * 模型可直接行动；unknown key 报 "must be removed"（normalize 不吞未知键）。
+ */
 export function parseEditRequest(input: unknown): EditRequest {
-	return editRequestSchema.assert(normalizeEditInput(input));
+	const normalized = normalizeEditInput(input);
+	if (!isRecord(normalized)) invalidEditRequest("path must be a string");
+	for (const key of Object.keys(normalized)) {
+		if (key !== "path" && key !== "edits") invalidEditRequest(`${key} must be removed`);
+	}
+	if (typeof normalized.path !== "string") invalidEditRequest("path must be a string");
+	if (!Array.isArray(normalized.edits)) invalidEditRequest("edits must be an array");
+	if (normalized.edits.length === 0) invalidEditRequest("edits must not be empty");
+
+	const edits = normalized.edits.map((entry, index) => {
+		if (!isRecord(entry)) invalidEditRequest(`edits[${index}] must be an object`);
+		for (const key of Object.keys(entry)) {
+			if (key !== "oldText" && key !== "newText" && key !== "replaceAll") {
+				invalidEditRequest(`${key} must be removed`);
+			}
+		}
+		if (typeof entry.oldText !== "string") invalidEditRequest(`edits[${index}].oldText must be a string`);
+		if (typeof entry.newText !== "string") invalidEditRequest(`edits[${index}].newText must be a string`);
+		if (entry.replaceAll !== undefined && typeof entry.replaceAll !== "boolean") {
+			invalidEditRequest(`edits[${index}].replaceAll must be boolean`);
+		}
+		return {
+			oldText: entry.oldText,
+			newText: entry.newText,
+			...(entry.replaceAll !== undefined ? { replaceAll: entry.replaceAll } : {}),
+		};
+	});
+
+	return { path: normalized.path, edits };
 }
 
 export function buildCallToolViewModel(args: unknown): CallRenderViewModel {
@@ -217,27 +231,32 @@ export function buildOutcomeAgentContent(outcome: EditOutcome): string {
 	return JSON.stringify(agentOutcome);
 }
 
-function buildFileResultView(outcome: EditOutcome): FileResultView {
+function buildFileResultView(outcome: EditOutcome, cwd: string): FileResultView {
 	if (outcome.status === "failed") {
 		return {
+			label: "edit",
 			path: outcome.path,
+			cwd,
+			changeStats: { additions: 0, deletions: 0, changedLines: 0 },
+			display: { lineNumberWidth: 1, rows: [] },
+			truncated: false,
 			status: "failed",
 			error: outcome.error,
 		};
 	}
 	return {
+		label: "edit",
 		path: outcome.path,
-		status: "applied",
-		previewDisplay: outcome.previewDisplay,
-		previewStartLine: outcome.previewStartLine,
-		previewTruncated: outcome.previewTruncated,
+		cwd,
 		changeStats: outcome.changeStats,
+		display: outcome.previewDisplay,
+		truncated: outcome.previewTruncated,
 	};
 }
 
-export function buildOutcomeUiDetails(outcome: EditOutcome): ResultToolViewModel {
+export function buildOutcomeUiDetails(outcome: EditOutcome, cwd: string): ResultToolViewModel {
 	return {
 		kind: "result",
-		file: buildFileResultView(outcome),
+		file: buildFileResultView(outcome, cwd),
 	};
 }

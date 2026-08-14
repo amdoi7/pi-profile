@@ -29,15 +29,6 @@ test("parseEditRequest accepts replaceAll", () => {
 	assert.equal(resolution.edits[0]?.replaceAll, true);
 });
 
-test("parseEditRequest drops legacy expectedOccurrences", () => {
-	const resolution = parseEditRequest(makeArgs("/tmp/demo.ts", [
-		{ oldText: "before", newText: "after", expectedOccurrences: 2 },
-	]));
-
-	assert.equal(resolution.edits.length, 1);
-	assert.deepEqual(resolution.edits[0], { oldText: "before", newText: "after" });
-});
-
 test("parseEditRequest rejects non-boolean replaceAll", () => {
 	assert.throws(() =>
 		parseEditRequest(makeArgs("/tmp/demo.ts", [
@@ -93,37 +84,6 @@ test("parseEditRequest appends flat legacy edits after explicit edits", () => {
 
 	assert.equal(resolution.edits.length, 2);
 	assert.deepEqual(resolution.edits[1], { oldText: "bar", newText: "beta" });
-});
-
-test("parseEditRequest merges numbered legacy pairs at top level", () => {
-	const resolution = parseEditRequest({
-		path: "a.ts",
-		edits: [{ oldText: "foo", newText: "alpha" }],
-		oldText2: "bar",
-		newText2: "beta",
-	});
-
-	assert.equal(resolution.edits.length, 2);
-	assert.deepEqual(resolution.edits[1], { oldText: "bar", newText: "beta" });
-});
-
-test("parseEditRequest moves numbered legacy pairs nested in an edit to the tail", () => {
-	const resolution = parseEditRequest(makeArgs("a.ts", [
-		{ oldText: "foo", newText: "alpha", oldText2: "bar", newText2: "beta" },
-	]));
-
-	assert.equal(resolution.edits.length, 2);
-	assert.deepEqual(resolution.edits[0], { oldText: "foo", newText: "alpha" });
-	assert.deepEqual(resolution.edits[1], { oldText: "bar", newText: "beta" });
-});
-
-test("parseEditRequest rejects unpaired legacy numbered keys", () => {
-	assert.throws(() =>
-		parseEditRequest(makeArgs("a.ts", [
-			{ oldText: "foo", newText: "alpha", oldText2: 42 },
-		])),
-	/oldText2/,
-	);
 });
 
 test("parseEditRequest rejects unknown edit properties", () => {

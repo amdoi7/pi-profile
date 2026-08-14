@@ -21,14 +21,6 @@ const { initTheme } = await import(packageFileUrl(piPackageDir, "dist/modes/inte
 const sourceDir = extensionDir("edit");
 const TOOL_CALL_ID = "tool-call-1";
 
-async function linkLocalDependency(targetRoot, packageName) {
-	const targetDir = path.join(sourceDir, "node_modules", packageName);
-	const linkPath = path.join(targetRoot, "node_modules", packageName);
-	await fs.promises.mkdir(path.dirname(linkPath), { recursive: true });
-	await fs.promises.rm(linkPath, { force: true, recursive: true });
-	await fs.promises.symlink(targetDir, linkPath, "dir");
-}
-
 async function loadRegisteredEditTool() {
 	const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-edit-render-result-"));
 	const tempExtensionDir = path.join(tempRoot, "extension");
@@ -41,7 +33,6 @@ async function loadRegisteredEditTool() {
 	await copySharedFiles(tempSharedDir, ["file-link.ts", "code-preview.ts", "final-diff.ts", "diff-view.ts", "file-mutation-view.ts", "diff-service.ts", "diff-worker.ts"]);
 	await linkPiPackages(tempExtensionDir, { tui: true });
 	await linkSharedPackages(tempExtensionDir);
-	await linkLocalDependency(tempEditDir, "arktype");
 
 	const extensionModule = await import(`${pathToFileURL(path.join(tempEditDir, "index.ts")).href}?t=${Date.now()}`);
 	let registeredTool;
@@ -49,6 +40,7 @@ async function loadRegisteredEditTool() {
 		registerTool(definition) {
 			registeredTool = definition;
 		},
+		on() {},
 	});
 	if (!registeredTool) {
 		throw new Error("Failed to capture registered edit tool.");
@@ -149,7 +141,7 @@ function buildSingleFileSuccessGroup() {
 	};
 }
 
-function buildAgentResult(fileResult) {
+function buildAgentResult(fileResult, cwd = process.cwd()) {
 	return {
 		content: [{
 			type: "text",
@@ -162,15 +154,20 @@ function buildAgentResult(fileResult) {
 			kind: "result",
 			file: fileResult.status === "applied"
 				? {
+					label: "edit",
 					path: fileResult.path,
-					status: "applied",
-					previewDisplay: fileResult.previewDisplay,
-					previewStartLine: fileResult.firstChangedLine,
-					previewTruncated: false,
+					cwd,
+					display: fileResult.previewDisplay,
+					truncated: false,
 					changeStats: fileResult.changeStats ?? { additions: 1, deletions: 1, changedLines: 2 },
 				}
 				: {
+					label: "edit",
 					path: fileResult.path,
+					cwd,
+					changeStats: { additions: 0, deletions: 0, changedLines: 0 },
+					display: { lineNumberWidth: 1, rows: [] },
+					truncated: false,
 					status: "failed",
 					error: fileResult.error.message,
 				},
@@ -274,7 +271,7 @@ test("failed result shows the path only in its header", async () => {
 	assert.match(output, /oldText was not found/);
 });
 
-test("malformed result replaces a prior structured container with a contract diagnostic", async () => {
+test("result without structured details shows the contract diagnostic (no legacy fallback)", async () => {
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
 	const context = createRenderContext();
@@ -290,6 +287,7 @@ test("malformed result replaces a prior structured container with a contract dia
 		context,
 	);
 
+	// 不向后兼容：成功 + details 无法解析即契约破坏，显示开发诊断而非降级文本。
 	const diagnostic = tool.renderResult(
 		{ content: [{ type: "text", text: "raw fallback" }], details: undefined },
 		{ expanded: true },
@@ -297,6 +295,70 @@ test("malformed result replaces a prior structured container with a contract dia
 		{ ...context, lastComponent: structured },
 	);
 	assert.match(renderText(diagnostic), /edit_result_contract_invalid/);
+	assert.doesNotMatch(renderText(diagnostic), /raw fallback/);
+});
+
+test("legacy summary-shaped details shows the contract diagnostic (no format compat)", async () => {
+	initTheme("dark");
+	const tool = await loadRegisteredEditTool();
+	// 旧格式 details（{ kind, summary, groups }）：不兼容，诊断指出契约破坏。
+	const output = renderText(tool.renderResult(
+		{
+			content: [{ type: "text", text: "legacy summary payload" }],
+			details: { kind: "summary", summary: "1 applied", groups: [] },
+			isError: false,
+		},
+		{ expanded: false },
+		createTheme(),
+		createRenderContext(),
+	));
+
+	assert.match(output, /edit_result_contract_invalid/);
+	assert.doesNotMatch(output, /legacy summary payload/);
+});
+
+test("empty content without details keeps the contract diagnostic", async () => {
+	initTheme("dark");
+	const tool = await loadRegisteredEditTool();
+	const output = renderText(tool.renderResult(
+		{ content: [], details: undefined },
+		{ expanded: false },
+		createTheme(),
+		createRenderContext(),
+	));
+
+	assert.match(output, /edit_result_contract_invalid/);
+});
+
+test("error result renders the real failure message, not the contract diagnostic", async () => {
+	initTheme("dark");
+	const tool = await loadRegisteredEditTool();
+	const output = renderText(tool.renderResult(
+		{
+			content: [{ type: "text", text: "edits[0].oldText must be a string (was missing)" }],
+			details: {},
+			isError: true,
+		},
+		{ expanded: false },
+		createTheme(),
+		createRenderContext(),
+	));
+
+	assert.match(output, /oldText must be a string/);
+	assert.doesNotMatch(output, /edit_result_contract_invalid/);
+});
+
+test("partial result without details keeps pending instead of flashing the contract diagnostic", async () => {
+	initTheme("dark");
+	const tool = await loadRegisteredEditTool();
+	const output = renderText(tool.renderResult(
+		{ content: [], details: undefined },
+		{ expanded: false, isPartial: true },
+		createTheme(),
+		createRenderContext(),
+	));
+
+	assert.doesNotMatch(output, /edit_result_contract_invalid/);
 });
 
 test("renderResult keeps the single-file path header visible before its diff", async () => {
@@ -368,7 +430,9 @@ test("renderResult makes edit path headers clickable file hyperlinks", async () 
 				status: "applied",
 				firstChangedLine: 1,
 				previewDisplay: contextDisplay([[1, "after"]]),
-			}),
+			},
+			cwd,
+		),
 			{ expanded: true },
 			createTheme(),
 			createRenderContext({ cwd }),

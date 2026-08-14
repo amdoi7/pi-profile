@@ -10,12 +10,10 @@ import {
 	beginFileMutationResultRender,
 	beginPendingFileMutationRender,
 	clearPendingFileMutationRender,
-	type FileMutationRenderItem,
 } from "../_shared/file-mutation-view.ts";
 import { isChangeStats, isDisplayDiff } from "../_shared/final-diff.ts";
 
-import { renderDiffSummary } from "../_shared/code-preview.ts";
-import { renderCwdFilePathLink } from "../_shared/file-link.ts";
+import { fileMutationPlanItem, fileResultItem, type FileMutationResult } from "../_shared/file-result.ts";
 
 import type { CallRenderViewModel, ResultToolViewModel } from "./pipeline.ts";
 
@@ -26,13 +24,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function isFileResult(value: unknown): boolean {
-	if (!isRecord(value) || typeof value.path !== "string") return false;
+	if (!isRecord(value) || typeof value.label !== "string" || typeof value.path !== "string" || typeof value.cwd !== "string") return false;
 	if (value.status === "failed") {
 		return typeof value.error === "string";
 	}
-	return value.status === "applied" &&
-		isDisplayDiff(value.previewDisplay) &&
-		typeof value.previewTruncated === "boolean" &&
+	return isDisplayDiff(value.display) &&
+		typeof value.truncated === "boolean" &&
 		isChangeStats(value.changeStats);
 }
 
@@ -60,55 +57,44 @@ export function renderCallViewModel(
 	}
 
 	const container = beginPendingFileMutationRender(context);
-	appendFileMutationBatch(container, [{
-		title: `${renderCallTitle(theme)} ${renderCwdFilePathLink(viewModel.path, viewModel.path, context.cwd, theme)}`,
-		outcome: "pending",
-	}], theme);
+	appendFileMutationBatch(container, [fileMutationPlanItem({
+		label: "edit",
+		path: viewModel.path,
+		cwd: context.cwd,
+		changeStats: { additions: 0, deletions: 0, changedLines: 0 },
+	}, theme, context.cwd)], theme);
 	return container;
+}
+
+/** 清 pending 态并复用/新建 Text（contract 诊断与错误结果共享的单出口）。 */
+function replaceWithText(context: EditToolRenderContext, value: string): Text {
+	clearPendingFileMutationRender(context);
+	const text = context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
+	text.setText(value);
+	return text;
 }
 
 export function renderResultContractError(
 	theme: Theme,
 	context: EditToolRenderContext,
 ): Text {
-	clearPendingFileMutationRender(context);
-	const text = context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
-	text.setText(theme.fg(
-		"error",
-		'edit_result_contract_invalid expected="details.kind=result with one structured file result" action="report the edit extension result payload"',
-	));
-	return text;
+	return replaceWithText(
+		context,
+		theme.fg(
+			"error",
+			'edit_result_contract_invalid expected="details.kind=result with one structured file result" action="report the edit extension result payload"',
+		),
+	);
 }
 
-function fileResultTitle(
-	file: ResultToolViewModel["file"],
+/** 执行错误结果（校验/abort，details 为空）：渲染真实错误文本，不掩盖用户可行动信息。 */
+export function renderResultTextContent(
+	result: { content: Array<{ type: string; text?: string }> },
 	theme: Theme,
 	context: EditToolRenderContext,
-): string {
-	const summary = file.status === "applied"
-		? renderDiffSummary(file.changeStats, theme)
-		: theme.fg("error", "failed");
-	const suffix = summary.length > 0 ? `${theme.fg("muted", " · ")}${summary}` : "";
-	return `${renderCallTitle(theme)} ${renderCwdFilePathLink(file.path, file.path, context.cwd, theme)}` + suffix;
-}
-
-function fileResultItem(
-	file: ResultToolViewModel["file"],
-	theme: Theme,
-	context: EditToolRenderContext,
-): FileMutationRenderItem {
-	const title = fileResultTitle(file, theme, context);
-	if (file.status === "failed") {
-		return { title, outcome: "failed", message: file.error };
-	}
-	const hasDiff = file.previewDisplay.rows.length > 0 || file.previewTruncated;
-	return {
-		title,
-		outcome: "applied",
-		previews: hasDiff
-			? [{ display: file.previewDisplay, truncated: file.previewTruncated }]
-			: [],
-	};
+): Text {
+	const message = result.content.map((part) => part.text ?? "").join("\n").trim();
+	return replaceWithText(context, `${renderCallTitle(theme)}\n${theme.fg("error", message || "edit failed")}`);
 }
 
 export function parseRenderedResultPayload(result: { details?: unknown }): ResultToolViewModel | undefined {
@@ -122,6 +108,10 @@ export function renderResultViewModel(
 	context: EditToolRenderContext,
 ): Container {
 	const container = beginFileMutationResultRender(context);
-	appendFileMutationBatch(container, [fileResultItem(viewModel.file, theme, context)], theme);
+	appendFileMutationBatch(
+		container,
+		[fileResultItem(viewModel.file, theme, context.cwd)],
+		theme,
+	);
 	return container;
 }

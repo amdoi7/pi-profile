@@ -1,4 +1,3 @@
-import { type } from "arktype";
 import { constants } from "node:fs";
 import { access, readFile, stat, writeFile } from "node:fs/promises";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
@@ -35,16 +34,17 @@ export type ExecutedFileEditResult = {
 // Hard file-size gate. Files larger than this are rejected before reading.
 export const MAX_EDIT_FILE_SIZE_BYTES = 8 * 1024 * 1024; // 8 MB
 
-export const editToolErrorSchema = type({
-	kind: "'NOT_FOUND' | 'DUPLICATE_MATCH' | 'NO_CHANGE'",
-	message: "string",
-});
+export const EDIT_TOOL_ERROR_KINDS = ["NOT_FOUND", "DUPLICATE_MATCH", "NO_CHANGE"] as const;
+export type RecoverableEditErrorKind = (typeof EDIT_TOOL_ERROR_KINDS)[number];
 
-export type RecoverableEditErrorKind = typeof editToolErrorSchema.infer.kind;
-export type EditToolError = Error & typeof editToolErrorSchema.infer;
+export interface EditToolError extends Error {
+	kind: RecoverableEditErrorKind;
+}
 
 export function isEditToolError(error: unknown): error is EditToolError {
-	return error instanceof Error && editToolErrorSchema.allows(error);
+	return error instanceof Error
+		&& typeof (error as Partial<EditToolError>).kind === "string"
+		&& (EDIT_TOOL_ERROR_KINDS as readonly string[]).includes((error as EditToolError).kind);
 }
 
 function editError(message: string, kind: RecoverableEditErrorKind): EditToolError {
