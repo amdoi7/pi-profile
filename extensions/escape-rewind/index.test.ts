@@ -4,7 +4,7 @@ import {
 	isRetractablePromptSubmission,
 	navigateToSubmittedMessageForRewrite,
 } from "./index.ts";
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "vitest";
 
 describe("escape-rewind", () => {
 	function assertAppearsInOrder(events: string[], expected: string[]) {

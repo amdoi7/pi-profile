@@ -4,5 +4,11 @@
   "type": "module",
   "dependencies": {
     "diff": "8.0.4"
+  },
+  "devDependencies": {
+    "vitest": "^3.2.4"
+  },
+  "scripts": {
+    "test": "vitest run"
   }
 }

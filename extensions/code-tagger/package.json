@@ -1,0 +1,14 @@
+{
+	"name": "code-tagger",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"test": "vitest run tests/*.test.mjs",
+		"typecheck": "tsc -p tsconfig.json",
+		"eval": "node evals/corpus.mjs"
+	},
+	"devDependencies": {
+		"typescript": "^5.7.0",
+		"vitest": "^3.2.7"
+	}
+}
