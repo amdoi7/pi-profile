@@ -21,8 +21,15 @@ How to write patches that apply cleanly. Follow these rules when generating
 
 - Every operation needs its header: `*** Add File:`, `*** Delete File:`, or
   `*** Update File:`.
+- Control lines (`*** Begin Patch`, operation headers, `@@`, `*** End Patch`)
+  may carry leading whitespace (e.g. a heredoc body indented as a block); the
+  leading whitespace is ignored. A uniform indent across the whole body
+  (every line shifted by the same prefix, including content lines) is also
+  supported: the indent is inferred from the control lines and stripped from
+  every line before parsing.
 - Add lines always start with `+`; delete lines with `-`; context lines with a
-  single space.
+  single space. Content lines are matched verbatim — leading whitespace on a
+  content line is part of the line text.
 - Each `@@` chunk must contain at least one `+` or `-` line. A context-only
   chunk is invalid and is skipped by the engine.
 - Reference paths relative to the working directory when possible. Absolute
@@ -71,9 +78,9 @@ How to write patches that apply cleanly. Follow these rules when generating
 - The error message includes the exact expected lines
   (`Failed to find expected lines in <path>: <lines>`). Read the file and fix
   the context rather than re-issuing the same patch.
-- Syntactically invalid hunks are skipped with a `skipped` report; the rest of
-  the patch still applies. Treat `PARTIAL_APPLY` as an error: collect the
-  report, fix the skipped hunks, and re-apply.
+- Syntactically invalid hunks are skipped with `skipped:` report lines; the
+  rest of the patch still applies. Treat `PARTIAL_APPLY` as an error: collect
+  the report, fix the skipped hunks, and re-apply.
 - An apply failure (missing file, context mismatch, existing target) stops at
-  the first failing operation and reports `appliedPrefix`; do not assume later
-  operations ran.
+  the first failing operation and lists the applied prefix as `applied:`
+  lines; do not assume later operations ran.

@@ -56,10 +56,13 @@ func (failure *parseFailure) Error() string {
 
 func parsePatch(input string) ([]patchHunk, []skippedHunk, error) {
 	lines := strings.Split(input, "\n")
-	if len(lines) == 0 || lines[0] != beginPatch {
+	// 统一 heredoc 缩进剥除：所有指令行（trim 后以 ***/@@ 开头）前导空白的最小值 = N；
+	// 每行剥去至多 N 个前导空白后按标准规则解析（内容行 line[0] 即标记，恢复严格匹配）。
+	lines = stripIndent(lines, patchIndent(lines))
+	if len(lines) == 0 || strings.TrimLeft(lines[0], " \t") != beginPatch {
 		return nil, nil, invalidPatch("The first line of the patch must be '*** Begin Patch'")
 	}
-	if lines[len(lines)-1] != endPatch {
+	if strings.TrimLeft(lines[len(lines)-1], " \t") != endPatch {
 		return nil, nil, invalidPatch("The last line of the patch must be '*** End Patch'")
 	}
 
@@ -90,6 +93,42 @@ func parsePatch(input string) ([]patchHunk, []skippedHunk, error) {
 	return hunks, skipped, nil
 }
 
+// patchIndent 计算统一 heredoc 缩进量：指令行（trim 后以 ***/@@ 开头）前导空白的最小值。
+// 顶格 patch 为 0；无指令行（非 patch 内容）为 0（不剥除）。
+func patchIndent(lines []string) int {
+	n := -1
+	for _, line := range lines {
+		trimmed := strings.TrimLeft(line, " \t")
+		if !strings.HasPrefix(trimmed, "***") && !strings.HasPrefix(trimmed, "@@") {
+			continue
+		}
+		indent := len(line) - len(trimmed)
+		if n == -1 || indent < n {
+			n = indent
+		}
+	}
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
+// stripIndent 每行剥去至多 n 个前导空白字符（统一 heredoc 缩进；不足 n 的行剥到 0）。
+func stripIndent(lines []string, n int) []string {
+	if n <= 0 {
+		return lines
+	}
+	out := make([]string, len(lines))
+	for i, line := range lines {
+		strip := 0
+		for strip < n && strip < len(line) && (line[strip] == ' ' || line[strip] == '\t') {
+			strip++
+		}
+		out[i] = line[strip:]
+	}
+	return out
+}
+
 func nextOperationLine(lines []string, lineIndex int) int {
 	for i := lineIndex + 1; i < len(lines)-1; i++ {
 		if isOperationHeader(lines[i]) {
@@ -100,7 +139,7 @@ func nextOperationLine(lines []string, lineIndex int) int {
 }
 
 func parseHunk(lines []string, lineIndex, hunkIndex int) (patchHunk, int, error) {
-	line := lines[lineIndex]
+	line := strings.TrimLeft(lines[lineIndex], " \t")
 	switch {
 	case strings.HasPrefix(line, addFile):
 		path, err := parseHunkPath(line[len(addFile):])
@@ -157,8 +196,8 @@ func parseAddHunk(lines []string, lineIndex, hunkIndex int, path string) (patchH
 func parseUpdateHunk(lines []string, lineIndex, hunkIndex int, path string) (patchHunk, int, error) {
 	hunk := patchHunk{index: hunkIndex, operation: operationUpdate, path: path}
 	index := lineIndex + 1
-	if index < len(lines)-1 && strings.HasPrefix(lines[index], moveTo) {
-		movePath, err := parseHunkPath(lines[index][len(moveTo):])
+	if index < len(lines)-1 && strings.HasPrefix(strings.TrimLeft(lines[index], " \t"), moveTo) {
+		movePath, err := parseHunkPath(strings.TrimLeft(lines[index], " \t")[len(moveTo):])
 		if err != nil {
 			return patchHunk{}, 0, invalidHunk(hunkIndex, operationUpdate, path, index, err.Error())
 		}
@@ -187,10 +226,10 @@ func parseUpdateHunk(lines []string, lineIndex, hunkIndex int, path string) (pat
 func parseUpdateChunk(lines []string, lineIndex, chunkIndex int, hunk patchHunk) (updateChunk, int, error) {
 	chunk := updateChunk{index: chunkIndex}
 	index := lineIndex
-	if lines[index] == section {
+	if strings.TrimLeft(lines[index], " \t") == section {
 		index++
-	} else if strings.HasPrefix(lines[index], sectionWith) {
-		chunk.context = lines[index][len(sectionWith):]
+	} else if strings.HasPrefix(strings.TrimLeft(lines[index], " \t"), sectionWith) {
+		chunk.context = strings.TrimLeft(lines[index], " \t")[len(sectionWith):]
 		if chunk.context == "" {
 			return updateChunk{}, 0, invalidChunk(hunk, chunkIndex, index, "Section header context must not be empty")
 		}
@@ -203,7 +242,7 @@ func parseUpdateChunk(lines []string, lineIndex, chunkIndex int, hunk patchHunk)
 	hasChange := false
 	for index < len(lines)-1 {
 		line := lines[index]
-		if line == endOfFile {
+		if strings.TrimLeft(line, " \t") == endOfFile {
 			if len(chunk.lines) == 0 {
 				return updateChunk{}, 0, invalidChunk(hunk, chunkIndex, index, "Update hunk does not contain any lines")
 			}
@@ -211,7 +250,7 @@ func parseUpdateChunk(lines []string, lineIndex, chunkIndex int, hunk patchHunk)
 			index++
 			break
 		}
-		if strings.HasPrefix(line, section) || isOperationHeader(line) {
+		if strings.HasPrefix(strings.TrimLeft(line, " \t"), section) || isOperationHeader(line) {
 			break
 		}
 		if line == "" || (line[0] != ' ' && line[0] != '-' && line[0] != '+') {
@@ -231,7 +270,8 @@ func parseUpdateChunk(lines []string, lineIndex, chunkIndex int, hunk patchHunk)
 }
 
 func isOperationHeader(line string) bool {
-	return strings.HasPrefix(line, addFile) || strings.HasPrefix(line, deleteFile) || strings.HasPrefix(line, updateFile)
+	trimmed := strings.TrimLeft(line, " \t")
+	return strings.HasPrefix(trimmed, addFile) || strings.HasPrefix(trimmed, deleteFile) || strings.HasPrefix(trimmed, updateFile)
 }
 
 func invalidPatch(message string) error {

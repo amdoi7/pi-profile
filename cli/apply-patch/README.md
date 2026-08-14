@@ -52,30 +52,35 @@ Supported operations are `Add File`, `Delete File`, `Update File`, `Move to`, `@
 - A match failure reports the expected lines inside the error message. A
   trailing empty line that stands for the replaced region's terminating
   newline is retried without it, mirroring the Codex matcher.
-- Failed apply reports list each applied change; update and move changes also
-  carry `oldContent` and `newContent` so consumers can render exact diffs or
-  roll back without re-reading files.
+- Failed apply reports list each applied change (`applied:` lines, in patch
+  order, without file contents).
 - Writes use a synced temporary file followed by rename or link.
 
-Success uses the Codex summary format on stdout. Failure writes one JSON object to stderr:
+Output is plain text: success on stdout, failure on stderr; the exit status
+is carried by the process exit code, not repeated in the output. Success
+prints a marker line followed by one change per line (added, then modified,
+then deleted; status `A`, `M`, or `D`; the path is the rest of the line):
 
-```json
-{
-  "ok": false,
-  "exitCode": 1,
-  "error": {
-    "code": "CONTEXT_NOT_FOUND",
-    "message": "Failed to find expected lines in example.txt",
-    "hunk": {
-      "index": 0,
-      "operation": "update",
-      "path": "example.txt",
-      "chunkIndex": 1
-    }
-  },
-  "appliedPrefix": []
-}
 ```
+Success. Updated the following files:
+M example.txt
+```
+
+Failure prints an `error[CODE]` header, an optional `hunk:` reference, one
+`applied:` line per applied change, one `skipped:` line per skipped hunk, and
+the `message:` block last (it can span multiple lines and runs to EOF):
+
+```
+error[CONTEXT_NOT_FOUND]
+hunk: #0 update chunk 1 example.txt
+applied: #0 add other.txt
+skipped: #1 update chunk 0 third.txt — Invalid patch hunk on line 3: ...
+message: Failed to find expected lines in example.txt
+```
+
+Hunk references are `#<index>` followed by optional `<operation>`,
+`chunk <n>`, and path fields in that order; the path is always the rest of
+the line and may contain spaces.
 
 Exit codes follow the Codex CLI contract:
 
