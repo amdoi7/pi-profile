@@ -242,7 +242,7 @@ export default function (pi: ExtensionAPI) {
 				},
 			};
 		});
-	});
+	}, ["tui"]);
 
 	// session_tree（/tree 导航）与 session_compact（自动/手动压缩）都会替换
 	// entries 且无 message_end 增量信号——全量重建（pi 在两者触发时 entries 已更新）；

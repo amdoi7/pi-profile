@@ -406,6 +406,13 @@ describe("layoutFooter", () => {
 		);
 		expect(pipeCols(top)).toEqual(pipeCols(bottom));
 	});
+	test("collapsed cwd keeps separators aligned on wide terminals (… = 1 col, regression)", () => {
+		// 折叠路径的全角省略号在等宽终端按 1 列渲染(与 displayWidth 同口径);
+		// 若未来误将 … 算 2 列,pad 少 1,行1 第一个 │ 与行2 错位,此测试转红。
+		const folded = "cwd: ~/…/ai4x/safety-supervision-agent";
+		const [top, bottom] = layoutFooter(160, { ...segments, cwd: folded }, sessionRow, usageLine, " │ ");
+		expect(pipeCols(top)).toEqual(pipeCols(bottom));
+	});
 	test("ANSI-wrapped segments do not inflate the grid (regression)", () => {
 		const ansi = (s: string) => `\x1b[38;2;1;2;3m${s}\x1b[0m`;
 		const cjk = `${ansi("ctx: 5k 2%")} │ ${ansi("↑5k ↓1k R26k W0 上次CH97%")} │ 11 t/s`;
