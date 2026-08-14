@@ -151,22 +151,25 @@ first; implementing before framing is a process defect, not a shortcut.
   git diff is only for commit staging and targeted verification; plans derive
   from requirements, root cause, and the ideal end state (see coding-discipline
   design).
+- Commits are cheap local checkpoints: commit early, each by cohesive domain
+  (boundaries per the commit skill); rewriting unpushed history (rebase/amend)
+  is safe. Push is the irreversible line — escalation per Grill me. Do not
+  batch mixed changes into a wip commit to split later; splitting costs more
+  human attention than chunking at commit time.
 
 - Command output discipline: compose UNIX pipelines to surface key info first — `2>&1 | grep -E "ℹ (pass|fail)"`-style summary counts, FAIL/error lines, and the first failure detail only; keep full output to a log file instead of printing it all.
-- Cross-file mechanical edits: scope with `rg -l` and verify the match set
-  before running; use `sg` or `perl -pi` instead of regex for syntax-aware
-  shapes (identifiers, calls, AST).
-- File edits prefer `apply_patch` (default path, single- and multi-file;
-  already on bash env PATH); envelope format in
-  ~/.pi/agent/cli/apply-patch/patch-authoring.md. Patch context must come from
-  the current file content.
-- Use the `edit` tool's replaceAll/multiple edits only for repeated
-  replacements (same text in several places, patch context cannot anchor
-  uniquely); single-anchored changes default to apply_patch; new files use
-  write.
-- Mutate files with `edit`, `apply_patch`, or `perl` only. Never use python
-  heredoc scripts for file mutation: `str.replace` fails silently, the
-  failure is invisible, and the change cannot be audited as a diff.
+- File mutation by target shape (auditable-as-diff only; never python
+  heredocs — `str.replace` fails silently):
+  - `edit` (default): known literal targets; fails loudly on mismatch or
+    non-unique anchor. replaceAll only for deliberately repeated text.
+  - `apply_patch`: new/delete files, multi-hunk or multi-file changes, or
+    repeated short text edit cannot anchor. Envelope format in
+    cli/apply-patch/patch-authoring.md; context from current file content.
+  - `perl -pi`: pattern-level cross-file edits; scope with `rg -l` and
+    verify the match set first (`sg` for syntax-aware shapes).
+- A failed match is an authoring error: re-read the exact content and retry
+  the same tool; never escape to a weaker-checking tool (edit failure →
+  perl turns a loud mismatch into a silent wrong edit).
 - Web extraction: `defuddle.md` converts URL pages to Markdown.
 
 ## Grill me
