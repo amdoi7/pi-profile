@@ -1,6 +1,6 @@
 {
     "$schema": "https://raw.githubusercontent.com/badlogic/pi-mono/main/packages/coding-agent/theme-schema.json",
-    "name": "moon-nord",
+    "name": "moon-nord-daltonized",
     "vars": {
         "night0": "#2e3440",
         "night1": "#3b4252",
@@ -63,7 +63,7 @@
         "mdQuoteBorder": "night2",
         "mdHr": "night2",
         "mdListBullet": "sakura",
-        "toolDiffAdded": "spring",
+        "toolDiffAdded": "iceCyan",
         "toolDiffRemoved": "coral",
         "toolDiffContext": "slate",
         "syntaxComment": "slateComment",
