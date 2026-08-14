@@ -1,22 +1,17 @@
-import { join } from "node:path";
-import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
-import { formatCallback, type CallbackMessage } from "./bridge.ts";
-import { buildInitialPrompt, makeWorkerId, validateRunInput } from "./contract.ts";
+import { CALLBACK_TYPE, formatCallback, type CallbackMessage } from "./bridge.ts";
+import { appendFileSync, existsSync } from "node:fs";
+import { buildInitialPrompt, makeWorkerId, normalizeTools, validateRunInput, workerSessionDir } from "./contract.ts";
+import { COLLECTED_MARKER, defaultPidAlive, scanWorkerSessions, type RecoveredSession, type ScanResult } from "./recovery.ts";
 import { RoomBus } from "./room-bus.ts";
 import { displayNameOf } from "./present.ts";
 import { RpcClient } from "./rpc-client.ts";
 import { spawnChild, terminate } from "./spawner.ts";
 import { WorkerError, WorkerStateMachine } from "./state-machine.ts";
 import { latestStats } from "./present.ts";
-import type { RunInput, WorkerRecord } from "./types.ts";
+import type { CollectVerdict, RunInput, WorkerRecord } from "./types.ts";
 import { attachWatcher, type WorkerEvent } from "./watcher.ts";
 
 const RECENT_CAP = 10;
-
-/** 子 session 审计目录:<cwd>/.pi/worker/sessions(HARNESS.md「有状态事实源」契约)。 */
-export function sessionDirFor(cwd: string): string {
-	return join(cwd, CONFIG_DIR_NAME, "worker", "sessions");
-}
 
 function pushRecent(rec: { recent: string[] }, entry: string): void {
 	rec.recent.push(entry);
@@ -25,6 +20,24 @@ function pushRecent(rec: { recent: string[] }, entry: string): void {
 
 const HANDSHAKE_TIMEOUT_MS = 30000;
 const ABORT_TIMEOUT_MS = 5000;
+
+/** 握手 get_state → 记录映射(纯函数,可单测)。sessionFile 是 pi 原生会话 jsonl
+ * 路径(RpcSessionState.sessionFile)——回调携带后,父的事实核验第三层
+ * (子 session 审计)一步可达,无需自建文件发现逻辑。 */
+export function applyHandshakeState(
+	rec: WorkerRecord,
+	state: { model?: { provider?: string; id?: string } | null; thinkingLevel?: string; sessionFile?: string },
+): void {
+	if (state.model?.id) {
+		rec.modelInfo = {
+			provider: state.model.provider ?? "",
+			id: state.model.id,
+			thinkingLevel: state.thinkingLevel ?? "",
+		};
+	}
+	if (state.sessionFile) rec.sessionFile = state.sessionFile;
+}
+
 /** stop 软指令的宽限期:STOP 依赖子 LLM 自愿服从(live 实测 20-60s 不等),超时后 abort */
 const STOP_GRACE_MS = 30000;
 /** abort 后等待 settled 的窗口;仍不 settled → terminate(SIGTERM→SIGKILL),worst case 有界 */
@@ -54,7 +67,7 @@ export interface ManagerDeps {
  */
 export class WorkerManager {
 	readonly sm = new WorkerStateMachine();
-	/** 消息平面:parent/worker 互发统一入口(寻址/投递/审计/失败回执)。 */
+	/** message plane:parent/worker 互发统一入口(resolve/deliver/audit fan-out/failure receipt)。 */
 	readonly bus: RoomBus;
 	private readonly handles = new Map<string, Handle>();
 
@@ -62,13 +75,14 @@ export class WorkerManager {
 		this.bus = new RoomBus({
 			deliver: deps.deliver,
 			resolve: (to) => {
+				// 仅可收消息的状态(running/idle)可寻址;starting/stopping 未就绪,终态出局
 				const t = [...this.sm.records.values()].filter(
-					(r) => r.state !== "done" && r.state !== "killing" && (r.name === to || r.id === to),
+					(r) => (r.state === "running" || r.state === "idle") && (r.name === to || r.id === to),
 				);
 				return t.length === 1 ? t[0].id : undefined;
 			},
 			transport: (id, text) => this.message(id, text),
-			nameOf: (id) => this.sm.records.get(id)?.name ?? displayNameOf(id),
+			displayNameOf: (id) => this.sm.records.get(id)?.name ?? displayNameOf(id),
 		});
 	}
 
@@ -80,18 +94,19 @@ export class WorkerManager {
 		}
 
 		const id = makeWorkerId(input);
-		const rec = this.sm.run({ id, name: input.name.trim(), oneshot: input.oneshot });
-		const sessionDir = sessionDirFor(cwd);
+		const rec = this.sm.run({ id, name: input.name.trim() });
+		const sessionDir = workerSessionDir(cwd, process.pid); // 归属命名空间(恢复按目录判定所有者)
+		const tools = normalizeTools(input.tools);
 
 		let proc: import("node:child_process").ChildProcess;
 		try {
 			proc = spawnChild({
 				cwd,
-				sessionDir,
 				id,
 				name: input.name.trim(),
 				model: input.model?.trim() || undefined,
 				thinking: input.thinking?.trim() || undefined,
+				tools,
 			});
 		} catch (e) {
 			this.sm.onExit(id, { code: null, signal: null, stderrTail: `spawn 失败: ${e instanceof Error ? e.message : String(e)}` });
@@ -100,12 +115,11 @@ export class WorkerManager {
 		rec.pid = proc.pid;
 		rec.model = input.model?.trim() || undefined;
 		rec.thinking = input.thinking?.trim() || undefined;
-		rec.role = input.role?.trim() || undefined;
+		if (tools) rec.tools = tools;
 
 		const rpc = new RpcClient(proc);
 		const handle: Handle = { proc, rpc, watcher: { dispose: () => {} }, sessionDir };
-		// 先注册句柄再接事件流:watcher 任何事件(dialog 等)到达时 handles 必有,
-		// 时序窗口结构性消除(dialog 分支的句柄缺失 throw 成为不可达断言)。
+		// 先注册句柄再接事件流:watcher 任何事件(dialog 等)到达时 handles 必有。
 		this.handles.set(id, handle);
 		handle.watcher = attachWatcher(
 			{ events: rpc, stderr: proc.stderr! /* stdio: ["pipe",...] 保证非 null */ },
@@ -113,19 +127,14 @@ export class WorkerManager {
 		);
 		this.deps.onChange?.();
 
-		const prompt = buildInitialPrompt({ ...input, id, sessionDir });
+		const prompt = buildInitialPrompt({ ...input, id });
 		void rpc
 			.send({ type: "get_state" }, { timeoutMs: HANDSHAKE_TIMEOUT_MS })
 			.then((state) => {
-				// 握手顺带取实际生效模型/档位(含默认值),overlay 显示用
-				const data = state as { model?: { provider?: string; id?: string } | null; thinkingLevel?: string };
+				// 握手顺带取实际生效模型/档位 + 原生 sessionFile(审计指针)
 				const live = this.sm.records.get(id);
-				if (live && data.model?.id) {
-					live.modelInfo = {
-						provider: data.model.provider ?? "",
-						id: data.model.id,
-						thinkingLevel: data.thinkingLevel ?? "",
-					};
+				if (live) {
+					applyHandshakeState(live, state as { model?: { provider?: string; id?: string } | null; thinkingLevel?: string; sessionFile?: string });
 				}
 				return rpc.send({ type: "prompt", message: prompt });
 			})
@@ -140,7 +149,7 @@ export class WorkerManager {
 				// 谁执行 starting→failed 转移谁投递;watcher 侧状态守卫防双投
 				this.sm.onExit(id, { code: null, signal: null, stderrTail: `启动失败: ${message}` });
 				this.deps.deliver(
-					formatCallback({ type: "failed", id, exitCode: null, exitSignal: null, stderrTail: `启动失败: ${message}` }),
+					formatCallback({ type: "failed", id, exitCode: null, exitSignal: null, stderrTail: `启动失败: ${message}`, sessionFile: live.sessionFile }),
 				);
 				this.dropHandle(id);
 				terminate(proc);
@@ -198,9 +207,21 @@ export class WorkerManager {
 	 * 正常路径不受影响:timer fire 时已 settled/kill → 状态守卫跳过。 */
 	async stop(id: string): Promise<void> {
 		this.sm.stop(id);
-		await this.sendCmd(id, { type: "steer", message: STOP_MESSAGE }, "stop");
+		// 代次令牌:同合约原样重跑复用同 id(终端记录被替换,新句柄),本代次的兑底
+		// 计时器 fire 时按 id 查到的已是新代次——句柄比对不一致即失效,不串扰。
+		const generation = this.handles.get(id);
+		try {
+			await this.sendCmd(id, { type: "steer", message: STOP_MESSAGE }, "stop");
+		} catch (e) {
+			// 停止指令没落地 ⇒ 子仍在跑本轮:回退 running 才是真相。此处 return 前
+			// 兑底计时器尚未 armed,stopping 不会无兑底悬挂;调用方按错误重试或 kill。
+			this.sm.rollback(id, "stopping", "running");
+			this.deps.onChange?.();
+			throw e;
+		}
 		this.deps.onChange?.();
 		setTimeout(() => {
+			if (this.handles.get(id) !== generation) return;
 			const rec = this.sm.records.get(id);
 			if (!rec || rec.state !== "stopping") return;
 			const handle = this.handles.get(id);
@@ -209,6 +230,7 @@ export class WorkerManager {
 				// abort 失败(管道断/进程死):状态机已由 watcher 转移到 failed/exited,无需动作
 			});
 			setTimeout(() => {
+				if (this.handles.get(id) !== generation) return;
 				const rec2 = this.sm.records.get(id);
 				if (!rec2 || rec2.state !== "stopping") return;
 				const handle2 = this.handles.get(id);
@@ -244,7 +266,16 @@ export class WorkerManager {
 		// follow_up RPC 只排队不触发:agent 空闲时队列无消费者(running 时入队才会在
 		// 本轮结束后自动接续)。本状态机 follow_up 仅合法于 idle,故映射 prompt
 		// (idle 时立即触发新一轮)——语义同为追加轮次,不产生空窗。
-		await this.sendCmd(id, { type: "prompt", message }, "follow_up");
+		try {
+			await this.sendCmd(id, { type: "prompt", message }, "follow_up");
+		} catch (e) {
+			// prompt 没落地 ⇒ 新一轮没起来,子仍 idle。若留在 running:settled 永不
+			// 到达(无 turn 可结束),message 走 steer 入无消费者的队列,collect 被拒——
+			// 只剩 kill 可逃。回退 idle 保住 message/collect 两条正常出路。
+			this.sm.rollback(id, "running", "idle");
+			this.deps.onChange?.();
+			throw e;
+		}
 		this.deps.onChange?.();
 	}
 
@@ -264,12 +295,80 @@ export class WorkerManager {
 		}
 	}
 
-	/** collect:父验收后收尾,终止进程并释放。 */
-	collect(id: string): void {
+	/** collect:父验收后收尾,终止进程并释放。verdict = 终审结论(工具参数面,
+	 * 落记录供 status 审计);非法状态抛错(fail fast),不落 verdict。 */
+	collect(id: string, verdict?: CollectVerdict): void {
 		this.sm.collect(id);
+		const rec = this.sm.records.get(id);
+		if (rec && verdict) rec.verdict = verdict;
 		const handle = this.handles.get(id);
 		if (handle) terminate(handle.proc);
+		// 收起标记落 session 尾部:恢复去重(不复活),审计保留(不删文件);
+		// 标记失败仅影响去重——下次重启重新浮现,可再 collect,不阻塞收尾
+		if (rec?.sessionFile && existsSync(rec.sessionFile)) {
+			try {
+				appendFileSync(
+					rec.sessionFile,
+					JSON.stringify({
+						type: "custom",
+						customType: COLLECTED_MARKER,
+						id: "worker-collect",
+						parentId: null,
+						timestamp: new Date().toISOString(),
+						data: verdict ? { verdict } : {},
+					}) + "\n",
+				);
+			} catch {
+				// 见上注释:去重降级,不 fail 收尾
+			}
+		}
 		this.deps.onChange?.();
+	}
+
+	/** 遗留检测(只读):启动时调用,不建记录——认领是显式动作(pi_worker recover)。 */
+	async scanLeftovers(cwd: string): Promise<ScanResult> {
+		return scanWorkerSessions(workerSessionDir(cwd), { pid: process.pid, pidAlive: defaultPidAlive });
+	}
+
+	/**
+	 * 显式认领(pi_worker action=recover / 测试直接调用):worker-sessions 目录即
+	 * registry(single source of truth,零并行文件)。
+	 * jsonl → exited × recovered 显式状态组合记录,进 records 供 status/pane 审计;
+	 * 幂等(在册 id 跳过,reload 安全)。认领即 quiet 留痕(不烧父轮次),
+	 * 丢弃范围(skipped/heldElsewhere)随留痕显式声明。
+	 */
+	async recoverFromDisk(
+		cwd: string,
+		opts?: { claim?: (id: string) => boolean },
+	): Promise<{ recovered: number; skippedFiles: string[]; heldElsewhere: string[]; foreign: RecoveredSession[] }> {
+		const { sessions, skipped, heldElsewhere } = await scanWorkerSessions(workerSessionDir(cwd), {
+			pid: process.pid,
+			pidAlive: defaultPidAlive,
+		});
+		const ids: string[] = [];
+		const foreign: RecoveredSession[] = [];
+		for (const s of sessions) {
+			if (this.sm.records.has(s.id)) continue;
+			if (opts?.claim && !opts.claim(s.id)) {
+				foreign.push(s); // 非本会话:不建记录,由调用方给新会话指引
+				continue;
+			}
+			this.sm.recover(s);
+			ids.push(s.id);
+		}
+		if (ids.length > 0) {
+			const parts = [`认领 ${ids.length} 个遗留 worker(state=exited,最后状态未知,以 jsonl 为准)`];
+			if (ids.length > 0) parts.push(ids.join(", "));
+			if (skipped.length > 0) parts.push(`跳过不可解析文件: ${skipped.join(", ")}`);
+			if (heldElsewhere.length > 0) parts.push(`另有 ${heldElsewhere.length} 个由其他活窗口持有(未认领): ${heldElsewhere.join(", ")}`);
+			parts.push("status 审计,collect 清理");
+			this.deps.deliver(
+				{ customType: CALLBACK_TYPE, content: parts.join(";"), details: { type: "recovery", id: "recovery" } },
+				{ quiet: true },
+			);
+		}
+		if (ids.length > 0) this.deps.onChange?.();
+		return { recovered: ids.length, skippedFiles: skipped, heldElsewhere, foreign };
 	}
 
 	/** kill:撤换。abort(停止当前 turn)+ 终止进程;进程退出后状态 → done。 */
@@ -322,6 +421,7 @@ export class WorkerManager {
 							exitCode: rec.exitCode ?? null,
 							exitSignal: rec.exitSignal ?? null,
 							stderrTail: ev.stderrTail || handle?.rpc.spawnError || "",
+							sessionFile: rec.sessionFile,
 						}),
 					);
 					this.dropHandle(id);
@@ -349,6 +449,15 @@ export class WorkerManager {
 				pushRecent(rec, `start:${ev.toolName} ${ev.args}`);
 				return;
 			}
+			case "activity": {
+				// 阶段词汇(retrying/compacting):set 覆写;end 只清同 phase,不误清 tool 活动
+				const rec = this.sm.records.get(id);
+				if (!rec) return;
+				if (ev.label) rec.currentActivity = ev.label;
+				else if (rec.currentActivity?.startsWith(ev.phase)) rec.currentActivity = undefined;
+				this.deps.onChange?.();
+				return;
+			}
 			case "toolEnd": {
 				const rec = this.sm.records.get(id);
 				if (!rec) return;
@@ -360,16 +469,28 @@ export class WorkerManager {
 			}
 			case "dialog": {
 				// 子进程 extension 的 dialog 会阻塞等 response;不回 = 永久挂起(僵尸)。
-				// 统一回 cancelled,不替父决策。句柄缺失 = invariant 破坏,静默会埋雷。
+				// 统一回 cancelled,不替父决策。句柄缺失 = invariant 破坏:事件流上 throw
+				// 无捕获者(父进程 uncaughtException),改 deliver 诊断,不 crash 不静默。
 				const handle = this.handles.get(id);
-				if (!handle) throw new WorkerError(`dialog 回应失败: ${id} 进程句柄缺失(invariant 破坏)`);
+				if (!handle) {
+					this.deps.deliver(
+						formatCallback({
+							type: "failed",
+							id,
+							exitCode: null,
+							exitSignal: null,
+							stderrTail: "dialog 回应失败:进程句柄缺失(invariant 破坏);已忽略该 dialog",
+						}),
+					);
+					return;
+				}
 				handle.rpc.writeRaw({ type: "extension_ui_response", id: ev.id, cancelled: true });
 				return;
 			}
 		}
 	}
 
-	/** settled 反应:取呈报与用量 → 投递回调;oneshot 自动 collect。 */
+	/** settled 反应:取呈报与用量 → 投递回调;父验收后显式 collect。 */
 	private async handleSettled(id: string): Promise<void> {
 		this.sm.onSettled(id);
 		this.deps.onChange?.();
@@ -401,9 +522,8 @@ export class WorkerManager {
 		rec.report = report;
 
 		this.deps.deliver(
-			formatCallback({ type: "settled", id, name: rec.name, role: rec.role, report, reportError, stats, turns: rec.turns }),
+			formatCallback({ type: "settled", id, name: rec.name, report, reportError, stats, turns: rec.turns, sessionFile: rec.sessionFile }),
 		);
-		if (rec.oneshot) this.collect(id);
 	}
 
 	status(id?: string): WorkerRecord | WorkerRecord[] {
@@ -433,15 +553,10 @@ export class WorkerManager {
 					const state = (await handle.rpc.send({ type: "get_state" }, { timeoutMs: 5000 })) as {
 						model?: { provider?: string; id?: string } | null;
 						thinkingLevel?: string;
+						sessionFile?: string;
 					};
 					const rec = this.sm.records.get(id);
-					if (rec && state.model?.id) {
-						rec.modelInfo = {
-							provider: state.model.provider ?? "",
-							id: state.model.id,
-							thinkingLevel: state.thinkingLevel ?? "",
-						};
-					}
+					if (rec) applyHandshakeState(rec, state);
 				} catch {
 					// 子进程不可达,跳过
 				}

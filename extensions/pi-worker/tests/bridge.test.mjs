@@ -5,12 +5,11 @@ import { formatCallback, CALLBACK_TYPE } from "../src/bridge.ts";
 
 /** settled 回调:首行摘要保留(兼容既有解析),XML 模板注入结构化字段供父机器断言。 */
 describe("formatCallback settled XML 注入", () => {
-	test("完整字段:id/name/role/status/turns/usage(tool_calls/tokens/cost),report 全文在 <report> 内", () => {
+	test("完整字段:id/name/status/turns/usage(tool_calls/tokens/cost),report 全文在 <report> 内", () => {
 		const msg = formatCallback({
 			type: "settled",
 			id: "pi-worker-hank#aaaaaa",
 			name: "hank",
-			role: "检查者",
 			report: "改动:修复空指针\n证据:测试通过\n遗留:无",
 			stats: { tokens: { input: 8200, output: 4100, cacheRead: 3400, cacheWrite: 1200, total: 16900 }, toolCalls: 4, cost: 0.0042 },
 			turns: 3,
@@ -20,7 +19,6 @@ describe("formatCallback settled XML 注入", () => {
 		assert.match(msg.content, /<worker-settled>/);
 		assert.match(msg.content, /<id>pi-worker-hank#aaaaaa<\/id>/);
 		assert.match(msg.content, /<name>hank<\/name>/);
-		assert.match(msg.content, /<role>检查者<\/role>/);
 		assert.match(msg.content, /<status>settled<\/status>/);
 		assert.match(msg.content, /<turns>3<\/turns>/);
 		assert.match(msg.content, /<tool_calls>4<\/tool_calls>/);
@@ -30,7 +28,6 @@ describe("formatCallback settled XML 注入", () => {
 		assert.match(msg.content, /<\/worker-settled>$/);
 		// details 保持机器字段(渲染层依赖 details.report 纯文本,不受注入影响)
 		assert.equal(msg.details.report, "改动:修复空指针\n证据:测试通过\n遗留:无");
-		assert.equal(msg.details.role, "检查者");
 		assert.equal(msg.details.turns, 3);
 	});
 
@@ -57,11 +54,10 @@ describe("formatCallback settled XML 注入", () => {
 		assert.match(msg.content, /<name>a&lt;b&gt;&amp;c<\/name>/);
 	});
 
-	test("无 stats 无 turns 无 role → 无 <usage> <turns> <role> 段,仅 id/name/status/report", () => {
+	test("无 stats 无 turns → 无 <usage> <turns> 段,仅 id/name/status/report", () => {
 		const msg = formatCallback({ type: "settled", id: "pi-worker-hank#aaaaaa", name: "hank", report: "r" });
 		assert.ok(!msg.content.includes("<usage>"));
 		assert.ok(!msg.content.includes("<turns>"));
-		assert.ok(!msg.content.includes("<role>"));
 		assert.match(msg.content, /<status>settled<\/status>/);
 		assert.match(msg.content, /<report>\nr\n<\/report>/);
 	});
@@ -93,5 +89,27 @@ describe("formatCallback failed(回归:不变)", () => {
 		const msg = formatCallback({ type: "failed", id: "pi-worker-hank#aaaaaa", exitCode: 2, exitSignal: null, stderrTail: "boom" });
 		assert.equal(msg.content, "failed id=pi-worker-hank#aaaaaa exit=2 stderr=boom");
 		assert.equal(msg.details.exitCode, 2);
+	});
+});
+
+describe("formatCallback sessionFile(原生审计指针)", () => {
+	const SESSION = "/repo/.pi/worker-sessions/x.jsonl";
+
+	test("settled 带 sessionFile → details 机器字段 + content 行携带路径", () => {
+		const msg = formatCallback({ type: "settled", id: "pi-worker-hank#aaaaaa", name: "hank", report: "r", sessionFile: SESSION });
+		assert.equal(msg.details.sessionFile, SESSION);
+		assert.ok(msg.content.includes(` session=${SESSION}`), msg.content);
+	});
+
+	test("无 sessionFile(握手未成)→ details 无字段,content 行不变", () => {
+		const msg = formatCallback({ type: "settled", id: "pi-worker-hank#aaaaaa", name: "hank", report: "r" });
+		assert.ok(!("sessionFile" in msg.details));
+		assert.ok(!msg.content.includes("session="));
+	});
+
+	test("failed 带 sessionFile → details + content 行携带", () => {
+		const msg = formatCallback({ type: "failed", id: "pi-worker-hank#aaaaaa", exitCode: 2, exitSignal: null, stderrTail: "boom", sessionFile: SESSION });
+		assert.equal(msg.details.sessionFile, SESSION);
+		assert.ok(msg.content.includes(` session=${SESSION}`));
 	});
 });

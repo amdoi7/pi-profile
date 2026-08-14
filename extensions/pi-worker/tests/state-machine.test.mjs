@@ -6,9 +6,9 @@ import { WorkerStateMachine, WorkerError } from "../src/state-machine.ts";
 const ID = "pi-worker-hank#abc123";
 
 /** run + 握手完成 → running */
-function make(id = ID, oneshot = false) {
+function make(id = ID) {
 	const sm = new WorkerStateMachine();
-	sm.run({ id, name: "hank", oneshot });
+	sm.run({ id, name: "hank" });
 	sm.onStarted(id);
 	return sm;
 }
@@ -31,11 +31,10 @@ function expectWorkerError(fn, ...needles) {
 
 test("run: ∅→starting,记录字段齐全", () => {
 	const sm = new WorkerStateMachine();
-	const rec = sm.run({ id: ID, name: "hank", oneshot: true });
+	const rec = sm.run({ id: ID, name: "hank" });
 	assert.equal(rec.state, "starting");
 	assert.equal(rec.id, ID);
 	assert.equal(rec.name, "hank");
-	assert.equal(rec.oneshot, true);
 	assert.ok(rec.createdAt > 0);
 });
 
@@ -123,11 +122,13 @@ test("steer: terminal 非法", () => {
 	expectWorkerError(() => sm.steer(ID), "id 已 failed", "重新 run");
 });
 
-test("steer: exited 非法", () => {
+test("steer: exited 非法,提示唯一出路 collect 清账", () => {
 	const sm = make();
 	sm.onSettled(ID);
 	sm.onExit(ID, { code: 0, signal: null }); // idle→exited
-	expectWorkerError(() => sm.steer(ID), "id 已 exited", "重新 run 或 collect");
+	const e = expectWorkerError(() => sm.steer(ID), "id 已 exited", "collect 清账");
+	// 提示不得指向非法动作:exited 上 run 被拒(非终态),kill 非法
+	assert.ok(!e.message.includes("重新 run"), `message "${e.message}" names illegal action 重新 run`);
 });
 
 test("steer: 未知 id,列存活", () => {
@@ -212,11 +213,12 @@ test("follow_up: terminal 非法", () => {
 	expectWorkerError(() => sm.followUp(ID), "id 已 done", "重新 run");
 });
 
-test("follow_up: exited 非法(进程已退出)", () => {
+test("follow_up: exited 非法(进程已退出),提示唯一出路 collect 清账", () => {
 	const sm = make();
 	sm.onSettled(ID);
 	sm.onExit(ID, { code: 0, signal: null }); // idle→exited
-	expectWorkerError(() => sm.followUp(ID), "id 已 exited", "重新 run 或 collect");
+	const e = expectWorkerError(() => sm.followUp(ID), "id 已 exited", "collect 清账");
+	assert.ok(!e.message.includes("重新 run"), `message "${e.message}" names illegal action 重新 run`);
 });
 
 // ---------- collect ----------
@@ -269,11 +271,28 @@ test("kill: terminal 非法", () => {
 	expectWorkerError(() => sm.kill(ID), "id 已 failed");
 });
 
-test("kill: exited 非法", () => {
+test("kill: exited 非法,提示唯一出路 collect 清账", () => {
 	const sm = make();
 	sm.onSettled(ID);
 	sm.onExit(ID, { code: 0, signal: null });
-	expectWorkerError(() => sm.kill(ID), "id 已 exited");
+	const e = expectWorkerError(() => sm.kill(ID), "id 已 exited", "collect 清账");
+	assert.ok(!e.message.includes("重新 run"), `message "${e.message}" names illegal action 重新 run`);
+});
+
+test("stop: exited 非法,提示唯一出路 collect 清账", () => {
+	const sm = make();
+	sm.onSettled(ID);
+	sm.onExit(ID, { code: 0, signal: null });
+	const e = expectWorkerError(() => sm.stop(ID), "id 已 exited", "collect 清账");
+	assert.ok(!e.message.includes("重新 run"), `message "${e.message}" names illegal action 重新 run`);
+});
+
+test("run: exited 记录拒绝,提示 collect 清账(kill 在 exited 非法,不得出现)", () => {
+	const sm = make();
+	sm.onSettled(ID);
+	sm.onExit(ID, { code: 0, signal: null });
+	const e = expectWorkerError(() => sm.run({ id: ID, name: "hank" }), "已存在且未终结", "collect 清账");
+	assert.ok(!e.message.includes("或 kill"), `message "${e.message}" names illegal action kill`);
 });
 
 // ---------- 事件 ----------
@@ -367,15 +386,6 @@ test("status: 缺省列全部;未知 id 列存活", () => {
 	expectWorkerError(() => sm.status("pi-worker-nobody#000000"), "id 不存在", "存活: pi-worker-hank#abc123, pi-worker-rin#000001");
 });
 
-// ---------- oneshot ----------
-
-test("oneshot: report 回调后 collect → done", () => {
-	const sm = make("pi-worker-once#111111", true);
-	sm.onSettled("pi-worker-once#111111");
-	sm.collect("pi-worker-once#111111"); // auto-collect
-	assert.equal(sm.records.get("pi-worker-once#111111").state, "done");
-});
-
 test("kill→exit→done 全链路", () => {
 	const sm = make();
 	sm.kill(ID);
@@ -384,3 +394,85 @@ test("kill→exit→done 全链路", () => {
 	assert.equal(sm.records.get(ID).state, "done");
 });
 
+// ---------- recover(启动恢复:jsonl 重建遗留记录) ----------
+
+const RECOVER_INPUT = {
+	id: "pi-worker-hank#0123456789ab",
+	name: "hank",
+	sessionFile: "/repo/.pi/worker-sessions/a.jsonl",
+	createdAt: 100,
+	updatedAt: 200,
+};
+
+test("recover: ∅→exited,显式状态组合(state × recovered provenance),无进程句柄", () => {
+	const sm = new WorkerStateMachine();
+	const rec = sm.recover(RECOVER_INPUT);
+	assert.equal(rec.state, "exited");
+	assert.equal(rec.recovered, true);
+	assert.equal(rec.processExited, true);
+	assert.equal(rec.sessionFile, RECOVER_INPUT.sessionFile);
+	assert.equal(rec.createdAt, 100);
+	assert.equal(rec.updatedAt, 200);
+});
+
+test("recover: 幂等——在册 id 不覆盖(live 记录优先)", () => {
+	const sm = new WorkerStateMachine();
+	sm.run({ id: RECOVER_INPUT.id, name: "hank" });
+	const rec = sm.recover({ ...RECOVER_INPUT, updatedAt: 999 });
+	assert.equal(rec.state, "starting", "在册记录不被恢复覆盖");
+	assert.equal(rec.updatedAt !== 999, true);
+});
+
+test("recover: 遗留记录合法集 = exited 同集(collect → done;steer 非法)", () => {
+	const sm = new WorkerStateMachine();
+	sm.recover(RECOVER_INPUT);
+	expectWorkerError(() => sm.steer(RECOVER_INPUT.id), "已 exited");
+	sm.collect(RECOVER_INPUT.id);
+	assert.equal(sm.status(RECOVER_INPUT.id).state, "done");
+});
+
+test("recover: 遗留 exited 非终态——同合约重派被挡,错误指向 collect", () => {
+	const sm = new WorkerStateMachine();
+	sm.recover(RECOVER_INPUT);
+	expectWorkerError(() => sm.run({ id: RECOVER_INPUT.id, name: "hank" }), "未终结", "collect");
+});
+
+// ---------- rollback(乐观迁移的补偿:CAS) ----------
+
+test("rollback: 状态仍是本次写入值 → 回退到 from", () => {
+	const sm = make();
+	sm.onSettled(ID); // → idle
+	sm.followUp(ID); // idle → running(乐观)
+	sm.rollback(ID, "running", "idle");
+	assert.equal(sm.status(ID).state, "idle", "效果未落地 → 状态回到 idle");
+});
+
+test("rollback: 期间进程已死 → 不覆盖 failed(异步事实优先于补偿)", () => {
+	const sm = make();
+	sm.onSettled(ID);
+	sm.followUp(ID);
+	sm.onExit(ID, { code: 1, signal: null }); // running → failed
+	sm.rollback(ID, "running", "idle");
+	assert.equal(sm.status(ID).state, "failed");
+});
+
+test("rollback: 期间已 settled → 不覆盖 idle", () => {
+	const sm = make();
+	sm.stop(ID); // running → stopping
+	sm.onSettled(ID); // stopping → idle
+	sm.rollback(ID, "stopping", "running");
+	assert.equal(sm.status(ID).state, "idle");
+});
+
+test("rollback: 期间被 kill → 不覆盖 killing", () => {
+	const sm = make();
+	sm.stop(ID);
+	sm.kill(ID); // stopping → killing
+	sm.rollback(ID, "stopping", "running");
+	assert.equal(sm.status(ID).state, "killing");
+});
+
+test("rollback: 不存在的 id → 静默忽略(补偿路径不抛错)", () => {
+	const sm = new WorkerStateMachine();
+	sm.rollback("pi-worker-ghost#000000", "running", "idle");
+});

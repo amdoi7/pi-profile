@@ -8,6 +8,10 @@ export interface ExitInfo {
 	stderrTail?: string;
 }
 
+/** exited 的唯一合法出路:collect(kill/steer/follow_up 非法,run 因非终态被拒)。
+ * 提示文案与合法动作集同构——不得指名字典外动作。 */
+const EXITED_HINT = "唯一出路 collect 清账;清账后可按原合约重派";
+
 /**
  * 纯状态机:事件流 → 状态迁移 + action 合法性校验。无副作用,无进程知识。
  *
@@ -32,11 +36,13 @@ export class WorkerStateMachine {
 	/** run:∅→starting。id 未终结时拒绝(同合约同 id 的并发分发是调用方 bug)。
 	 * 替换 terminal(failed/done)记录时继承上次失败诊断——status 可回溯;
 	 * 回调已送达父、磁盘 jsonl 在,内存只留 last-known。 */
-	run(input: { id: string; name: string; oneshot?: boolean }): WorkerRecord {
+	run(input: { id: string; name: string }): WorkerRecord {
 		const existing = this.records.get(input.id);
 		if (existing && !TERMINAL_STATES.includes(existing.state)) {
+			// exited 上 kill 非法,通用「先 collect 或 kill」会指到死路;按状态给真实出路
+			const way = existing.state === "exited" ? EXITED_HINT : "先 collect 或 kill";
 			throw new WorkerError(
-				`id 已存在且未终结: ${input.id};先 collect 或 kill,或修改合约生成新 id`,
+				`id 已存在且未终结: ${input.id};${way},或修改合约生成新 id`,
 			);
 		}
 		const now = Date.now();
@@ -44,7 +50,6 @@ export class WorkerStateMachine {
 			id: input.id,
 			name: input.name,
 			state: "starting",
-			oneshot: input.oneshot ?? false,
 			processExited: false,
 			createdAt: now,
 			updatedAt: now,
@@ -56,6 +61,32 @@ export class WorkerStateMachine {
 			rec.exitCode = existing.exitCode;
 			rec.exitSignal = existing.exitSignal;
 		}
+		this.records.set(input.id, rec);
+		return rec;
+	}
+
+	/**
+	 * recover:persisted(stateless jsonl)→ live(stateful record),∅→exited
+	 * (最后 live 状态未知,无进程句柄)。
+	 * 显式状态组合:state=exited(合法集只剩 collect/status)× recovered provenance;
+	 * 不新增 unknown 态——那会复制 exited 的合法动作集,一个概念裂成两个词。
+	 * 幂等:在册 id 不覆盖(live 记录优先)。
+	 */
+	recover(input: { id: string; name: string; sessionFile: string; createdAt: number; updatedAt: number }): WorkerRecord {
+		const existing = this.records.get(input.id);
+		if (existing) return existing;
+		const rec: WorkerRecord = {
+			id: input.id,
+			name: input.name,
+			state: "exited",
+			processExited: true,
+			recovered: true,
+			sessionFile: input.sessionFile,
+			createdAt: input.createdAt,
+			updatedAt: input.updatedAt,
+			recent: [],
+			turns: 0,
+		};
 		this.records.set(input.id, rec);
 		return rec;
 	}
@@ -103,7 +134,7 @@ export class WorkerStateMachine {
 			stopping: "已 stop,steer 无意义;等 settled 或 kill",
 			starting: "等待启动完成",
 			terminal: "无法 steer;重新 run",
-			exited: "无法 steer;重新 run 或 collect",
+			exited: EXITED_HINT,
 		});
 		this.touch(id);
 	}
@@ -115,7 +146,7 @@ export class WorkerStateMachine {
 			idle: "无需 stop;用 message 或 collect",
 			starting: "等待启动完成",
 			terminal: "无需 stop",
-			exited: "无法 stop;重新 run 或 collect",
+			exited: EXITED_HINT,
 		});
 		rec.state = "stopping";
 		this.touch(id);
@@ -128,9 +159,23 @@ export class WorkerStateMachine {
 			stopping: "已 stop,等 settled",
 			starting: "等待启动完成",
 			terminal: "无法 follow_up;重新 run",
-			exited: "无法 follow_up;重新 run 或 collect",
+			exited: EXITED_HINT,
 		});
 		rec.state = "running";
+		this.touch(id);
+	}
+
+	/**
+	 * 乐观迁移的补偿:效果(RPC)未落地时把状态放回去。
+	 *
+	 * CAS 语义——仅当状态仍是本次迁移写入的 `from` 才回退。await 期间到达的
+	 * 异步事件(onExit/onSettled/kill)是比补偿更新的事实,已改写状态则让位。
+	 * 无迁移可补偿(记录已消失)时静默返回:补偿路径不产生新的失败。
+	 */
+	rollback(id: string, from: WorkerState, to: WorkerState): void {
+		const rec = this.records.get(id);
+		if (!rec || rec.state !== from) return;
+		rec.state = to;
 		this.touch(id);
 	}
 
@@ -150,7 +195,7 @@ export class WorkerStateMachine {
 	kill(id: string): void {
 		const rec = this.requireState(id, ["starting", "running", "stopping", "idle"], {
 			terminal: "无法 kill",
-			exited: "无法 kill;重新 run 或 collect",
+			exited: EXITED_HINT,
 		});
 		rec.state = "killing";
 		this.touch(id);

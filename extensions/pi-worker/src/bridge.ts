@@ -9,13 +9,13 @@ export type CallbackEvent =
 			type: "settled";
 			id: string;
 			name: string;
-			/** run 合约角色标注(自由文本);仅指定时输出 <role>,缺省省略 */
-			role?: string;
 			report: string;
 			reportError?: string;
 			stats?: unknown;
 			/** 完成轮数(摘要行 ⎿ N turns) */
 			turns?: number;
+			/** 子会话 jsonl 路径(pi 原生 get_state;审计指针,握手未成则无) */
+			sessionFile?: string;
 	  }
 	| {
 			type: "failed";
@@ -23,6 +23,8 @@ export type CallbackEvent =
 			exitCode: number | null;
 			exitSignal: string | null;
 			stderrTail: string;
+			/** 子会话 jsonl 路径(同上,握手未成则无) */
+			sessionFile?: string;
 	  };
 
 export interface CallbackMessage {
@@ -54,9 +56,8 @@ function formatSettledContent(ev: Extract<CallbackEvent, { type: "settled" }>): 
 	const name = xmlEscape(ev.name);
 	const report =
 		ev.report || (ev.reportError ? `(呈报获取失败: ${ev.reportError})` : "(无呈报)");
-	const lines = [`settled id=${ev.id} name=${ev.name}`, "<worker-settled>"];
+	const lines = [`settled id=${ev.id} name=${ev.name}${ev.sessionFile ? ` session=${ev.sessionFile}` : ""}`, "<worker-settled>"];
 	lines.push(`<id>${id}</id>`, `<name>${name}</name>`);
-	if (ev.role) lines.push(`<role>${xmlEscape(ev.role)}</role>`);
 	lines.push("<status>settled</status>");
 	if (typeof ev.turns === "number") lines.push(`<turns>${ev.turns}</turns>`);
 	const stats = (ev.stats ?? {}) as {
@@ -90,24 +91,26 @@ export function formatCallback(ev: CallbackEvent): CallbackMessage {
 				type: "settled",
 				id: ev.id,
 				name: ev.name,
-				role: ev.role,
 				report: ev.report,
 				reportError: ev.reportError,
 				stats: ev.stats,
 				turns: ev.turns,
+				...(ev.sessionFile !== undefined ? { sessionFile: ev.sessionFile } : {}),
 			},
 		};
 	}
 	const stderr = ev.stderrTail ? ` stderr=${ev.stderrTail}` : "";
+	const session = ev.sessionFile ? ` session=${ev.sessionFile}` : "";
 	return {
 		customType: CALLBACK_TYPE,
-		content: `failed id=${ev.id} exit=${ev.exitCode ?? ev.exitSignal ?? "?"}${stderr}`,
+		content: `failed id=${ev.id} exit=${ev.exitCode ?? ev.exitSignal ?? "?"}${stderr}${session}`,
 		details: {
 			type: "failed",
 			id: ev.id,
 			exitCode: ev.exitCode,
 			exitSignal: ev.exitSignal,
 			stderrTail: ev.stderrTail,
+			...(ev.sessionFile !== undefined ? { sessionFile: ev.sessionFile } : {}),
 		},
 	};
 }

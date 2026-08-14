@@ -1,14 +1,16 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { buildWorkerCharter } from "./contract.ts";
+import { buildWorkerPreamble, WORKER_TOOL_ALLOWLIST, workerSessionDir } from "./contract.ts";
 
 export interface SpawnOptions {
 	cwd: string;
-	sessionDir: string;
 	id: string;
 	name: string;
 	model?: string;
 	thinking?: string;
+	/** run 合约归一化工具面;缺省 = WORKER_TOOL_ALLOWLIST */
+	tools?: string;
 }
 
 const TERMINATE_GRACE_MS = 2000;
@@ -17,37 +19,30 @@ const TERMINATE_GRACE_MS = 2000;
 const SELF_INDEX_PATH = fileURLToPath(new URL("../index.ts", import.meta.url));
 
 /**
- * 子进程工具白名单:基础工作面(read/bash/edit/write)+ 通信(send_message)。
- * 排除父环境的扩展工具(pi_worker/uv 等)——worker 不需要,且限面即安全。
- */
-const WORKER_TOOL_ALLOWLIST = "read,bash,edit,write,send_message";
-
-/**
- * 子 pi 进程 spawn 参数(纯组装,可单测)。借鉴 pi CLI 注入面做 worker 瘦身:
- * - --no-skills / --no-context-files:worker 不加载父的 skills/AGENTS.md,
- *   治理由 --append-system-prompt 注入的 worker 宪法(buildWorkerCharter)承担;
+ * 子 pi 进程 spawn 参数(纯组装,可单测)。pi CLI 注入面:
+ * - AGENTS.md 链/SYSTEM.md/skills 均由 pi 机制加载(与父同),不进 preamble;
  * - --no-extensions -e <自身>:子进程只加载 pi-worker 自身(send_message),
  *   不加载父的扩展列表(btw/context-ui/custom-footer 等,rpc 模式无 UI);
  * - -t 白名单:限制工具面(上下文 + 安全);
- * - --append-system-prompt:worker 宪法(身份/四要素/先回执/失败归因/事实核验)。
+ * - --session-dir:审计目录内置约定 <cwd>/.pi/worker-sessions/p<父pid>
+ *   (归属命名空间:恢复按目录判定所有者,同 cwd 多窗口互不认领)。
  */
 export function buildSpawnArgs(opts: SpawnOptions): string[] {
+	const preamble = preambleOverride(() => buildWorkerPreamble({ name: opts.name, id: opts.id }));
 	const args = [
 		"--mode",
 		"rpc",
 		"--session-dir",
-		opts.sessionDir,
+		workerSessionDir(opts.cwd, process.pid),
 		"--name",
 		opts.id,
-		"--no-skills",
-		"--no-context-files",
 		"--no-extensions",
 		"-e",
 		SELF_INDEX_PATH,
 		"-t",
-		WORKER_TOOL_ALLOWLIST,
+		opts.tools ?? WORKER_TOOL_ALLOWLIST,
 		"--append-system-prompt",
-		buildWorkerCharter({ name: opts.name, id: opts.id, sessionDir: opts.sessionDir }),
+		preamble,
 	];
 	if (opts.model) args.push("--model", opts.model);
 	if (opts.thinking) args.push("--thinking", opts.thinking);
@@ -64,6 +59,13 @@ export function spawnChild(opts: SpawnOptions): ChildProcess {
 		env: { ...process.env, PI_WORKER_CHILD: "1" },
 		stdio: ["pipe", "pipe", "pipe"],
 	});
+}
+
+/** 拟合循环 A/B 钩子:PI_WORKER_PREAMBLE_FILE 设置时以其文件内容整体替换
+ * buildWorkerPreamble(仅 eval 对照实验用;生产环境不设,缺省走 charter)。 */
+function preambleOverride(fallback: () => string): string {
+	const f = process.env.PI_WORKER_PREAMBLE_FILE;
+	return f ? readFileSync(f, "utf8").trim() : fallback();
 }
 
 /** SIGTERM,宽限期后 SIGKILL。对已退出进程无操作。 */

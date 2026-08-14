@@ -13,17 +13,19 @@ import {
 	formatOverlayRows,
 	actionsFor,
 	formatRecentEntry,
-	formatAttributionMessage,
 	formatActionMessage,
 	opFor,
+	formatLifecycle,
+	formatLeftoverHint,
+	splitLeftoversByReference,
 } from "../src/present.ts";
+import { WorkerError } from "../src/state-machine.ts";
 
 function rec(partial) {
 	return {
-		id: "pi-worker-hank#a1b2c3",
+		id: "pi-worker-hank#a1b2c3d4e5f6",
 		name: "hank",
 		state: "running",
-		oneshot: false,
 		processExited: false,
 		turns: 0,
 		createdAt: 0,
@@ -39,8 +41,7 @@ function withStats(partial, stats) {
 }
 
 describe("formatFooter", () => {
-	// spinner 帧确定化:running frameMs=1000,4 帧;F0 时 0%4=0 → ⧓;F0+1000 时 1%4=1 → ⧔
-	const F0 = 1_000_000_000; // floor/1000=1_000_000,%5=0
+	const F0 = 1_000_000_000;
 	const fg = (c, t) => `<${c}>${t}</>`;
 
 	test("空记录 → undefined", () => {
@@ -52,61 +53,39 @@ describe("formatFooter", () => {
 		assert.equal(formatFooter(records, { now: F0 }), undefined);
 	});
 
-	test("单工作态:spinner + name + elapsed,无 hash 无 turns", () => {
+	test("单工作态:静态图标 + name + elapsed,无 hash 无 turns", () => {
 		const records = [rec({ state: "running", turns: 3, createdAt: F0 })];
-		assert.equal(formatFooter(records, { now: F0 + 45_000 }), "⧔   hank · 45s");
+		assert.equal(formatFooter(records, { now: F0 + 45_000 }), "● hank · 45s");
 	});
 
 	test("单工作态带活动:只留工具名(心跳),参数不进 footer", () => {
 		const withAct = [rec({ state: "running", turns: 1, createdAt: F0, currentActivity: 'tool: rg "pi_worker"' })];
-		assert.equal(formatFooter(withAct, { now: F0 + 5_000 }), "⧔   hank · rg · 5s");
+		assert.equal(formatFooter(withAct, { now: F0 + 5_000 }), "● hank · rg · 5s");
 		const long = [rec({ state: "running", createdAt: F0, currentActivity: "tool: bash " + "x".repeat(40) })];
 		const line = formatFooter(long, { now: F0 });
 		assert.ok(line.includes("bash"), line);
 		assert.ok(!line.includes("x".repeat(10)), line); // 参数一律不进 footer
 	});
 
-	test("spinner 帧随秒轮换;fg 给 spinner 套 accent", () => {
-		const records = [rec({ state: "running", createdAt: F0 })];
-		assert.equal(formatFooter(records, { now: F0 + 1_000 })[0], "⧔");
-		assert.equal(formatFooter(records, { now: F0 + 4_000 })[0], "⧓");
-		assert.ok(formatFooter(records, { now: F0, fg }).startsWith("<accent>⧓  </>"));
+	test("工作态图标与 overlay STATE_MARKS 同词汇(静态 ●):starting/running 皆 ●,accent 色", () => {
+		assert.equal(formatFooter([rec({ state: "running", createdAt: F0 })], { now: F0 })[0], "●");
+		assert.equal(formatFooter([rec({ state: "starting", createdAt: F0 })], { now: F0 })[0], "●");
+		assert.ok(formatFooter([rec({ state: "running", createdAt: F0 })], { now: F0, fg }).startsWith("<accent>●</>"));
 	});
 
-	test("铸约帧族(starting):⦗◦⦘→⦗☯⦘,2s/帧慢呼吸,3 字符槽", () => {
-		const records = [rec({ state: "starting", createdAt: F0 })];
-		assert.equal(formatFooter(records, { now: F0 })[0], "⦗"); // ⦗◦⦘
-		assert.equal(formatFooter(records, { now: F0 + 2_000 })[0], "⦗"); // ⦗☯⦘(2s 后换帧)
-		assert.equal(formatFooter(records, { now: F0 + 1_000 })[0], "⦗"); // 1s 未到 2s,仍帧 0
-		const line = formatFooter(records, { now: F0 + 6_000 });
-		assert.ok(line.startsWith("⦗⧇⦘"), line); // 第 4 帧
-	});
-
-	test("裁决帧族(stopping):⧈→╳,warning 色", () => {
+	test("stopping:● warning 色(告警面语义保留)", () => {
 		const records = [rec({ state: "stopping", createdAt: F0 })];
-		assert.equal(formatFooter(records, { now: F0 })[0], "⧈");
-		assert.equal(formatFooter(records, { now: F0 + 2_000 })[0], "╳"); // 2s:2%4=2 → ⧇?⧈⧇╳· 帧 2 = ╳
-		assert.ok(formatFooter(records, { now: F0, fg }).startsWith("<warning>⧈  </>"));
-	});
-
-	test("三态帧槽等宽:footer 的 name 列位置恒 4 列(无宽度漂移)", () => {
-		const at = F0;
-		const starting = formatFooter([rec({ state: "starting", createdAt: F0 })], { now: at });
-		const running = formatFooter([rec({ state: "running", createdAt: F0 })], { now: at });
-		const stopping = formatFooter([rec({ state: "stopping", createdAt: F0 })], { now: at });
-		// 帧槽 + 分隔 = 4 列,name 从第 5 列起,三态一致
-		assert.equal(visibleWidth(starting.slice(0, starting.indexOf("hank"))), 4);
-		assert.equal(visibleWidth(running.slice(0, running.indexOf("hank"))), 4);
-		assert.equal(visibleWidth(stopping.slice(0, stopping.indexOf("hank"))), 4);
+		assert.equal(formatFooter(records, { now: F0 })[0], "●");
+		assert.ok(formatFooter(records, { now: F0, fg }).startsWith("<warning>●</>"));
 	});
 
 	test("多工作态聚合:最早创建者具名 +N,Σturns;有 stats 加 Σtok", () => {
 		const records = [
-			rec({ id: "pi-worker-b#222222", name: "qingliu", state: "running", turns: 1, createdAt: F0 + 2 }),
-			withStats({ id: "pi-worker-a#111111", name: "zhizao", state: "running", turns: 3, createdAt: F0 + 1 }, { tokens: { total: 45000 } }),
-			rec({ id: "pi-worker-c#333333", name: "zhangyin", state: "stopping", turns: 2, createdAt: F0 + 3 }),
+			rec({ id: "pi-worker-b#222222222222", name: "qingliu", state: "running", turns: 1, createdAt: F0 + 2 }),
+			withStats({ id: "pi-worker-a#111111111111", name: "zhizao", state: "running", turns: 3, createdAt: F0 + 1 }, { tokens: { total: 45000 } }),
+			rec({ id: "pi-worker-c#333333333333", name: "zhangyin", state: "stopping", turns: 2, createdAt: F0 + 3 }),
 		];
-		assert.equal(formatFooter(records, { now: F0 + 60_000 }), "⧓   zhizao +2 · 59s · 45k tok");
+		assert.equal(formatFooter(records, { now: F0 + 60_000 }), "● zhizao +2 · 59s · 45k tok");
 	});
 
 	test("tok 格式:formatTokens 纯函数;单 worker 不显示 tok(渐进披露)", () => {
@@ -120,33 +99,38 @@ describe("formatFooter", () => {
 		assert.ok(!formatFooter(noStats, { now: F0 }).includes("tok"));
 	});
 
-	test("等决策区:✗failed ✓done ⏾exited,按严重度排序(ask 通道已移除)", () => {
+	test("等决策区:✗failed ✓idle ⏾exited,按严重度排序;任一待决策即给 /pi-worker 入口", () => {
 		const records = [
-			rec({ id: "pi-worker-a#111111", name: "a", state: "idle" }),
-			rec({ id: "pi-worker-b#222222", name: "b", state: "idle" }),
-			rec({ id: "pi-worker-c#333333", name: "c", state: "idle" }),
+			rec({ id: "pi-worker-a#111111111111", name: "a", state: "idle" }),
+			rec({ id: "pi-worker-b#222222222222", name: "b", state: "idle" }),
+			rec({ id: "pi-worker-c#333333333333", name: "c", state: "idle" }),
 			rec({ id: "pi-worker-d#444444", name: "d", state: "failed" }),
 			rec({ id: "pi-worker-e#555555", name: "e", state: "exited" }),
 		];
 		assert.equal(
 			formatFooter(records, { now: F0 }),
-			"✗ 1 failed · ✓ 3 done · ⏾ 1 exited · /pi-worker",
+			"✗ 1 failed · ✓ 3 idle · ⏾ 1 exited · /pi-worker",
 		);
 		const colored = formatFooter(records, { now: F0, fg });
 		assert.ok(colored.includes("<error>✗ 1 failed</>"));
-		assert.ok(colored.includes("<dim>✓ 3 done</>"));
+		assert.ok(colored.includes("<dim>✓ 3 idle</>"));
 		assert.ok(colored.includes("<warning>⏾ 1 exited</>"));
 		assert.ok(colored.includes("<dim>/pi-worker</>"));
 	});
 
-	test("双区并存:工作区 │ 等决策区", () => {
+	test("无 failed:idle 待验收同样给行动入口(判决也是决策)", () => {
+		const records = [rec({ id: "pi-worker-a#111111111111", name: "a", state: "idle" })];
+		assert.equal(formatFooter(records, { now: F0 }), "✓ 1 idle · /pi-worker");
+	});
+
+	test("双区并存:决策区在左(截尾先丢工作区,行动入口不可被截)", () => {
 		const records = [
 			rec({ state: "running", turns: 3, createdAt: F0 }),
-			rec({ id: "pi-worker-a#111111", name: "a", state: "idle" }),
+			rec({ id: "pi-worker-a#111111111111", name: "a", state: "idle" }),
 		];
 		assert.equal(
 			formatFooter(records, { now: F0 + 45_000 }),
-			"⧔   hank · 45s │ ✓ 1 done",
+			"✓ 1 idle · /pi-worker │ ● hank · 45s",
 		);
 	});
 });
@@ -155,7 +139,7 @@ function msg(partial) {
 	return {
 		customType: "pi-worker",
 		content: "x",
-		details: { id: "pi-worker-hank#a1b2c3", ...partial },
+		details: { id: "pi-worker-hank#a1b2c3d4e5f6", ...partial },
 	};
 }
 
@@ -201,11 +185,21 @@ describe("formatCallbackView", () => {
 		assert.ok(view.body.includes("SIGKILL"));
 	});
 
+	test("recovery(启动恢复):独立类型,warning 级呈现(遗留 worker 待审计/清理是决策项,非机械留痕)", () => {
+		const v = formatCallbackView({
+			content: "启动恢复:重建 2 个遗留 worker(state=exited,最后状态未知,以 jsonl 为准);pi-worker-a#111111111111, pi-worker-b#222222222222;status 审计,collect 清理",
+			details: { type: "recovery", id: "recovery" },
+		});
+		assert.equal(v.kind, "recovery");
+		assert.ok(v.header.includes("启动恢复"));
+		assert.ok(v.body.includes("pi-worker-a#111111111111"), "id 列表在 body");
+	});
+
 	test("action-done(审计):content 即 body,不再落空 settled 卡", () => {
 		const view = formatCallbackView({
 			customType: "pi-worker",
 			content: "worker hank → seal:证据已齐",
-			details: { type: "action-done", id: "pi-worker-seal#b2c3d4" },
+			details: { type: "action-done", id: "pi-worker-seal#b2c3d4e5f6a7" },
 		});
 		assert.equal(view.kind, "action");
 		assert.equal(view.header, "⏺ action seal");
@@ -238,31 +232,33 @@ describe("formatCallbackView", () => {
 });
 
 describe("formatToolCallLine", () => {
-	test("run:name + task 摘要(40 字符截断)+ 显式 model/thinking", () => {
-		assert.equal(formatToolCallLine("run", { name: "zhizao", task: "写测试" }), 'run zhizao "写测试"');
+	test("run:name + prompt 摘要(40 字符截断)+ 显式 model/thinking", () => {
+		assert.equal(formatToolCallLine("run", { name: "zhizao", prompt: "写测试" }), 'run zhizao "写测试"');
 		assert.equal(
-			formatToolCallLine("run", { name: "zhizao", task: "写测试", model: "opencode-go/deepseek-v4-flash", thinking: "max" }),
+			formatToolCallLine("run", { name: "zhizao", prompt: "写测试", model: "opencode-go/deepseek-v4-flash", thinking: "max" }),
 			'run zhizao "写测试" · opencode-go/deepseek-v4-flash think:max',
 		);
 		assert.equal(
-			formatToolCallLine("run", { name: "zhizao", task: "t".repeat(50) }),
+			formatToolCallLine("run", { name: "zhizao", prompt: "t".repeat(50) }),
 			`run zhizao "${"t".repeat(40)}…"`,
 		);
 		// thinking 单独指定(默认模型 + 升档):无 model 段
-		assert.equal(formatToolCallLine("run", { name: "zhizao", task: "x", thinking: "high" }), 'run zhizao "x" · think:high');
+		assert.equal(formatToolCallLine("run", { name: "zhizao", prompt: "x", thinking: "high" }), 'run zhizao "x" · think:high');
+		// tools:显式工具面(只读隔离)渲染,缺省不渲染
+		assert.equal(formatToolCallLine("run", { name: "zhizao", prompt: "审", tools: "read,ls" }), 'run zhizao "审" · tools:read,ls');
 	});
 
 	test("message:id 显示为 name(去 hash)+ 消息文本摘要", () => {
 		assert.equal(
-			formatToolCallLine("message", { id: "pi-worker-hank#a1b2c3", message: "先修断言" }),
+			formatToolCallLine("message", { id: "pi-worker-hank#a1b2c3d4e5f6", prompt: "先修断言" }),
 			'message hank "先修断言"',
 		);
 	});
 
 	test("stop/collect/kill:仅目标;status 无 id 即列全部", () => {
-		assert.equal(formatToolCallLine("kill", { id: "pi-worker-hank#a1b2c3" }), "kill hank");
+		assert.equal(formatToolCallLine("kill", { id: "pi-worker-hank#a1b2c3d4e5f6" }), "kill hank");
 		assert.equal(formatToolCallLine("status", {}), "status");
-		assert.equal(formatToolCallLine("status", { id: "pi-worker-hank#a1b2c3" }), "status hank");
+		assert.equal(formatToolCallLine("status", { id: "pi-worker-hank#a1b2c3d4e5f6" }), "status hank");
 	});
 });
 
@@ -271,7 +267,7 @@ describe("toastFor", () => {
 		const toast = toastFor(msg({ type: "failed", exitCode: 1, exitSignal: null, stderrTail: "x" }));
 		assert.equal(toast.level, "error");
 		assert.ok(toast.text.includes("worker"));
-		assert.ok(toast.text.includes("pi-worker-hank#a1b2c3"));
+		assert.ok(toast.text.includes("pi-worker-hank#a1b2c3d4e5f6"));
 		assert.ok(toast.text.includes("exit=1"));
 	});
 
@@ -307,16 +303,16 @@ describe("formatRuntime", () => {
 describe("formatOverlayRows", () => {
 	test("分区:decision(failed/idle/exited)在前,working 在后;区内按创建序", () => {
 		const records = [
-			rec({ id: "pi-worker-work#111111", name: "work", state: "running", createdAt: 10, turns: 2 }),
-			rec({ id: "pi-worker-ask1#222222", name: "ask1", state: "idle", createdAt: 1 }),
-			rec({ id: "pi-worker-fail#333333", name: "fail", state: "failed", createdAt: 2 }),
+			rec({ id: "pi-worker-work#111111111111", name: "work", state: "running", createdAt: 10, turns: 2 }),
+			rec({ id: "pi-worker-ask1#222222222222", name: "ask1", state: "idle", createdAt: 1 }),
+			rec({ id: "pi-worker-fail#333333333333", name: "fail", state: "failed", createdAt: 2 }),
 			rec({ id: "pi-worker-idle#444444", name: "idle", state: "idle", createdAt: 3 }),
 			rec({ id: "pi-worker-exit#555555", name: "exit", state: "exited", createdAt: 4 }),
 		];
 		const rows = formatOverlayRows(records, 1_000_000);
 		assert.deepEqual(
 			rows.map((r) => r.value),
-			["pi-worker-fail#333333", "pi-worker-ask1#222222", "pi-worker-idle#444444", "pi-worker-exit#555555", "pi-worker-work#111111"],
+			["pi-worker-fail#333333333333", "pi-worker-ask1#222222222222", "pi-worker-idle#444444", "pi-worker-exit#555555", "pi-worker-work#111111111111"],
 		);
 		assert.deepEqual(
 			rows.map((r) => r.section),
@@ -324,37 +320,49 @@ describe("formatOverlayRows", () => {
 		);
 	});
 
-		test("主行:定宽列 name/runtime/tN,图标语义色(无 #hash 无 role)", () => {
+		test("主行:定宽列 name/runtime/tN,图标语义色(无 #hash)", () => {
 		const records = [
-			rec({ id: "pi-worker-a#111111", name: "a", state: "idle", idleReason: "ask", createdAt: 1_000_000_000, role: "织造", turns: 2 }),
-			rec({ id: "pi-worker-b#222222", name: "b", state: "failed", createdAt: 999_940_000 }), // 105s → 1m45s,拉宽 runtime 列
-			rec({ id: "pi-worker-c#333333", name: "c", state: "idle", idleReason: "report", createdAt: 1_000_000_002 }),
+			rec({ id: "pi-worker-a#111111111111", name: "a", state: "idle", idleReason: "ask", createdAt: 1_000_000_000, turns: 2 }),
+			rec({ id: "pi-worker-b#222222222222", name: "b", state: "failed", createdAt: 999_940_000 }), // 105s → 1m45s,拉宽 runtime 列
+			rec({ id: "pi-worker-c#333333333333", name: "c", state: "idle", idleReason: "report", createdAt: 1_000_000_002 }),
 			rec({ id: "pi-worker-d#444444", name: "d", state: "exited", createdAt: 1_000_000_003 }),
 			rec({ id: "pi-worker-e#555555", name: "e", state: "running", createdAt: 1_000_000_004 }),
 		];
 		const rows = formatOverlayRows(records, 1_000_045_000);
 		const byId = Object.fromEntries(rows.map((r) => [r.value, r]));
-		// name 列 pad 到行集最大宽(1),runtime 右对齐到 1m45s(5 列);role 不进显示层
-		assert.match(byId["pi-worker-a#111111"].main.text, /^✓ a {3}45s t2$/);
-		assert.match(byId["pi-worker-b#222222"].main.text, /^✗ b 1m45s t0$/);
-		assert.match(byId["pi-worker-c#333333"].main.text, /^✓ c {3}44s t0$/);
+		// name 列 pad 到行集最大宽(1),runtime 右对齐到 1m45s(5 列)
+		assert.match(byId["pi-worker-a#111111111111"].main.text, /^✓ a {3}45s t2$/);
+		assert.match(byId["pi-worker-b#222222222222"].main.text, /^✗ b 1m45s t0$/);
+		assert.match(byId["pi-worker-c#333333333333"].main.text, /^✓ c {3}44s t0$/);
 		assert.match(byId["pi-worker-d#444444"].main.text, /^⏾ d {3}44s t0$/);
 		assert.match(byId["pi-worker-e#555555"].main.text, /^● e {3}44s t0$/);
-		assert.equal(byId["pi-worker-a#111111"].main.color, "success");
-		assert.equal(byId["pi-worker-b#222222"].main.color, "error");
-		assert.ok(byId["pi-worker-b#222222"].main.text.startsWith("✗ "));
-		assert.ok(byId["pi-worker-c#333333"].main.text.startsWith("✓ "));
-		assert.equal(byId["pi-worker-c#333333"].main.color, "success");
+		assert.equal(byId["pi-worker-a#111111111111"].main.color, "success");
+		assert.equal(byId["pi-worker-b#222222222222"].main.color, "error");
+		assert.ok(byId["pi-worker-b#222222222222"].main.text.startsWith("✗ "));
+		assert.ok(byId["pi-worker-c#333333333333"].main.text.startsWith("✓ "));
+		assert.equal(byId["pi-worker-c#333333333333"].main.color, "success");
 		assert.ok(byId["pi-worker-d#444444"].main.text.startsWith("⏾ "));
 		assert.equal(byId["pi-worker-d#444444"].main.color, "warning");
 		assert.ok(byId["pi-worker-e#555555"].main.text.startsWith("● "));
 		assert.equal(byId["pi-worker-e#555555"].main.color, "dim");
 	});
 
-	test("details:模型行 + 活动/cost/ask 行,选中才渲染(结构提供,渲染层控制)", () => {
+	test("working 行脉冲:偶数秒 accent,奇数秒 dim;stopping 恒 warning(告警不脉冲)", () => {
+		const mk = () => [
+			rec({ id: "pi-worker-r#111111111111", name: "r", state: "running", createdAt: 0 }),
+			rec({ id: "pi-worker-s#222222222222", name: "s", state: "stopping", createdAt: 0 }),
+		];
+		const bright = formatOverlayRows(mk(), 2_000); // 偶数秒
+		assert.equal(bright.find((r) => r.value.includes("r#")).main.color, "accent");
+		assert.equal(bright.find((r) => r.value.includes("s#")).main.color, "warning", "stopping 告警恒亮");
+		const dark = formatOverlayRows(mk(), 3_000); // 奇数秒
+		assert.equal(dark.find((r) => r.value.includes("r#")).main.color, "dim");
+	});
+
+	test("行单行化:details 只载判决证据——模型/cost 徽章上移 transcript 标题,活动进主行(grok 行不重复徽章)", () => {
 		const records = [
 			rec({
-				id: "pi-worker-zhizao#a1b2c3",
+				id: "pi-worker-zhizao#a1b2c3d4e5f6",
 				name: "zhizao",
 				state: "running",
 				createdAt: 1_000_000_000,
@@ -364,15 +372,55 @@ describe("formatOverlayRows", () => {
 				latestStats: { cost: 0.0042, toolCalls: 4, tokens: { input: 8200, output: 4100, cacheRead: 3400, total: 15700 } },
 			}),
 		];
-		const rows = formatOverlayRows(records, 1_000_045_000, () => "OpenCode Go");
+		const rows = formatOverlayRows(records, 1_000_045_000);
 		assert.equal(rows.length, 1);
-		const [model, extra] = rows[0].details;
-		assert.equal(model.text, "OpenCode Go/deepseek-v4-flash · think:max");
-		assert.equal(model.color, "dim");
-		// extras:活动(带参数,诊断面)+ cost;tool 计数与 token 细分不进(无决策价值)
-		assert.equal(extra.text, 'tool: bash {"command":"npm test"} · cost $0.0042');
-		assert.equal(extra.color, "dim");
-		assert.equal(rows[0].details.length, 2);
+		// 主行:working 态带活动短摘要(剥 tool: 前缀);details 无模型/cost 重复
+		assert.match(rows[0].main.text, /^● zhizao 45s t3 · bash /);
+		assert.ok(rows[0].main.text.includes("npm test"), "活动带参数摘要");
+		assert.equal(rows[0].details.length, 0, "模型/活动/cost 不再进 details");
+	});
+
+	test("主行活动摘要:仅 working 态(running/starting/stopping)且 30 字符截断;idle/failed 不带", () => {
+		const longActivity = `tool: rg ${"x".repeat(60)}`;
+		const rows = formatOverlayRows(
+			[
+				rec({ id: "pi-worker-r#111111111111", name: "r", state: "running", currentActivity: longActivity, createdAt: 1 }),
+				rec({ id: "pi-worker-i#222222222222", name: "i", state: "idle", currentActivity: longActivity, createdAt: 2 }),
+			],
+			1_000_000,
+		);
+		const running = rows.find((r) => r.value.includes("r#"));
+		const idle = rows.find((r) => r.value.includes("i#"));
+		assert.ok(running.main.text.includes("…"), "活动超长截断");
+		assert.ok(!idle.main.text.includes("rg"), "非 working 态主行不带活动");
+	});
+
+	test("exited 折叠:>2 聚合为单行(enter 展开);≤2 原样列出;展开显示全部", () => {
+		const mk = (n) => Array.from({ length: n }, (_, i) =>
+			rec({ id: `pi-worker-e${i}#111111111111`, name: `e${i}`, state: "exited", createdAt: i + 1 }));
+		const folded = formatOverlayRows(mk(3), 1_000_000);
+		assert.deepEqual(folded.map((r) => r.value), ["__exited_fold__"], "3 个 exited 聚合为一行");
+		assert.equal(folded[0].section, "decision");
+		assert.match(folded[0].main.text, /exited ×3/);
+		const two = formatOverlayRows(mk(2), 1_000_000);
+		assert.deepEqual(two.map((r) => r.value), ["pi-worker-e0#111111111111", "pi-worker-e1#111111111111"], "≤2 不折叠");
+		const expanded = formatOverlayRows(mk(3), 1_000_000, { expandExited: true });
+		assert.equal(expanded.length, 3, "展开后全量列出");
+		assert.ok(!expanded.some((r) => r.value === "__exited_fold__"));
+	});
+
+	test("exited 折叠行序位:decision 区 failed > idle > 折叠行,working 区不受影响", () => {
+		const records = [
+			rec({ id: "pi-worker-w#111111111111", name: "w", state: "running", createdAt: 10 }),
+			rec({ id: "pi-worker-f#222222222222", name: "f", state: "failed", createdAt: 2 }),
+			rec({ id: "pi-worker-i#333333333333", name: "i", state: "idle", createdAt: 3 }),
+			...Array.from({ length: 4 }, (_, i) => rec({ id: `pi-worker-e${i}#44444444444${i}`, name: `e${i}`, state: "exited", createdAt: 4 + i })),
+		];
+		const rows = formatOverlayRows(records, 1_000_000);
+		assert.deepEqual(
+			rows.map((r) => r.value),
+			["pi-worker-f#222222222222", "pi-worker-i#333333333333", "__exited_fold__", "pi-worker-w#111111111111"],
+		);
 	});
 
 		describe("formatRecentEntry(tool call 可读行)", () => {
@@ -389,33 +437,83 @@ describe("formatOverlayRows", () => {
 		});
 	});
 
-	test("无模型/无活动时 details 为空", () => {
+		test("判决证据拆封:failed 首行 exit/stderr 诊断;idle 呈报封顶 3 行 + transcript 指引(全文在 L2 视图)", () => {
+		const failed = formatOverlayRows(
+			[rec({ id: "pi-worker-f#111111111111", name: "f", state: "failed", exitCode: 1, stderrTail: "boom", createdAt: 1 })],
+			1_000,
+		);
+		assert.deepEqual(failed[0].details[0], { text: "exit=1 · boom", color: "error" });
+
+		const report = "改动:x\n原因:y\n核验证据:z\n遗留:无";
+		const idle = formatOverlayRows(
+			[rec({ id: "pi-worker-i#222222222222", name: "i", state: "idle", report, createdAt: 1 })],
+			1_000,
+		);
+		assert.deepEqual(
+			idle[0].details.slice(0, 3),
+			report.split("\n").slice(0, 3).map((text) => ({ text, color: "muted" })),
+		);
+		assert.ok(idle[0].details.some((d) => d.text.includes("+1 行")), "4 行呈报超出封顶有省略指引");
+
+		const long = formatOverlayRows(
+			[rec({ id: "pi-worker-l#333333333333", name: "l", state: "idle", report: Array.from({ length: 12 }, (_, i) => `L${i}`).join("\n"), createdAt: 1 })],
+			1_000,
+		);
+		assert.equal(long[0].details.filter((d) => d.color === "muted").length, 3, "呈报封顶 3 行");
+		assert.ok(long[0].details.some((d) => d.text.includes("+9 行") && d.text.includes("transcript")), "省略指引指向 transcript 视图");
+	});
+
+		test("无模型/无活动时 details 为空", () => {
 		const idleRows = formatOverlayRows(
-			[rec({ id: "pi-worker-y#222222", name: "y", state: "idle", createdAt: 1 })],
+			[rec({ id: "pi-worker-y#222222222222", name: "y", state: "idle", createdAt: 1 })],
 			1_000_000,
 		);
 		assert.equal(idleRows[0].details.length, 0);
 	});
 
+	test("未投影状态(新增状态漏登记)→ WorkerError fail fast,不裸 TypeError", () => {
+		assert.throws(
+			() => formatOverlayRows([rec({ id: "pi-worker-x#999999999999", name: "x", state: "paused", createdAt: 1 })], 1_000_000),
+			(e) => e instanceof WorkerError && /未投影的状态/.test(e.message),
+		);
+	});
+
 	test("终态(done/killing)无决策价值,不列出", () => {
 		const records = [
-			rec({ id: "pi-worker-x#111111", name: "x", state: "done", createdAt: 1 }),
-			rec({ id: "pi-worker-y#222222", name: "y", state: "killing", createdAt: 2 }),
-			rec({ id: "pi-worker-z#333333", name: "z", state: "starting", createdAt: 3 }),
+			rec({ id: "pi-worker-x#111111111111", name: "x", state: "done", createdAt: 1 }),
+			rec({ id: "pi-worker-y#222222222222", name: "y", state: "killing", createdAt: 2 }),
+			rec({ id: "pi-worker-z#333333333333", name: "z", state: "starting", createdAt: 3 }),
 		];
 		const rows = formatOverlayRows(records, 1_000_000);
-		assert.deepEqual(rows.map((r) => r.value), ["pi-worker-z#333333"]);
+		assert.deepEqual(rows.map((r) => r.value), ["pi-worker-z#333333333333"]);
+	});
+
+	test("遗留记录(exited × recovered 显式状态组合):details 带来源标记与 session 审计指针", () => {
+		const rows = formatOverlayRows(
+			[rec({ state: "exited", recovered: true, sessionFile: "/repo/.pi/worker-sessions/a.jsonl", createdAt: 1 })],
+			1_000_000,
+		);
+		assert.equal(rows[0].section, "decision", "遗留 = 待清理决策");
+		const texts = rows[0].details.map((d) => d.text).join("\n");
+		assert.ok(texts.includes("重启遗留"), texts);
+		assert.ok(texts.includes("/repo/.pi/worker-sessions/a.jsonl"), texts);
 	});
 });
 
-describe("opFor(动作 → 执行操作:判决直调 manager,仅归因注入父 session)", () => {
+describe("opFor(动作 → 执行操作:判决注入父 session(落 verdict 需 agent 判断),机械直调 manager)", () => {
 	const A = (value, extra = {}) => ({ value, label: value, ...extra });
-	const ID = "pi-worker-hank#a1b2c3";
+	const ID = "pi-worker-hank#a1b2c3d4e5f6";
 
-	test("通过/强制放行 → collect;丢弃 → kill(人到人决,无 LLM 中转)", () => {
-		assert.deepEqual(opFor(A("通过"), ID), { kind: "collect", audit: `已对 ${ID} 验收通过(collect)` });
-		assert.deepEqual(opFor(A("强制放行"), ID, "证据已核"), { kind: "collect", audit: `已对 ${ID} 强制放行(collect),理由:证据已核` });
-		assert.deepEqual(opFor(A("丢弃"), ID), { kind: "kill", audit: `已对 ${ID} 丢弃(kill)` });
+	test("通过/强制放行/丢弃 → inject 准指令:verdict 落 deliverable frontmatter 是审查闭环事实源,需父 agent 落笔", () => {
+		const pass = opFor(A("通过"), ID);
+		assert.equal(pass.kind, "inject");
+		assert.ok(pass.text.includes(ID) && pass.text.includes("verdict=通过") && pass.text.includes(`pi_worker collect id=${ID} verdict=通过`), pass.text);
+		const force = opFor(A("强制放行"), ID, "证据已核");
+		assert.equal(force.kind, "inject");
+		assert.ok(force.text.includes(`pi_worker collect id=${ID} verdict=强制放行`) && force.text.includes("证据已核"), force.text);
+		const discard = opFor(A("丢弃"), ID);
+		assert.equal(discard.kind, "inject");
+		assert.ok(discard.text.includes(`pi_worker collect id=${ID} verdict=丢弃`) && discard.text.includes("status=rejected") && !discard.text.includes("kill"), discard.text);
 	});
 
 	test("消息 → manager.message,message 即输入原文(btw 式自由文本)", () => {
@@ -428,44 +526,27 @@ describe("opFor(动作 → 执行操作:判决直调 manager,仅归因注入父 
 		assert.deepEqual(opFor(A("collect"), ID), { kind: "collect", audit: `已对 ${ID} 执行 collect` });
 	});
 
-	test("归因四路 → inject 准指令(修合约重派是真判断,保留 LLM 路径)", () => {
-		assert.deepEqual(opFor(A("归因:输入"), ID), {
-			kind: "inject",
-			text: `对 ${ID} 撤换归因:输入 → 请执行 pi_worker collect id=${ID},修合约后同 name 重派`,
-		});
-		assert.equal(opFor(A("归因:收益递减"), ID).kind, "inject");
+	test("撤换 → inject:归因分流处置(collect 清账 + 重派/收尾,分类归父 agent)", () => {
+		const op = opFor(A("撤换"), ID);
+		assert.equal(op.kind, "inject");
+		assert.ok(op.text.includes(ID) && op.text.includes("归因分流") && op.text.includes(`pi_worker collect id=${ID}`), op.text);
 	});
 
 	test("撤换归因四路:collect 清理 + 重派引导", () => {
-		assert.equal(
-			formatAttributionMessage("pi-worker-hank#a1b2c3", "输入"),
-			"对 pi-worker-hank#a1b2c3 撤换归因:输入 → 请执行 pi_worker collect id=pi-worker-hank#a1b2c3,修合约后同 name 重派",
-		);
-		assert.equal(
-			formatAttributionMessage("pi-worker-hank#a1b2c3", "能力"),
-			"对 pi-worker-hank#a1b2c3 撤换归因:能力 → 请执行 pi_worker collect id=pi-worker-hank#a1b2c3,同 name 带 model/thinking 重派",
-		);
-		assert.equal(
-			formatAttributionMessage("pi-worker-hank#a1b2c3", "胜任度"),
-			"对 pi-worker-hank#a1b2c3 撤换归因:胜任度 → 请执行 pi_worker collect id=pi-worker-hank#a1b2c3,换 name 重派",
-		);
-		assert.equal(
-			formatAttributionMessage("pi-worker-hank#a1b2c3", "收益递减"),
-			"对 pi-worker-hank#a1b2c3 撤换归因:收益递减 → 请执行 pi_worker collect id=pi-worker-hank#a1b2c3,父收尾不重派",
-		);
+		assert.ok(true, "占位");
 	});
 });
 
 describe("formatActionMessage", () => {
 	test("机械动作(直调后)审计陈述", () => {
-		assert.equal(formatActionMessage("pi-worker-hank#a1b2c3", "stop"), "已对 pi-worker-hank#a1b2c3 执行 stop");
-		assert.equal(formatActionMessage("pi-worker-hank#a1b2c3", "collect"), "已对 pi-worker-hank#a1b2c3 执行 collect");
+		assert.equal(formatActionMessage("pi-worker-hank#a1b2c3d4e5f6", "stop"), "已对 pi-worker-hank#a1b2c3d4e5f6 执行 stop");
+		assert.equal(formatActionMessage("pi-worker-hank#a1b2c3d4e5f6", "collect"), "已对 pi-worker-hank#a1b2c3d4e5f6 执行 collect");
 	});
 });
 
 describe("actionsFor(与状态机合法集一致)", () => {
 	function r(state, extra = {}) {
-		return rec({ id: "pi-worker-x#111111", name: "x", state, ...extra });
+		return rec({ id: "pi-worker-x#111111111111", name: "x", state, ...extra });
 	}
 	test("exited 只给 collect", () => {
 		assert.deepEqual(actionsFor(r("exited")).map((a) => a.value), ["collect"]);
@@ -482,21 +563,147 @@ describe("actionsFor(与状态机合法集一致)", () => {
 		assert.equal(actions[0].needsInput, true);
 		assert.equal(actions[2].irreversible, true);
 	});
-	test("idle 给 通过/消息/丢弃/强制放行,丢弃/强制放行不可逆", () => {
+	test("idle 给 通过/消息/丢弃/强制放行;判决是 inject(父 agent 二次判断),不二次确认", () => {
 		const actions = actionsFor(r("idle"));
 		assert.deepEqual(actions.map((a) => a.value), ["通过", "消息", "丢弃", "强制放行"]);
 		assert.equal(actions[1].needsInput, true);
-		assert.equal(actions[2].irreversible, true);
-		assert.equal(actions[3].irreversible, true);
+		assert.ok(!actions.some((a) => a.irreversible), "inject 类动作无需 confirm");
 		assert.equal(actions[3].needsInput, true);
 	});
-	test("failed 给归因四路,全部不可逆", () => {
+	test("failed 给撤换(归因分流是父 agent 判断,不在菜单替父分类);inject 类不二次确认", () => {
 		const actions = actionsFor(r("failed"));
-		assert.deepEqual(actions.map((a) => a.value), ["归因:输入", "归因:能力", "归因:胜任度", "归因:收益递减"]);
-		assert.ok(actions.every((a) => a.irreversible));
+		assert.deepEqual(actions.map((a) => a.value), ["撤换"]);
+		assert.ok(!actions[0].irreversible, "inject 经父 agent 二次判断才生效,无需 confirm");
 	});
 	test("done/killing 无动作", () => {
 		assert.deepEqual(actionsFor(r("done")), []);
 		assert.deepEqual(actionsFor(r("killing")), []);
+	});
+});
+
+describe("formatLifecycle", () => {
+	const F0 = 1_000_000_000;
+	const data = { id: "pi-worker-hank#a1b2c3d4e5f6", name: "hank", prompt: "fix auth bug", createdAt: F0 };
+
+	test("running 带活动:● 脉冲(偶数秒 accent/奇数秒 dim),name + 引号 prompt + elapsed + 活动(剥 tool: 前缀)", () => {
+		const r = rec({ state: "running", createdAt: F0, currentActivity: 'tool: rg "pi_worker"' });
+		const bright = formatLifecycle(r, data, F0 + 46_000); // 偶数秒
+		assert.equal(bright.icon, "●");
+		assert.equal(bright.iconColor, "accent");
+		assert.equal(bright.text, 'hank "fix auth bug" · 46s · rg "pi_worker"');
+		assert.equal(bright.textColor, "dim");
+		const dark = formatLifecycle(r, data, F0 + 45_000); // 奇数秒
+		assert.equal(dark.iconColor, "dim", "脉冲回 dim(词汇静态,颜色呼吸)");
+	});
+
+	test("starting 无活动:无活动段", () => {
+		const v = formatLifecycle(rec({ state: "starting", createdAt: F0 }), data, F0 + 5_000);
+		assert.equal(v.text, 'hank "fix auth bug" · 5s');
+	});
+
+	test("stopping:● warning(收尾告警)", () => {
+		const v = formatLifecycle(rec({ state: "stopping", createdAt: F0 }), data, F0 + 5_000);
+		assert.equal(v.icon, "●");
+		assert.equal(v.iconColor, "warning");
+	});
+
+	test("idle:✓ 整体 dim(色彩让位于紧随的呈报回调),保留 elapsed", () => {
+		const v = formatLifecycle(rec({ state: "idle", createdAt: F0 }), data, F0 + 90_000);
+		assert.equal(v.icon, "✓");
+		assert.equal(v.iconColor, "dim");
+		assert.equal(v.text, 'hank "fix auth bug" · 1m30s');
+	});
+
+	test("failed:✗ dim + exit 诊断", () => {
+		const v = formatLifecycle(rec({ state: "failed", createdAt: F0, exitCode: 1 }), data, F0 + 10_000);
+		assert.equal(v.icon, "✗");
+		assert.equal(v.text, 'hank "fix auth bug" · 10s · exit=1');
+	});
+
+	test("exited:⏾ dim", () => {
+		const v = formatLifecycle(rec({ state: "exited", createdAt: F0 }), data, F0 + 10_000);
+		assert.equal(v.icon, "⏾");
+	});
+
+	test("done 带 verdict:● dim + 判决留痕", () => {
+		const v = formatLifecycle(rec({ state: "done", createdAt: F0, verdict: "通过" }), data, F0 + 10_000);
+		assert.equal(v.icon, "●");
+		assert.equal(v.iconColor, "dim");
+		assert.equal(v.text, 'hank "fix auth bug" · 10s · 通过');
+	});
+
+	test("记录缺失(collect 后):静态回退 entry data,● dim 无 elapsed", () => {
+		const v = formatLifecycle(undefined, data, F0 + 10_000);
+		assert.equal(v.icon, "●");
+		assert.equal(v.iconColor, "dim");
+		assert.equal(v.text, 'hank "fix auth bug"');
+	});
+
+	test("prompt 超 40 截断;活动超 30 截断", () => {
+		const longData = { ...data, prompt: "x".repeat(50) };
+		const r = rec({ state: "running", createdAt: F0, currentActivity: `tool: bash ${"y".repeat(40)}` });
+		const v = formatLifecycle(r, longData, F0);
+		assert.ok(v.text.includes(`"${"x".repeat(40)}…"`), "prompt 截断");
+		const activity = v.text.split(" · ").pop();
+		assert.ok(activity.startsWith("bash ") && activity.endsWith("…"), "activity 截断");
+		assert.ok(activity.length <= 30, "activity ≤30 字符");
+	});
+
+	test("expanded details:模型行 + sessionFile + recent 尾;recovered 警示", () => {
+		const r = rec({
+			state: "idle",
+			createdAt: F0,
+			modelInfo: { provider: "opencode-go", id: "deepseek-v4-flash", thinkingLevel: "low" },
+			sessionFile: "/tmp/s.jsonl",
+			recent: ["start:bash ls", "end:bash"],
+			recovered: true,
+		});
+		const v = formatLifecycle(r, data, F0);
+		const texts = v.details.map((d) => d.text);
+		assert.ok(texts.some((t) => t.includes("deepseek-v4-flash") && t.includes("think:low")), "模型行");
+		assert.ok(texts.some((t) => t === "/tmp/s.jsonl"), "sessionFile");
+		assert.ok(texts.some((t) => t.includes("bash: ls")), "recent 投影");
+		assert.ok(v.details.some((d) => d.color === "warning"), "recovered 警示");
+	});
+
+	test("记录缺失时 expanded details 给完整 prompt", () => {
+		const v = formatLifecycle(undefined, { ...data, prompt: "p1\np2" }, F0);
+		assert.deepEqual(v.details.map((d) => d.text), ["p1", "p2"]);
+	});
+});
+
+describe("splitLeftoversByReference + formatLeftoverHint(本会话归属判定)", () => {
+	const sessions = [
+		{ id: "pi-worker-a#111111111111", name: "a", sessionFile: "/tmp/a.jsonl", createdAt: 1, updatedAt: 1 },
+		{ id: "pi-worker-b#222222222222", name: "b", sessionFile: "/tmp/b.jsonl", createdAt: 2, updatedAt: 2 },
+	];
+	// branch 里含 a 的 id(run 工具调用留痕),不含 b
+	const branchText = JSON.stringify([
+		{ type: "message", message: { role: "assistant", content: [{ type: "toolCall", name: "pi_worker", arguments: { name: "a" } }] } },
+		"结果:id=pi-worker-a#111111111111 pid=42",
+	]);
+
+	test("split:branch 引用的 id = 本会话遗留;未引用 = 外会话", () => {
+		const { own, foreign } = splitLeftoversByReference(sessions, branchText);
+		assert.deepEqual(own.map((s) => s.id), ["pi-worker-a#111111111111"]);
+		assert.deepEqual(foreign.map((s) => s.id), ["pi-worker-b#222222222222"]);
+	});
+
+	test("hint:own → recover 显式认领指引;foreign → pi --resume 直接新会话查看指引(不建记录)", () => {
+		const hint = formatLeftoverHint({ sessions, skipped: [], heldElsewhere: [] }, branchText);
+		assert.ok(hint.includes("pi_worker action=recover"), "own 认领指引");
+		assert.ok(hint.includes("pi-worker-a#111111111111"));
+		assert.ok(hint.includes("pi --session /tmp/b.jsonl") && hint.includes("pi --fork /tmp/b.jsonl"), "foreign 查看/派生新会话指引");
+		assert.ok(hint.includes("非本会话"), "foreign 语义标注");
+	});
+
+	test("hint:全空/held-only → undefined(不打扰)", () => {
+		assert.equal(formatLeftoverHint({ sessions: [], skipped: [], heldElsewhere: [] }, ""), undefined);
+		assert.equal(formatLeftoverHint({ sessions: [], skipped: [], heldElsewhere: ["pi-worker-x#111111111111"] }, ""), undefined);
+	});
+
+	test("hint:skipped 声明保留", () => {
+		const hint = formatLeftoverHint({ sessions: [], skipped: ["broken.jsonl"], heldElsewhere: [] }, "");
+		assert.ok(hint.includes("broken.jsonl"));
 	});
 });

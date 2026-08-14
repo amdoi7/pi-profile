@@ -79,15 +79,15 @@ test("tool_start/end → toolStart/toolEnd,args 提取可读键摘要(40 字符)
 	events.emitEvent({ type: "tool_execution_end", toolCallId: "t1", toolName: "bash", result: {}, isError: false });
 	assert.equal(emitted[0].type, "toolStart");
 	assert.equal(emitted[0].toolName, "bash");
-	assert.equal(emitted[0].args, "x".repeat(40)); // command 键摘要,非破碎 JSON
+	assert.equal(emitted[0].args, `${"x".repeat(39)}…`); // 首个标量主语,总长含省略号 40
 	assert.deepEqual(emitted[1], { type: "toolEnd", toolName: "bash" });
 });
 
-test("tool_start args 无常见键 → JSON 壳回退(40 字符)", () => {
+test("tool_start 多标量 → 主语 + key=value(无键白名单,首个标量主语)", () => {
 	const { events, emitted } = setup();
 	events.emitEvent({ type: "tool_execution_start", toolCallId: "t2", toolName: "write", args: { oldText: "a", newText: "b" } });
 	assert.ok(emitted[0].args.length <= 40);
-	assert.ok(emitted[0].args.includes("oldText"));
+	assert.equal(emitted[0].args, "a · newText=b");
 });
 
 test("message_end 不产生事件(turn 话语投影已移除);增量(text_delta)亦不产生", () => {
@@ -122,4 +122,26 @@ test("dispose 后事件不再翻译", () => {
 	events.emitEvent({ type: "agent_settled" });
 	events.emitExit(1, null);
 	assert.deepEqual(emitted, []);
+});
+
+test("auto_retry_start → activity 事件(retrying (n/m),grok 词汇);auto_retry_end → 清除", () => {
+	const { events, emitted } = setup();
+	events.emitEvent({ type: "auto_retry_start", attempt: 2, maxAttempts: 3, delayMs: 2000 });
+	events.emitEvent({ type: "auto_retry_end", success: true, attempt: 2 });
+	assert.deepEqual(emitted, [
+		{ type: "activity", phase: "retrying", label: "retrying (2/3)" },
+		{ type: "activity", phase: "retrying", label: undefined },
+	]);
+});
+
+test("compaction_start/end → activity 事件(compacting);字段缺失回退安全", () => {
+	const { events, emitted } = setup();
+	events.emitEvent({ type: "compaction_start", reason: "threshold" });
+	events.emitEvent({ type: "compaction_end", reason: "threshold" });
+	events.emitEvent({ type: "auto_retry_start" }); // 缺 attempt/maxAttempts
+	assert.deepEqual(emitted, [
+		{ type: "activity", phase: "compacting", label: "compacting" },
+		{ type: "activity", phase: "compacting", label: undefined },
+		{ type: "activity", phase: "retrying", label: "retrying" },
+	]);
 });

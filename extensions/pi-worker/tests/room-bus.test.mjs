@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import { RoomBus } from "../src/room-bus.ts";
 
-/** RoomBus 单测:寻址/投递/审计扇出/失败回执,全 fake,无进程。 */
+/** RoomBus 单测:resolve/deliver/audit fan-out/failure receipt,全 fake,无进程。 */
 function setup({ resolveAmbiguous = [] } = {}) {
 	const delivered = []; // { msg, quiet }
 	const transports = []; // { id, text }
@@ -22,12 +22,12 @@ function setup({ resolveAmbiguous = [] } = {}) {
 			if (text.includes("BOOM")) throw new Error("目标已退出");
 			return id.includes("running") ? "steer" : "prompt";
 		},
-		nameOf: (id) => id.match(/^pi-worker-(.+)#[0-9a-f]{6}$/)?.[1] ?? id,
+		displayNameOf: (id) => id.match(/^pi-worker-(.+)#[0-9a-f]{6}$/)?.[1] ?? id,
 	});
 	return { bus, delivered, transports };
 }
 
-describe("post:寻址与投递", () => {
+describe("post:resolve 与 deliver", () => {
 	test("worker → parent:消息卡,唤醒(quiet=false),from 进 content", async () => {
 		const { bus, delivered } = setup();
 		const r = await bus.post("pi-worker-hank#aaaaaa", "parent", "验收证据已齐");
@@ -56,7 +56,7 @@ describe("post:寻址与投递", () => {
 		assert.equal(delivered.length, 0); // parent 发的不需要向 parent 审计
 	});
 
-	test("worker → worker:FSM 投递 + 父 session 安静审计扇出(世界模型不瞎)", async () => {
+	test("worker → worker:FSM 投递 + 父 session 安静audit fan-out(世界模型不瞎)", async () => {
 		const { bus, transports, delivered } = setup();
 		const r = await bus.post("pi-worker-hank#aaaaaa", "seal", "证据已齐");
 		assert.deepEqual(r, { ok: true, via: "prompt" });
@@ -68,7 +68,7 @@ describe("post:寻址与投递", () => {
 	});
 });
 
-describe("post:失败回执到发送方(能行动的边界)", () => {
+describe("post:failure receipt到发送方(能行动的边界)", () => {
 	test("目标不存在 → 通知发送方 worker(自我修正),result 带原因与原文", async () => {
 		const { bus, transports } = setup();
 		const r = await bus.post("pi-worker-hank#aaaaaa", "ghost", "hi");

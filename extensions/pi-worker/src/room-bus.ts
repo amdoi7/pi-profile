@@ -1,11 +1,11 @@
 import { CALLBACK_TYPE, type CallbackMessage } from "./bridge.ts";
 
 /**
- * RoomBus:全部节点(parent + live worker)的消息平面,单一管道。
+ * RoomBus:room(parent + live workers 协作空间)的 message plane,单一管道。
  * 不变式:一种语义——异步 fire-and-forget(无阻塞/gateway 变体);
- * 地址 = name / id / "parent";传输由目标类型与投递原语决定,发送方不关心。
+ * 地址 = name / id / "parent";传输由目标类型与 delivery primitive 决定,发送方不关心。
  * 成员目录不在此维护(派生自 manager registry 活记录);本模块只拥有消息语义:
- * 寻址、投递、审计扇出、失败回执。生命周期事件(settled/failed)不是消息,不走本管道。
+ * resolve、deliver、audit fan-out、failure receipt。生命周期事件(settled/failed)不是消息,不走本管道。
  */
 
 export interface RoomBusDeps {
@@ -13,10 +13,10 @@ export interface RoomBusDeps {
 	deliver: (msg: CallbackMessage, opts?: { quiet?: boolean }) => void;
 	/** name/id → live worker id;未命中(不存在或歧义)undefined。 */
 	resolve: (to: string) => string | undefined;
-	/** worker 投递原语:FSM 按状态选 steer(running)/ prompt(idle);非法状态抛错。 */
+	/** worker delivery primitive:FSM 按状态选 steer(running)/ prompt(idle);非法状态抛错。 */
 	transport: (id: string, text: string) => Promise<"steer" | "prompt">;
 	/** id → 显示名(审计文本用)。 */
-	nameOf: (id: string) => string;
+	displayNameOf: (id: string) => string;
 }
 
 export type PostResult =
@@ -37,7 +37,7 @@ export class RoomBus {
 			this.deps.deliver(
 				{
 					customType: CALLBACK_TYPE,
-					content: `msg ${this.deps.nameOf(from)} → parent:${text}`,
+					content: `msg ${this.deps.displayNameOf(from)} → parent:${text}`,
 					details: { type: "message", id: from, text },
 				},
 				{ quiet },
@@ -50,15 +50,15 @@ export class RoomBus {
 			await this.notifySender(from, `投递失败:${reason};原文:${text}`);
 			return { ok: false, reason };
 		}
-		const fromName = from === PARENT ? "parent" : this.deps.nameOf(from);
+		const fromName = from === PARENT ? "parent" : this.deps.displayNameOf(from);
 		try {
 			const via = await this.deps.transport(target, `来自「${fromName}」的消息:${text}`);
 			if (from !== PARENT) {
-				// peer 流量审计扇出:父 session 安静留痕(不烧父轮次),世界模型不瞎
+				// peer 流量 audit fan-out:父 session 安静留痕(不烧父轮次),世界模型不瞎
 				this.deps.deliver(
 					{
 						customType: CALLBACK_TYPE,
-						content: `msg ${fromName} → ${this.deps.nameOf(target)}:${text}`,
+						content: `msg ${fromName} → ${this.deps.displayNameOf(target)}:${text}`,
 						details: { type: "action-done", id: from },
 					},
 					{ quiet: true },
@@ -72,8 +72,8 @@ export class RoomBus {
 		}
 	}
 
-	/** 失败回执到发送方(worker 能自我修正);发送方是 parent 由调用方拿 PostResult;
-	 * 回执自身也失败(发送方已死)→ 安静审计到 parent session,不静默吞没。 */
+	/** failure receipt 到发送方(worker 能自我修正);发送方是 parent 由调用方拿 PostResult;
+	 * receipt 自身也失败(发送方已死)→ 安静审计到 parent session,不静默吞没。 */
 	private async notifySender(from: string, notice: string): Promise<void> {
 		if (from === PARENT) return;
 		try {
