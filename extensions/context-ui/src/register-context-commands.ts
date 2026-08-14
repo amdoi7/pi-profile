@@ -1,10 +1,12 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { registerCommand as gateCommand } from "../../_shared/mode-gate.ts";
 import { collectAnalyzedContext } from "./context-state.ts";
 import { renderContextOverlay } from "./context-renderer.ts";
 
 export function registerContextCommands(pi: ExtensionAPI): void {
-  pi.registerCommand("context", {
+  gateCommand(pi, "context", {
     description: "Show context usage",
+    modes: ["tui"],
     handler: async (_args, ctx: ExtensionCommandContext) => {
       try {
         const { breakdown, history } = await collectAnalyzedContext(ctx, pi);

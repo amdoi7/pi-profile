@@ -1,19 +1,20 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { on } from "../../_shared/mode-gate.ts";
 import {
   clearProviderToolPayloadSnapshot,
   updateProviderToolPayloadSnapshot,
 } from "./provider-tool-payload.ts";
 
 export function registerContextHooks(pi: ExtensionAPI): void {
-  pi.on("session_start", async () => {
+  on(pi, "session_start", async () => {
     clearProviderToolPayloadSnapshot();
-  });
+  }, ["tui"]);
 
-  pi.on("session_shutdown", async () => {
+  on(pi, "session_shutdown", async () => {
     clearProviderToolPayloadSnapshot();
-  });
+  }, ["tui"]);
 
-  pi.on("before_provider_request", (event) => {
+  on(pi, "before_provider_request", (event) => {
     updateProviderToolPayloadSnapshot(event.payload);
-  });
+  }, ["tui"]);
 }
