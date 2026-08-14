@@ -1,21 +1,20 @@
-import { isRecord, normalizeLines, operationByIndex, type ParsedPatch, type PatchOperation } from "./recognize.ts";
+import { normalizeLines, operationByIndex, type ParsedPatch, type PatchOperation } from "./recognize.ts";
 
 /**
  * invocation-result.ts — 单 invocation 输出解析（执行者架构）。
  *
  * 每个 invocation 的 stdout 隔离捕获（不与其他输出混流），因此只需要识别
- * 两种 canonical 形状：success 块（"Success. Updated the following files:" +
- * A/M/D 行）与 failure JSON 行。混流扫描（mightBeComplete /
+ * 两种 canonical 形状：success 文本块（marker 行 + 每行一条 `A|M|D path`）与
+ * failure 文本块（error[CODE] + hunk/applied/skipped 行 + message 段殿后至 EOF）——
+ * CLI 恒定文本输出契约（见 cli/apply-patch/README.md）。混流扫描（mightBeComplete /
  * containsResultBlockMarker / parseApplyPatchResultSequence）随观察者架构
- * 整体删除：这里没有"门卫"，输出就是块本身。
+ * 整体删除：这里没有“门卫”，输出就是块本身。
  */
 
 export type AppliedChange = {
 	index: number;
 	operation: PatchOperation["kind"];
 	path: string;
-	oldContent?: string;
-	newContent?: string;
 };
 
 export type SkippedHunk = {
@@ -28,7 +27,6 @@ export type SkippedHunk = {
 
 export type ApplyPatchFailure = {
 	ok: false;
-	exitCode: number;
 	error: {
 		code: string;
 		message: string;
@@ -59,107 +57,123 @@ export type ParsedApplyPatchResultSequence = {
 };
 
 
-export function parseSuccessfulChanges(text: string): SuccessfulChange[] | undefined {
-	const lines = normalizeLines(text);
-	const changes: SuccessfulChange[] = [];
-	let inHeader = false;
-	for (const line of lines) {
-		if (line === "Success. Updated the following files:") {
-			inHeader = true;
-			continue;
+const SUCCESS_MARKER = "Success. Updated the following files:";
+const CHANGE_LINE = /^([AMD]) (.+)$/;
+const ERROR_HEADER = /^error\[([A-Z_]+)\]$/;
+const HUNK_INDEX = /^#(\d+)/;
+const APPLIED_LINE = /^#(\d+) (add|delete|update) (.+)$/;
+const SKIPPED_SEPARATOR = " — ";
+
+/**
+ * hunk 引用文本：`#<index>[ <operation>][ chunk <n>][ <path>]`（字段顺序固定，
+ * path 恒为行尾可含空格）。operation 槽位的词法歧义（路径恰为 add/delete/update）
+ * 按 operation 解析——encoder 恒在已知时输出 operation，误配只弱化 match guard，
+ * 诚实降级不撒谎。
+ */
+type HunkReferenceText = {
+	index: number;
+	operation: PatchOperation["kind"] | undefined;
+	path: string | undefined;
+	chunkIndex: number | undefined;
+};
+
+function parseHunkReferenceText(text: string): HunkReferenceText | undefined {
+	const indexMatch = HUNK_INDEX.exec(text);
+	if (!indexMatch) return undefined;
+	const reference: HunkReferenceText = { index: Number(indexMatch[1]), operation: undefined, path: undefined, chunkIndex: undefined };
+	let rest = text.slice(indexMatch[0].length);
+	if (rest === "") return reference;
+	if (!rest.startsWith(" ")) return undefined;
+	rest = rest.slice(1);
+	for (const word of ["add", "delete", "update"] as const) {
+		if (rest === word || rest.startsWith(`${word} `)) {
+			reference.operation = word;
+			rest = rest.slice(word.length);
+			if (rest !== "") rest = rest.slice(1);
+			break;
 		}
-		if (!inHeader) continue;
-		const match = line.match(/^([AMD]) (.+)$/);
-		if (!match) {
-			inHeader = false;
-			continue;
-		}
-		changes.push({ status: match[1] as SuccessfulChange["status"], path: match[2] });
 	}
-	return changes.length > 0 ? changes : undefined;
+	if (rest.startsWith("chunk ")) {
+		const after = rest.slice("chunk ".length);
+		const spaceAt = after.indexOf(" ");
+		const digits = spaceAt === -1 ? after : after.slice(0, spaceAt);
+		if (!/^\d+$/.test(digits)) return undefined;
+		reference.chunkIndex = Number(digits);
+		rest = spaceAt === -1 ? "" : after.slice(spaceAt + 1);
+	}
+	if (rest !== "") reference.path = rest;
+	return reference;
+}
+
+/** success 文本块：marker 行 + 每行一条 `A|M|D path`（marker 后全为 change 行）。 */
+export function parseApplyPatchSuccess(text: string): SuccessfulChange[] | undefined {
+	const lines = normalizeLines(text);
+	const markerAt = lines.indexOf(SUCCESS_MARKER);
+	if (markerAt === -1) return undefined;
+	const changes: SuccessfulChange[] = [];
+	for (const line of lines.slice(markerAt + 1)) {
+		const match = CHANGE_LINE.exec(line);
+		if (!match) return undefined;
+		changes.push({ status: match[1] as SuccessfulChange["status"], path: match[2]! });
+	}
+	return changes;
 }
 
 /**
- * 单 invocation 输出解析：failure JSON 行（trimStart 后 {）优先，否则 success 块。
+ * 单 invocation 输出解析：failure 文本块（error[CODE] 头）优先，否则 success 文本块。
  * 无法识别（输出为空 / 与 canonical 形状不符）返回 undefined。
  */
 export function parseInvocationResult(text: string): ParsedApplyPatchResult | undefined {
 	const failure = parseApplyPatchFailure(text);
 	if (failure) return { success: false, failure, text };
-	const lines = normalizeLines(text);
-	if (lines[0] !== "Success. Updated the following files:") return undefined;
-	let cursor = 1;
-	while (cursor < lines.length && /^[AMD] .+$/.test(lines[cursor] ?? "")) cursor++;
-	const changes = parseSuccessfulChanges(text);
-	if (!changes) return undefined;
-	return { success: true, changes, text: lines.slice(0, cursor).join("\n") };
+	const success = parseApplyPatchSuccess(text);
+	if (!success) return undefined;
+	return { success: true, changes: success, text };
 }
 
-function parseAppliedChange(value: unknown): AppliedChange | undefined {
-	if (!isRecord(value)) return undefined;
-	if (!Number.isInteger(value.index) || !["add", "delete", "update"].includes(String(value.operation))) return undefined;
-	if (typeof value.path !== "string") return undefined;
-	if (value.oldContent !== undefined && typeof value.oldContent !== "string") return undefined;
-	if (value.newContent !== undefined && typeof value.newContent !== "string") return undefined;
-	return {
-		index: value.index as number,
-		operation: value.operation as AppliedChange["operation"],
-		path: value.path,
-		oldContent: typeof value.oldContent === "string" ? value.oldContent : undefined,
-		newContent: typeof value.newContent === "string" ? value.newContent : undefined,
-	};
-}
-
-function parseFailureHunk(value: unknown): ApplyPatchFailure["error"]["hunk"] | undefined {
-	if (!isRecord(value) || !Number.isInteger(value.index)) return undefined;
-	if (value.operation !== undefined && !["add", "delete", "update"].includes(String(value.operation))) return undefined;
-	if (value.path !== undefined && typeof value.path !== "string") return undefined;
-	if (value.chunkIndex !== undefined && !Number.isInteger(value.chunkIndex)) return undefined;
-	return {
-		index: value.index as number,
-		operation: value.operation as PatchOperation["kind"] | undefined,
-		path: value.path as string | undefined,
-		chunkIndex: value.chunkIndex as number | undefined,
-	};
-}
-
-function parseSkippedHunk(value: unknown): SkippedHunk | undefined {
-	if (!isRecord(value) || typeof value.message !== "string") return undefined;
-	const hunk = parseFailureHunk(value.hunk);
-	if (!hunk) return undefined;
-	return {
-		...hunk,
-		message: value.message,
-	};
-}
-
+/**
+ * failure 文本块：`error[<CODE>]` 头 + 至多一条 `hunk: ` + 若干 `applied: `/`skipped: `
+ * + `message: ` 段（殿后至 EOF，可多行）。任何一行形状不符 → undefined。
+ */
 export function parseApplyPatchFailure(text: string): ApplyPatchFailure | undefined {
-	const jsonLine = normalizeLines(text).find((line) => line.trim().startsWith("{"));
-	if (!jsonLine) return undefined;
-	let value: unknown;
-	try {
-		value = JSON.parse(jsonLine);
-	} catch {
+	const lines = normalizeLines(text);
+	const headerAt = lines.findIndex((line) => ERROR_HEADER.test(line));
+	if (headerAt === -1) return undefined;
+	const code = ERROR_HEADER.exec(lines[headerAt]!)![1]!;
+	let hunk: ApplyPatchFailure["error"]["hunk"];
+	const appliedPrefix: AppliedChange[] = [];
+	const skipped: SkippedHunk[] = [];
+	for (let cursor = headerAt + 1; cursor < lines.length; cursor++) {
+		const line = lines[cursor]!;
+		if (line.startsWith("hunk: ")) {
+			if (hunk !== undefined) return undefined;
+			const reference = parseHunkReferenceText(line.slice("hunk: ".length));
+			if (!reference) return undefined;
+			hunk = reference;
+			continue;
+		}
+		if (line.startsWith("applied: ")) {
+			const match = APPLIED_LINE.exec(line.slice("applied: ".length));
+			if (!match) return undefined;
+			appliedPrefix.push({ index: Number(match[1]), operation: match[2] as AppliedChange["operation"], path: match[3]! });
+			continue;
+		}
+		if (line.startsWith("skipped: ")) {
+			const body = line.slice("skipped: ".length);
+			const separatorAt = body.indexOf(SKIPPED_SEPARATOR);
+			if (separatorAt === -1) return undefined;
+			const reference = parseHunkReferenceText(body.slice(0, separatorAt));
+			if (!reference) return undefined;
+			skipped.push({ ...reference, message: body.slice(separatorAt + SKIPPED_SEPARATOR.length) });
+			continue;
+		}
+		if (line.startsWith("message: ")) {
+			const message = [line.slice("message: ".length), ...lines.slice(cursor + 1)].join("\n");
+			return { ok: false, error: { code, message, hunk }, appliedPrefix, skipped };
+		}
 		return undefined;
 	}
-	if (!isRecord(value) || value.ok !== false || !Number.isInteger(value.exitCode)) return undefined;
-	if (!isRecord(value.error) || typeof value.error.code !== "string" || typeof value.error.message !== "string") return undefined;
-	if (!Array.isArray(value.appliedPrefix)) return undefined;
-	const hunk = value.error.hunk === undefined ? undefined : parseFailureHunk(value.error.hunk);
-	if (value.error.hunk !== undefined && !hunk) return undefined;
-	const appliedPrefix = value.appliedPrefix.map(parseAppliedChange);
-	if (appliedPrefix.some((change) => change === undefined)) return undefined;
-	const skipped = value.skipped === undefined
-		? []
-		: (Array.isArray(value.skipped) ? value.skipped.map(parseSkippedHunk) : undefined);
-	if (skipped === undefined || skipped.some((skip) => skip === undefined)) return undefined;
-	return {
-		ok: false,
-		exitCode: value.exitCode as number,
-		error: { code: value.error.code, message: value.error.message, hunk },
-		appliedPrefix: appliedPrefix as AppliedChange[],
-		skipped: skipped as SkippedHunk[],
-	};
+	return undefined;
 }
 
 function expectedSuccessfulChange(operation: PatchOperation): SuccessfulChange {

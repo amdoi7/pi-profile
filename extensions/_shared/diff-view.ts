@@ -83,12 +83,15 @@ function rowColor(row: DisplayDiffRow): DiffColor {
 export class DiffComponent implements Component {
 	private readonly display: DisplayDiff;
 	private readonly theme: DiffTheme;
+	/** 段状态色条前缀（背景块）；内容行保持无背景以免淹没 diff 高亮。 */
+	private readonly rail: string;
 	private cachedWidth?: number;
 	private cachedLines?: string[];
 
-	constructor(display: DisplayDiff, theme: DiffTheme) {
+	constructor(display: DisplayDiff, theme: DiffTheme, rail = "") {
 		this.display = display;
 		this.theme = theme;
+		this.rail = rail;
 	}
 
 	render(width: number): string[] {
@@ -114,7 +117,7 @@ export class DiffComponent implements Component {
 			for (let wrappedIndex = 0; wrappedIndex < wrapped.length; wrappedIndex += 1) {
 				const gutter = wrappedIndex === 0 ? firstGutter : continuationGutter;
 				const line = gutter + wrapped[wrappedIndex]!;
-				lines.push(this.theme.fg(rowColor(row), line));
+				lines.push(this.rail + this.theme.fg(rowColor(row), line));
 			}
 		}
 
@@ -132,13 +135,13 @@ export class DiffComponent implements Component {
 export class DiffPreviewComponent implements Component {
 	private readonly container = new Container();
 
-	constructor(preview: DiffPreview, theme: DiffTheme) {
+	constructor(preview: DiffPreview, theme: DiffTheme, rail = "") {
 		if (preview.display.rows.length > 0) {
-			this.container.addChild(new DiffComponent(preview.display, theme));
+			this.container.addChild(new DiffComponent(preview.display, theme, rail));
 		}
 		if (preview.truncated) {
 			this.container.addChild(new Text(
-				theme.fg("warning", "... diff truncated at tool output limit"),
+				rail + theme.fg("warning", "... diff truncated at tool output limit"),
 				0,
 				0,
 			));

@@ -138,23 +138,28 @@ function createContext(command, overrides = {}) {
 /**
  * 测试辅助：多块 sequence 解析（渲染测试构造 batch payload 用）。
  * 产品执行者是逐 invocation 解析（invocation-result.ts），此处的多块切分
- * 只存在于测试：按 failure JSON 行 / Success 块边界切分，块后余文为 trailing。
+ * 只存在于测试：success 块 = marker 行 + 连续 `A|M|D path` 行；failure 块 =
+ * error[CODE] 头 + hunk/applied/skipped 行 + 单行 message（固件只用单行
+ * message，多行 message 行为由 invocation-result 单测覆盖）；块后余文为 trailing。
  */
 function parseSequence(tool, text) {
 	const lines = text.replace(/\r\n/g, "\n").split("\n");
 	const results = [];
 	let cursor = 0;
 	while (cursor < lines.length) {
-		if (lines[cursor].trimStart().startsWith("{")) {
-			const parsed = tool.modules.parseInvocationResult(lines[cursor]);
-			if (!parsed) break;
-			results.push(parsed);
-			cursor += 1;
-			continue;
-		}
 		if (lines[cursor] === "Success. Updated the following files:") {
 			let end = cursor + 1;
-			while (end < lines.length && /^[AMD] .+$/.test(lines[end])) end += 1;
+			while (end < lines.length && /^[AMD] .+/.test(lines[end])) end += 1;
+			const parsed = tool.modules.parseInvocationResult(lines.slice(cursor, end).join("\n"));
+			if (!parsed) break;
+			results.push(parsed);
+			cursor = end;
+			continue;
+		}
+		if (lines[cursor].startsWith("error[")) {
+			let end = cursor + 1;
+			while (end < lines.length && /^(hunk|applied|skipped): /.test(lines[end])) end += 1;
+			if (end < lines.length && lines[end].startsWith("message: ")) end += 1;
 			const parsed = tool.modules.parseInvocationResult(lines.slice(cursor, end).join("\n"));
 			if (!parsed) break;
 			results.push(parsed);
@@ -164,6 +169,32 @@ function parseSequence(tool, text) {
 		break;
 	}
 	return results.length > 0 ? { results, trailing: lines.slice(cursor).join("\n") } : undefined;
+}
+
+/** 测试固件：CLI 文本契约的 success 块（changes = [{status, path}]，按 CLI A-M-D 分组序）。 */
+function successBlockText(changes) {
+	return ["Success. Updated the following files:", ...changes.map((change) => `${change.status} ${change.path}`)].join("\n");
+}
+
+/** 测试固件：CLI 文本契约的 failure 块（入参沿用旧 JSON 形状；message 单行）。 */
+function failureReportText(failure) {
+	const lines = [`error[${failure.error.code}]`];
+	const ref = (hunk) => {
+		let text = `#${hunk.index}`;
+		if (hunk.operation !== undefined) text += ` ${hunk.operation}`;
+		if (hunk.chunkIndex !== undefined) text += ` chunk ${hunk.chunkIndex}`;
+		if (hunk.path !== undefined) text += ` ${hunk.path}`;
+		return text;
+	};
+	if (failure.error.hunk !== undefined) lines.push(`hunk: ${ref(failure.error.hunk)}`);
+	for (const change of failure.appliedPrefix ?? []) {
+		lines.push(`applied: #${change.index} ${change.operation} ${change.path}`);
+	}
+	for (const skip of failure.skipped ?? []) {
+		lines.push(`skipped: ${ref(skip.hunk)} — ${skip.message}`);
+	}
+	lines.push(`message: ${failure.error.message}`);
+	return lines.join("\n");
 }
 
 /**
@@ -288,6 +319,289 @@ PATCH`;
 
 	assert.match(output, /apply_patch Add file src\/spaced\.ts/);
 	assert.doesNotMatch(output, /\*\*\* Begin Patch/);
+});
+
+test("cat > file heredoc + apply_patch stdin redirect 识别并渲染", async () => {
+	const command = [
+		"cat > /tmp/h9.patch <<'EOF'",
+		"*** Begin Patch",
+		"*** Update File: src/old.ts",
+		"@@",
+		"-export const old = true;",
+		"+export const old = false;",
+		"*** End Patch",
+		"EOF",
+		"apply_patch < /tmp/h9.patch",
+	].join("\n");
+	const { tool } = await loadRegisteredTool();
+	const output = renderText(
+		tool.renderCall({ command }, createTheme(), createContext(command)),
+	);
+
+	assert.match(output, /apply_patch Update file src\/old\.ts/);
+	assert.doesNotMatch(output, /\*\*\* Begin Patch/);
+});
+
+test("cd 前缀 + 相对路径 cat-write/stdin redirect 配对识别", async () => {
+	const command = [
+		"cd nested && cat > p.patch <<'EOF'",
+		"*** Begin Patch",
+		"*** Update File: a.ts",
+		"@@",
+		"-x",
+		"+y",
+		"*** End Patch",
+		"EOF",
+		"apply_patch < p.patch",
+	].join("\n");
+	const { tool } = await loadRegisteredTool();
+	const output = renderText(
+		tool.renderCall({ command }, createTheme(), createContext(command)),
+	);
+
+	assert.match(output, /apply_patch Update file a\.ts/);
+});
+
+test("stdin redirect 来源无法静态 resolve 时整条 delegate built-in", async () => {
+	const { tool } = await loadRegisteredTool();
+	for (const command of [
+		"apply_patch < /tmp/h9.patch",
+		// 混合场景：有效 heredoc + 无法 resolve 的 redirect —— 识别会丢真实命令,整体 delegate。
+		`${MULTI_OPERATION_COMMAND}\napply_patch < /tmp/h9.patch`,
+		"apply_patch < \"$patch_file\"",
+	]) {
+		const output = renderText(
+			tool.renderCall({ command }, createTheme(), createContext(command)),
+		);
+		assert.doesNotMatch(output, /apply_patch Update file/);
+	}
+});
+
+test("external redirect pending：call 槽只展命令行（无操作行），执行开始后清空由结果 UI 接管", async () => {
+	const command = "apply_patch < /tmp/external-change.patch";
+	const { tool } = await loadRegisteredTool();
+	const pending = renderText(
+		tool.renderCall({ command }, createTheme(), createContext(command)),
+	);
+	assert.match(pending, /apply_patch < \/tmp\/external-change\.patch/);
+	assert.doesNotMatch(pending, /apply_patch Update file/);
+	const started = renderText(
+		tool.renderCall({ command }, createTheme(), createContext(command, { executionStarted: true })),
+	);
+	assert.equal(started.trim(), "");
+});
+
+test("external redirect（前序命令落盘的 patch 文件）：execute 出结构化 VM，渲染不泄 JSON 信封", async ({ temp }) => {
+	await fs.promises.writeFile(path.join(temp, "a.txt"), "old\n", "utf8");
+	const patchFile = path.join(temp, "change.patch");
+	await fs.promises.writeFile(patchFile, "*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch\n", "utf8");
+	const command = `cd ${temp} && apply_patch < ${patchFile}`;
+	const toolCallId = "external-redirect-result";
+	const { tool, handlers } = await loadRegisteredTool();
+	const result = await runWithEvents(toolCallId, command, tool, handlers, { cwd: temp });
+	assert.ok(result.details?.bashUi?.applyPatch, "外部 redirect 应产出结构化 view model");
+	const output = renderText(
+		tool.renderResult(
+			result,
+			{ expanded: false, isPartial: false },
+			createTheme(),
+			createContext(command, { toolCallId, executionStarted: true }),
+		),
+	);
+	assert.match(output, /apply_patch Update file a\.txt/);
+	assert.doesNotMatch(output, /"ok":true/);
+});
+
+test("external redirect 来源缺失：delegate 原生执行，模型侧输出保持忠实原文", async ({ temp }) => {
+	const command = `apply_patch < ${path.join(temp, "missing.patch")}`;
+	const { tool, handlers } = await loadRegisteredTool();
+	await assert.rejects(
+		runWithEvents("external-redirect-missing", command, tool, handlers, { cwd: temp }),
+		/Command exited with code 1/,
+	);
+});
+
+test("arg 形态在 compound 中识别(cd && apply_patch '<patch>')", async () => {
+	const command = `cd nested && apply_patch '*** Begin Patch
+*** Update File: a.ts
+@@
+-x
++y
+*** End Patch'`;
+	const { tool } = await loadRegisteredTool();
+	const output = renderText(
+		tool.renderCall({ command }, createTheme(), createContext(command)),
+	);
+
+	assert.match(output, /apply_patch Update file a\.ts/);
+});
+
+test("同一语句 && 链的两个 apply_patch heredoc 都识别", async () => {
+	const command = [
+		"apply_patch <<'P1' && apply_patch <<'P2'",
+		"*** Begin Patch",
+		"*** Add File: a.ts",
+		"+x",
+		"*** End Patch",
+		"P1",
+		"*** Begin Patch",
+		"*** Add File: b.ts",
+		"+y",
+		"*** End Patch",
+		"P2",
+	].join("\n");
+	const { tool } = await loadRegisteredTool();
+	const output = renderText(
+		tool.renderCall({ command }, createTheme(), createContext(command)),
+	);
+
+	assert.match(output, /apply_patch Add file a\.ts/);
+	assert.match(output, /apply_patch Add file b\.ts/);
+});
+
+test("invocation 之前的普通语句进入前缀段：识别并渲染 apply_patch 操作行", async () => {
+	const command = `echo building\n${MULTI_OPERATION_COMMAND}`;
+	const { tool } = await loadRegisteredTool();
+	const output = renderText(
+		tool.renderCall({ command }, createTheme(), createContext(command)),
+	);
+
+	assert.match(output, /apply_patch Add file/);
+});
+
+test("无法解析的 heredoc 内容仍识别为 apply_patch（渲染提示，不再 delegate）", async () => {
+	const command = `${MULTI_OPERATION_COMMAND}\napply_patch <<'PATCH'\nnot a patch\nPATCH`;
+	const { tool } = await loadRegisteredTool();
+	const output = renderText(
+		tool.renderCall({ command }, createTheme(), createContext(command)),
+	);
+
+	// 形态合法即渲染：第一个 patch 的操作行照常，第二个 patch 显示无法解析提示。
+	assert.match(output, /apply_patch Add file/);
+	assert.match(output, /无法解析/);
+});
+
+test("未被 redirect 消费的 cat 写文件使整条 delegate", async () => {
+	const command = ["cat > /tmp/unused.patch <<'EOF'", "x", "EOF", MULTI_OPERATION_COMMAND].join("\n");
+	const { tool } = await loadRegisteredTool();
+	const output = renderText(
+		tool.renderCall({ command }, createTheme(), createContext(command)),
+	);
+
+	assert.doesNotMatch(output, /apply_patch Add file/);
+});
+
+test("apply_patch 带 stdout redirect 的形态不识别", async () => {
+	const command = [
+		"apply_patch > /tmp/out.txt <<'PATCH'",
+		"*** Begin Patch",
+		"*** Add File: a.ts",
+		"+x",
+		"*** End Patch",
+		"PATCH",
+	].join("\n");
+	const { tool } = await loadRegisteredTool();
+	const output = renderText(
+		tool.renderCall({ command }, createTheme(), createContext(command)),
+	);
+
+	assert.doesNotMatch(output, /apply_patch Add file/);
+});
+
+test("perl -pi pending 渲染:perl edit 行 + 文件链接", async () => {
+	const command = "cd nested && perl -pi -e 's/foo/bar/' src/a.ts src/b.ts";
+	const { tool } = await loadRegisteredTool();
+	const output = renderText(
+		tool.renderCall({ command }, createTheme(), createContext(command)),
+	);
+
+	assert.match(output, /perl -pi -e/);
+	assert.match(output, /perl edit/);
+	assert.doesNotMatch(output, /in-place edit/);
+	assert.match(output, /src\/a\.ts/);
+	assert.match(output, /src\/b\.ts/);
+});
+
+test("sed -i pending 渲染:sed edit 行 + 文件链接", async () => {
+	const command = "cd nested && sed -i '' 's/foo/bar/' src/a.ts";
+	const { tool } = await loadRegisteredTool();
+	const output = renderText(
+		tool.renderCall({ command }, createTheme(), createContext(command)),
+	);
+
+	assert.match(output, /sed -i/);
+	assert.match(output, /sed edit/);
+	assert.doesNotMatch(output, /in-place edit/);
+	assert.match(output, /src\/a\.ts/);
+});
+
+test("mixed pending 渲染:perl edit 行与 apply_patch 操作行共一容器单命令头", async () => {
+	const command = `cd nested && perl -pi -e 's/foo/bar/' src/a.ts && apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: src/b.ts
+@@
+-x
++y
+*** End Patch
+PATCH`;
+	const { tool } = await loadRegisteredTool();
+	const output = renderText(
+		tool.renderCall({ command }, createTheme(), createContext(command)),
+	);
+
+	assert.match(output, /perl edit/);
+	assert.match(output, /src\/a\.ts/);
+	assert.match(output, /apply_patch Update file src\/b\.ts/);
+	// 单命令头:结构化 UI 只渲染一次 `$ <cmd>`。
+	assert.equal(output.match(/\$ /g)?.length, 1);
+});
+
+test("perl -pi glob 参数 pending 走 built-in(不识别)", async () => {
+	const command = "perl -pi -e 's/foo/bar/' src/*.ts";
+	const { tool } = await loadRegisteredTool();
+	const output = renderText(
+		tool.renderCall({ command }, createTheme(), createContext(command)),
+	);
+
+	assert.doesNotMatch(output, /in-place edit/);
+});
+
+test("in-place-edit result 渲染:Update 行 + 快照 diff + 输出", async () => {
+	const { tool } = await loadRegisteredTool();
+	const command = "cd nested && perl -pi -e 's/foo/bar/' src/a.ts";
+	const viewModel = {
+		kind: "in-place-edit-result",
+		files: [{
+			kind: "Update",
+			label: "perl edit",
+			path: "src/a.ts",
+			cwd: "/tmp/pi-bash-ui-workspace",
+			changeStats: { additions: 1, deletions: 1, changedLines: 2 },
+			display: {
+				lineNumberWidth: 1,
+				rows: [
+					{ kind: "remove", oldLine: 1, content: "foo", highlights: [] },
+					{ kind: "add", newLine: 1, content: "bar", highlights: [] },
+				],
+			},
+			truncated: false,
+		}],
+		output: "done",
+	};
+	const output = renderText(
+		tool.renderResult(
+			{ content: [{ type: "text", text: "done" }], details: { bashUi: { inPlaceEdit: viewModel } } },
+			{ isPartial: false, expanded: false },
+			createTheme(),
+			createContext(command),
+		),
+	);
+
+	assert.match(output, /src\/a\.ts/);
+	assert.match(output, /done/);
+	// 结果头必须归因真实命令:perl edit,不是 apply_patch。
+	assert.match(output, /perl edit/);
+	assert.doesNotMatch(output, /apply_patch/);
 });
 
 test("cd && apply_patch with spaced heredoc `<< 'PATCH'` 也识别", async () => {
@@ -498,7 +812,7 @@ test("partial result with incomplete changes retains the built-in bash renderer"
 		createContext(MULTI_OPERATION_COMMAND, { executionStarted: true }),
 	));
 
-	assert.match(output, /Success\. Updated the following files:/);
+	assert.match(output, /Success\. Updated the following files/);
 	assert.doesNotMatch(output, /apply_patch applied/);
 });
 
@@ -603,15 +917,15 @@ test("renderCall memoizes plan recognition per command string", async () => {
 	const context = createContext(MULTI_OPERATION_COMMAND, { executionStarted: true, state });
 	tool.renderCall({ command: MULTI_OPERATION_COMMAND }, createTheme(), context);
 	assert.equal(state.planCache.command, MULTI_OPERATION_COMMAND);
-	assert.ok(state.planCache.plan);
-	// 同一 command 第二帧命中缓存：plan 对象同一（识别器未重跑）。
-	const plan = state.planCache.plan;
+	assert.equal(state.planCache.recognition.kind, "plan");
+	// 同一 command 第二帧命中缓存：recognition 对象同一（识别器未重跑）。
+	const recognition = state.planCache.recognition;
 	tool.renderCall({ command: MULTI_OPERATION_COMMAND }, createTheme(), context);
-	assert.equal(state.planCache.plan, plan);
-	// 不同 command 失效（非 plan 命令的 undefined 也缓存）。
+	assert.equal(state.planCache.recognition, recognition);
+	// 不同 command 失效（delegate 判定同样缓存）。
 	tool.renderCall({ command: "echo hi" }, createTheme(), context);
 	assert.equal(state.planCache.command, "echo hi");
-	assert.equal(state.planCache.plan, undefined);
+	assert.equal(state.planCache.recognition.kind, "delegate");
 });
 
 test("renderCall memoizes highlight segments per command string", async () => {
@@ -760,7 +1074,7 @@ echo "exit=$?"`;
 		appliedPrefix: [{ index: 0, operation: "add", path: "first.txt" }],
 	};
 	const { tool } = await loadRegisteredTool();
-	const failureText = `${JSON.stringify(failure)}\nexit=1`;
+	const failureText = `${failureReportText(failure)}\nexit=1`;
 	const viewModel = await buildViewModel({ tool, command, text: failureText });
 	const output = renderText(tool.renderResult(
 		{
@@ -780,7 +1094,7 @@ echo "exit=$?"`;
 		"Update file missing.txt",
 		"exit=1",
 	]);
-	assert.doesNotMatch(output, /"ok":false/);
+	assert.doesNotMatch(output, /error\[FILE_NOT_FOUND\]/);
 });
 
 test("failed result renders appliedPrefix and the failed hunk", async () => {
@@ -805,7 +1119,7 @@ PATCH`;
 		appliedPrefix: [{ index: 0, operation: "add", path: "first.txt" }],
 	};
 	const { tool } = await loadRegisteredTool();
-	const failureText = `${JSON.stringify(failure)}\n\nCommand exited with code 1`;
+	const failureText = `${failureReportText(failure)}\n\nCommand exited with code 1`;
 	const viewModel = await buildViewModel({ tool, command, text: failureText });
 	const output = renderText(tool.renderResult(
 		{
@@ -884,7 +1198,7 @@ PATCH`;
 		appliedPrefix: [],
 	};
 	const { tool } = await loadRegisteredTool();
-	const failureText = JSON.stringify(failure);
+	const failureText = failureReportText(failure);
 	const viewModel = await buildViewModel({ tool, command, text: failureText });
 	const output = renderText(tool.renderResult(
 		{ content: [{ type: "text", text: failureText }], details: detailsWith(viewModel) },
@@ -929,6 +1243,31 @@ test("apply_patch heredoc followed by additional shell commands is recognized", 
 	assert.doesNotMatch(output, /uv run pytest/);
 });
 
+test("pipe in prefix commands does not block apply_patch recognition", async () => {
+	const { tool } = await loadRegisteredTool();
+	for (const command of [
+		`cd nested && rg -n "foo" src | head -4 && ${MULTI_OPERATION_COMMAND}`,
+		`rg -n "foo" src | head -4\n${MULTI_OPERATION_COMMAND}`,
+	]) {
+		const output = renderText(tool.renderCall({ command }, createTheme(), createContext(command)));
+		assert.match(output, /apply_patch Add file src\/new\.ts/, command);
+		assert.match(output, /apply_patch Delete file src\/dead\.ts/, command);
+		assert.doesNotMatch(output, /\*\*\* Begin Patch/, command);
+	}
+});
+
+test("apply_patch itself in a pipe, background, or after || still delegates", async () => {
+	const { tool } = await loadRegisteredTool();
+	for (const command of [
+		`apply_patch <<'PATCH' | cat\n*** Begin Patch\n*** Add File: src/x.ts\n+x\n*** End Patch\nPATCH`,
+		`apply_patch <<'PATCH' &\n*** Begin Patch\n*** Add File: src/x.ts\n+x\n*** End Patch\nPATCH`,
+		`false || ${MULTI_OPERATION_COMMAND}`,
+	]) {
+		const output = renderText(tool.renderCall({ command }, createTheme(), createContext(command)));
+		assert.doesNotMatch(output, /apply_patch Add file/, command);
+	}
+});
+
 test("multiple apply_patch heredocs after cd prefix and trailing test command are recognized", async () => {
 	const command = `cd nested && ${MULTI_OPERATION_COMMAND}\n${MULTI_OPERATION_COMMAND}\nuv run pytest -q`;
 	const { tool } = await loadRegisteredTool();
@@ -955,7 +1294,7 @@ test("multiple apply_patch results render each invocation independently", async 
 		updatePatch("src/third.ts", [" context only"]),
 		"uv run pytest -q",
 	].join("\n");
-	const failures = ["src/first.ts", "src/third.ts"].map((file, index) => JSON.stringify({
+	const failures = ["src/first.ts", "src/third.ts"].map((file, index) => failureReportText({
 		ok: false,
 		exitCode: 1,
 		error: {
@@ -981,7 +1320,7 @@ test("multiple apply_patch results render each invocation independently", async 
 		"Update file src/first.ts",
 	]);
 	assert.doesNotMatch(output, /src\/second\.ts|src\/third\.ts|ERROR: not found/);
-	assert.doesNotMatch(output, /\{"ok":false|Success\. Updated the following files:/);
+	assert.doesNotMatch(output, /error\[/);
 });
 
 test("consecutive successful patches to one file render as one aggregated file result", async () => {
@@ -1015,10 +1354,11 @@ test("consecutive successful patches to one file render as one aggregated file r
 		createContext(command, { executionStarted: true, isError: true }),
 	));
 
-	assert.match(output, /apply_patch Update file src\/repeated\.ts · \+6 -6 · 6 patches/);
+	assert.match(output, /apply_patch Update file src\/repeated\.ts · \+6 -6/);
+	assert.doesNotMatch(output, /patches/);
 	assert.equal(output.match(/apply_patch Update file src\/repeated\.ts/g)?.length, 1);
 	assert.match(output, /FAIL src\/repeated\.test\.ts/);
-	assert.doesNotMatch(output, /Success\. Updated the following files:/);
+	assert.doesNotMatch(output, /\{"ok":true/);
 
 	const expanded = renderText(tool.renderResult(
 		{ content: [{ type: "text", text: resultText }], details },
@@ -1114,7 +1454,8 @@ test("batch renders the final located diff in collapsed and expanded views", asy
 		createContext(command, { toolCallId, executionStarted: true }),
 	));
 
-	assert.match(collapsed, /apply_patch Update file state\.txt · \+1 -1 · 2 patches/);
+	assert.match(collapsed, /apply_patch Update file state\.txt · \+1 -1/);
+	assert.doesNotMatch(collapsed, /patches/);
 	assert.match(collapsed, /-1   │ one/);
 	assert.match(collapsed, /\+  1 │ three/);
 	assert.doesNotMatch(collapsed, /two/);
@@ -1233,9 +1574,9 @@ test("delete followed by add of the same file renders a single rewrite", async (
 PATCH`;
 	const { tool } = await loadRegisteredTool();
 	const details = await buildDetailsViaHandlers("rewrite-call", command, tool,
-		"Success. Updated the following files:\nD a.txt\nA a.txt", { cwd: temp, withBefore: true });
+		"Success. Updated the following files:\nA a.txt\nD a.txt", { cwd: temp, withBefore: true });
 	const output = renderText(tool.renderResult(
-		{ content: [{ type: "text", text: "Success. Updated the following files:\nD a.txt\nA a.txt" }], details, isError: false },
+		{ content: [{ type: "text", text: "Success. Updated the following files:\nA a.txt\nD a.txt" }], details, isError: false },
 		{ expanded: false, isPartial: false },
 		createTheme(),
 		createContext(command, { executionStarted: true }),
@@ -1245,7 +1586,7 @@ PATCH`;
 	assert.equal(output.match(/apply_patch (?:Delete|Add) file a\.txt/g)?.length ?? 0, 0);
 });
 
-test("failure appliedPrefix renders engine content without before snapshots", async () => {
+test("failure appliedPrefix without before snapshots falls back to intent diff", async () => {
 	const command = `apply_patch <<'PATCH'
 *** Begin Patch
 *** Update File: a.txt
@@ -1262,30 +1603,24 @@ PATCH`;
 		ok: false,
 		exitCode: 1,
 		error: { code: "FILE_NOT_FOUND", message: "resolve file to update missing.txt", hunk: { index: 1, operation: "update", path: "missing.txt" } },
-		appliedPrefix: [{
-			index: 0,
-			operation: "update",
-			path: "a.txt",
-			oldContent: "alpha\nold\nomega\n",
-			newContent: "alpha\nnew\nomega\n",
-		}],
+		appliedPrefix: [{ index: 0, operation: "update", path: "a.txt" }],
 	};
 	const { tool } = await loadRegisteredTool();
-	const details = detailsWith(await buildViewModel({ tool, command, text: JSON.stringify(failure) }));
+	const details = detailsWith(await buildViewModel({ tool, command, text: failureReportText(failure) }));
 	const output = renderText(tool.renderResult(
-		{ content: [{ type: "text", text: JSON.stringify(failure) }], details, isError: true },
+		{ content: [{ type: "text", text: failureReportText(failure) }], details, isError: true },
 		{ expanded: false, isPartial: false },
 		createTheme(),
 		createContext(command, { executionStarted: true, isError: true }),
 	));
 
+	// 文本契约不携带文件内容；无快照时 applied 渲染意图 diff（patch 推得），无引擎内容行。
 	assertAppearsInOrder(output, [
 		"apply_patch failed FILE_NOT_FOUND",
 		"applied:",
 		"apply_patch Update file a.txt",
-		"alpha",
-		"omega",
 	]);
+	assert.doesNotMatch(output, /alpha|omega/);
 });
 
 test("failure path merges delete and add of the same file into one rewrite", async ({ temp }) => {
@@ -1311,9 +1646,9 @@ PATCH`;
 		],
 	};
 	const { tool } = await loadRegisteredTool();
-	const details = await buildDetailsViaHandlers("rewrite-fail-call", command, tool, JSON.stringify(failure), { cwd: temp, withBefore: true });
+	const details = await buildDetailsViaHandlers("rewrite-fail-call", command, tool, failureReportText(failure), { cwd: temp, withBefore: true });
 	const output = renderText(tool.renderResult(
-		{ content: [{ type: "text", text: JSON.stringify(failure) }], details, isError: true },
+		{ content: [{ type: "text", text: failureReportText(failure) }], details, isError: true },
 		{ expanded: false, isPartial: false },
 		createTheme(),
 		createContext(command, { executionStarted: true, isError: true }),
@@ -1345,7 +1680,7 @@ PATCH`;
 		exitCode: 1,
 		error: { code: "FILE_NOT_FOUND", message: "resolve file to update missing.txt", hunk: { index: 3, operation: "update", path: "missing.txt" } },
 		appliedPrefix: [
-			{ index: 0, operation: "update", path: "good.txt", oldContent: "old\n", newContent: "new\n" },
+			{ index: 0, operation: "update", path: "good.txt" },
 			{ index: 2, operation: "add", path: "created.txt" },
 		],
 		skipped: [{
@@ -1358,9 +1693,9 @@ PATCH`;
 		}],
 	};
 	const { tool } = await loadRegisteredTool();
-	const details = detailsWith(await buildViewModel({ tool, command, text: JSON.stringify(failure) }));
+	const details = detailsWith(await buildViewModel({ tool, command, text: failureReportText(failure) }));
 	const output = renderText(tool.renderResult(
-		{ content: [{ type: "text", text: JSON.stringify(failure) }], details, isError: true },
+		{ content: [{ type: "text", text: failureReportText(failure) }], details, isError: true },
 		{ expanded: false, isPartial: false },
 		createTheme(),
 		createContext(command, { executionStarted: true, isError: true }),
@@ -1401,7 +1736,7 @@ PATCH`;
 		exitCode: 1,
 		error: { code: "FILE_NOT_FOUND", message: "resolve file to update missing.txt", hunk: { index: 2, operation: "update", path: "missing.txt" } },
 		appliedPrefix: [
-			{ index: 1, operation: "update", path: "good.txt", oldContent: "old\n", newContent: "new\n" },
+			{ index: 1, operation: "update", path: "good.txt" },
 		],
 		skipped: [{
 			hunk: { index: 0 },
@@ -1413,11 +1748,11 @@ PATCH`;
 		"unparseable-skipped-call",
 		command,
 		tool,
-		JSON.stringify(failure),
+		failureReportText(failure),
 		{ cwd: "/tmp/pi-bash-ui-workspace" },
 	);
 	const output = renderText(tool.renderResult(
-		{ content: [{ type: "text", text: JSON.stringify(failure) }], details, isError: true },
+		{ content: [{ type: "text", text: failureReportText(failure) }], details, isError: true },
 		{ expanded: false, isPartial: false },
 		createTheme(),
 		createContext(command, { executionStarted: true, isError: true }),
@@ -1455,9 +1790,9 @@ PATCH`;
 		appliedPrefix: [],
 	};
 	const { tool } = await loadRegisteredTool();
-	const details = await buildDetailsViaHandlers("mismatch-call", command, tool, JSON.stringify(failure), { cwd: temp, withBefore: true });
+	const details = await buildDetailsViaHandlers("mismatch-call", command, tool, failureReportText(failure), { cwd: temp, withBefore: true });
 	const output = renderText(tool.renderResult(
-		{ content: [{ type: "text", text: JSON.stringify(failure) }], details, isError: true },
+		{ content: [{ type: "text", text: failureReportText(failure) }], details, isError: true },
 		{ expanded: true, isPartial: false },
 		createTheme(),
 		createContext(command, { executionStarted: true, isError: true }),
@@ -1528,7 +1863,72 @@ PATCH`;
 	assert.match(output, /\+  1 │ firstChanged\(\);/);
 	assert.match(output, /-3   │ third\(\);/);
 	assert.match(output, /\+  3 │ thirdChanged\(\);/);
-	assert.doesNotMatch(output, /Success\. Updated the following files:/);
+	assert.doesNotMatch(output, /\{"ok":true/);
+});
+
+test("execute in-place edit end-to-end:verbatim 执行 + VM 进 details + 结果渲染", async ({ temp }) => {
+	await fs.promises.writeFile(path.join(temp, "app.ts"), "const port = 3000;\n", "utf8");
+	const command = `cd ${temp} && perl -pi -e 's/3000/8080/' app.ts && printf 'verified'`;
+	const toolCallId = "perl-e2e";
+	const { tool } = await loadRegisteredTool();
+	const result = await tool.execute(
+		toolCallId,
+		{ command },
+		undefined,
+		() => {},
+		createExecutionContext(temp),
+	);
+	assert.equal(await fs.promises.readFile(path.join(temp, "app.ts"), "utf8"), "const port = 8080;\n");
+	assert.match(result.content[0].text, /verified/);
+	assert.ok(result.details?.bashUi?.inPlaceEdit, "execute 应注入 in-place-edit view model");
+	const completed = renderText(tool.renderResult(
+		result,
+		{ expanded: false, isPartial: false },
+		createTheme(),
+		createContext(command, { toolCallId, executionStarted: true }),
+	));
+	assert.match(completed, /app\.ts/);
+	assert.match(completed, /const port = 3000;/);
+	assert.match(completed, /const port = 8080;/);
+	assert.match(completed, /verified/);
+	assert.match(completed, /perl edit/);
+	assert.doesNotMatch(completed, /apply_patch/);
+});
+
+test("execute mixed end-to-end:双 VM 进 details,结果渲染两段各自归因的 diff", async ({ temp }) => {
+	await fs.promises.writeFile(path.join(temp, "app.ts"), "const port = 3000;\n", "utf8");
+	const command = `cd ${temp} && perl -pi -e 's/3000/8080/' app.ts && apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: app.ts
+@@
+-const port = 8080;
++const port = 9090;
+*** End Patch
+PATCH`;
+	const toolCallId = "mixed-e2e";
+	const { tool } = await loadRegisteredTool();
+	const result = await tool.execute(
+		toolCallId,
+		{ command },
+		undefined,
+		() => {},
+		createExecutionContext(temp),
+	);
+	assert.equal(await fs.promises.readFile(path.join(temp, "app.ts"), "utf8"), "const port = 9090;\n");
+	assert.ok(result.details?.bashUi?.inPlaceEdit, "execute 应注入 in-place-edit view model");
+	assert.ok(result.details?.bashUi?.applyPatch, "execute 应注入 apply-patch view model");
+	const completed = renderText(tool.renderResult(
+		result,
+		{ expanded: false, isPartial: false },
+		createTheme(),
+		createContext(command, { toolCallId, executionStarted: true }),
+	));
+	assert.match(completed, /perl edit/);
+	assert.match(completed, /apply_patch Update file app\.ts/);
+	// 两段 diff 各自归因:perl 段 3000→8080,patch 段 8080→9090。
+	assert.match(completed, /const port = 3000;/);
+	assert.match(completed, /const port = 8080;/);
+	assert.match(completed, /const port = 9090;/);
 });
 
 test("execute runs invocations, trailing and returns the view model in details", async ({ temp }) => {
@@ -1553,7 +1953,7 @@ printf 'pytest 1 passed'`;
 		createExecutionContext(temp),
 	);
 	assert.ok(result.content, "expected execute output");
-	assert.match(result.content[0].text, /Success\. Updated the following files:/);
+	assert.match(result.content[0].text, /Success\. Updated the following files/);
 	assert.ok(result.details?.bashUi, "execute 应注入结构化 view model");
 	// 长尾命令副作用改写了文件：视图不得重读（diff 保持执行时 bracket 的状态，渲染层只消费 details）。
 	await fs.promises.writeFile(path.join(temp, "stream.ts"), "rewrittenByTailCommand;\n", "utf8");
@@ -1568,4 +1968,102 @@ printf 'pytest 1 passed'`;
 	assert.match(completed, /-1   │ oldValue;/);
 	assert.doesNotMatch(completed, /rewrittenByTailCommand/);
 	assert.match(completed, /pytest 1 passed/);
+});
+
+// ============================================================================
+// 段级视觉（dsh 轨迹借鉴）：多段结果 = 段头徽标 + 段状态背景色（复用 theme 语义）
+// ============================================================================
+
+/** 记录 bg token 调用的 spy theme：验证段状态背景只复用 theme 语义。 */
+function createSpyTheme() {
+	const bgCalls = [];
+	return {
+		fg: (_name, text) => text,
+		bold: (text) => text,
+		inverse: (text) => text,
+		bg: (name, text) => {
+			bgCalls.push(name);
+			return text;
+		},
+		bgCalls,
+	};
+}
+
+test("multi-segment success renders segment headers and success backgrounds", async ({ temp }) => {
+	await fs.promises.writeFile(path.join(temp, "app.ts"), "const port = 3000;\n", "utf8");
+	const command = `cd ${temp} && perl -pi -e 's/3000/8080/' app.ts && apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: app.ts
+@@
+-const port = 8080;
++const port = 9090;
+*** End Patch
+PATCH`;
+	const { tool } = await loadRegisteredTool();
+	const result = await tool.execute("seg-hdr", { command }, undefined, () => {}, createExecutionContext(temp));
+	const spy = createSpyTheme();
+	const output = tool.renderResult(
+		result,
+		{ expanded: false, isPartial: false },
+		spy,
+		createContext(command, { toolCallId: "seg-hdr", executionStarted: true }),
+	).render(120).join("\n");
+	// 段头徽标：段类型 + invocation 数 + 成功标记（无段序号噪音）。
+	assert.match(output, /\[in-place edit\] ✓/);
+	assert.match(output, /\[apply_patch · 1 invocation\] ✓/);
+	assert.doesNotMatch(output, /1\/2|2\/2/);
+	// 两段都成功 → 只出现 success 背景语义。
+	assert.ok(spy.bgCalls.length > 0, "多段结果应使用段级背景");
+	assert.ok(spy.bgCalls.every((name) => name === "toolSuccessBg"), `expected only toolSuccessBg, got ${spy.bgCalls.join(",")}`);
+});
+
+test("multi-segment with failed patch renders error badge and error background", async ({ temp }) => {
+	await fs.promises.writeFile(path.join(temp, "app.ts"), "const port = 3000;\n", "utf8");
+	const command = `cd ${temp} && perl -pi -e 's/3000/8080/' app.ts && apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: missing.ts
+@@
+-old
++new
+*** End Patch
+PATCH`;
+	const { tool } = await loadRegisteredTool();
+	const result = await tool.execute("seg-err", { command }, undefined, () => {}, createExecutionContext(temp));
+	const spy = createSpyTheme();
+	const output = tool.renderResult(
+		result,
+		{ expanded: false, isPartial: false },
+		spy,
+		createContext(command, { toolCallId: "seg-err", executionStarted: true }),
+	).render(120).join("\n");
+	// in-place 段成功徽标 + apply_patch 段失败徽标（错误码）。
+	assert.match(output, /\[in-place edit\] ✓/);
+	assert.match(output, /\[apply_patch · 1 invocation\] ✗ [A-Z_]+/);
+	// 成功段与失败段各自使用对应背景语义。
+	assert.ok(spy.bgCalls.includes("toolSuccessBg"), `expected toolSuccessBg in ${spy.bgCalls.join(",")}`);
+	assert.ok(spy.bgCalls.includes("toolErrorBg"), `expected toolErrorBg in ${spy.bgCalls.join(",")}`);
+});
+
+test("single-segment result keeps current visuals (no header, no segment background)", async ({ temp }) => {
+	await fs.promises.writeFile(path.join(temp, "app.ts"), "const port = 3000;\n", "utf8");
+	const command = `cd ${temp} && apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: app.ts
+@@
+-const port = 3000;
++const port = 9090;
+*** End Patch
+PATCH`;
+	const { tool } = await loadRegisteredTool();
+	const result = await tool.execute("seg-single", { command }, undefined, () => {}, createExecutionContext(temp));
+	const spy = createSpyTheme();
+	const output = tool.renderResult(
+		result,
+		{ expanded: false, isPartial: false },
+		spy,
+		createContext(command, { toolCallId: "seg-single", executionStarted: true }),
+	).render(120).join("\n");
+	// 单段：无段头徽标、无段级背景（外壳着色保持现状）。
+	assert.doesNotMatch(output, /\[apply_patch/);
+	assert.equal(spy.bgCalls.length, 0, "单段结果不应使用段级背景");
 });

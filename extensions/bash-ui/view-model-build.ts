@@ -5,6 +5,7 @@ import {
 	operationByIndex,
 	type ApplyPatchInvocation,
 	type ApplyPatchPlan,
+	type InPlaceEditPlan,
 	type PlannedPatchOperation,
 	type PatchLine,
 	type PatchOperation,
@@ -25,6 +26,8 @@ import type {
 	ApplyPatchSkipped,
 	ApplyPatchSingleResultViewModel,
 	ApplyPatchUnapplied,
+	InPlaceEditFileDiff,
+	InPlaceEditResultViewModel,
 } from "./view-model-codec.ts";
 import { operationKindWord } from "./view-model-codec.ts";
 
@@ -126,12 +129,7 @@ function collectExactFileDiff(
 	planned: PlannedPatchOperation,
 	before: SnapshotSet | undefined,
 	afterContents: AfterContents | undefined,
-	content?: { oldContent?: string; newContent?: string },
 ): { fileId: string } | undefined {
-	if (content?.oldContent !== undefined && content.newContent !== undefined) {
-		// failure payload 自带引擎内容（不依赖快照）。
-		return { fileId: collectDiff(collection, content.oldContent, content.newContent, { kind: "exact" }) };
-	}
 	const beforeSnapshot = before?.get(planned.sourceAbsolutePath);
 	if (!beforeSnapshot || beforeSnapshot.kind === "unavailable") return undefined;
 	const afterPath = planned.destinationAbsolutePath ?? planned.sourceAbsolutePath;
@@ -173,14 +171,14 @@ function collectRewriteFileDiff(
 // 组装阶段（阶段 C）：用 batch 输出解析文件条目，worker 不可用时 intent 降级。
 // ---------------------------------------------------------------------------
 
-type BuiltFileDiff = Pick<ApplyPatchFileDiff, "changeStats" | "diffDisplay" | "diffTruncated">;
+type BuiltFileDiff = Pick<ApplyPatchFileDiff, "changeStats" | "display" | "truncated">;
 
 function builtFileDiffFromOutput(diff: DiffOutput | undefined): BuiltFileDiff | undefined {
 	if (!diff || diff.stats.changedLines === 0) return undefined;
 	return {
 		changeStats: diff.stats,
-		diffDisplay: diff.display,
-		diffTruncated: diff.truncated,
+		display: diff.display,
+		truncated: diff.truncated,
 	};
 }
 
@@ -190,8 +188,8 @@ function localIntentDiff(lines: readonly PatchLine[]): BuiltFileDiff {
 	const deletions = lines.filter((line) => line.prefix === "-").length;
 	return {
 		changeStats: { additions, deletions, changedLines: additions + deletions },
-		diffDisplay: displayDiffFromLines(lines),
-		diffTruncated: false,
+		display: displayDiffFromLines(lines),
+		truncated: false,
 	};
 }
 
@@ -201,12 +199,13 @@ function assembleFileDiff(entry: CollectedFile, outputs: ReadonlyMap<string, Dif
 		const built = entry.spec ? builtFileDiffFromOutput(outputs.get(entry.spec.fileId)) : undefined;
 		if (built) {
 			return {
+				label: "apply_patch",
 				kind: "Rewrite",
 				path: addOp.operation.path,
 				cwd: entry.cwd,
 				changeStats: built.changeStats,
-				diffDisplay: built.diffDisplay,
-				diffTruncated: built.diffTruncated,
+				display: built.display,
+				truncated: built.truncated,
 			};
 		}
 		return intentRewriteFileDiff(entry.planned, addOp, entry.cwd);
@@ -215,24 +214,26 @@ function assembleFileDiff(entry: CollectedFile, outputs: ReadonlyMap<string, Dif
 	const built = entry.spec ? builtFileDiffFromOutput(outputs.get(entry.spec.fileId)) : undefined;
 	if (built) {
 		return {
+			label: "apply_patch",
 			kind: entry.kind,
 			path: operation.path,
 			destination: operation.destination,
 			cwd: entry.cwd,
 			changeStats: built.changeStats,
-			diffDisplay: built.diffDisplay,
-			diffTruncated: built.diffTruncated,
+			display: built.display,
+			truncated: built.truncated,
 		};
 	}
 	const intent = localIntentDiff(entry.lines ?? operation.lines);
 	return {
+		label: "apply_patch",
 		kind: entry.kind,
 		path: operation.path,
 		destination: operation.destination,
 		cwd: entry.cwd,
 		changeStats: intent.changeStats,
-		diffDisplay: intent.diffDisplay,
-		diffTruncated: intent.diffTruncated,
+		display: intent.display,
+		truncated: intent.truncated,
 	};
 }
 
@@ -240,12 +241,13 @@ function intentRewriteFileDiff(deleteOp: PlannedPatchOperation, addOp: PlannedPa
 	const lines = [...deleteOp.operation.lines, ...addOp.operation.lines];
 	const built = localIntentDiff(lines);
 	return {
+		label: "apply_patch",
 		kind: "Rewrite",
 		path: addOp.operation.path,
 		cwd,
 		changeStats: built.changeStats,
-		diffDisplay: built.diffDisplay,
-		diffTruncated: built.diffTruncated,
+		display: built.display,
+		truncated: built.truncated,
 	};
 }
 
@@ -344,7 +346,7 @@ function collectSingleResult(
 	for (const change of failure.appliedPrefix) {
 		const planned = plannedByIndex(invocation, change.index);
 		if (!planned) return undefined;
-		appliedSpecs.set(change.index, collectExactFileDiff(collection, planned, before, afterContents, change));
+		appliedSpecs.set(change.index, collectExactFileDiff(collection, planned, before, afterContents));
 	}
 	const used = new Set<number>();
 	for (const change of failure.appliedPrefix) {
@@ -602,8 +604,51 @@ export async function buildResultViewModel(
 				...file,
 				patchCount: entry.patchCount ?? 1,
 				// 构建层判定一次：intent 聚合（unlocated 行）时 expanded 无净变更可展示，渲染层只消费字段。
-				isIntent: file.diffDisplay.rows.some((row) => row.kind === "unlocated"),
+				isIntent: file.display.rows.some((row) => row.kind === "unlocated"),
 			};
 		});
 	return { kind: "apply-patch-batch-result", results, finalFiles, trailing: parsed.trailing, trailingCommand };
+}
+
+/**
+ * in-place edit VM：快照对 → exact diff（阶段 A/B/C 与 apply-patch 同构）。
+ * 程序不透明，无 intent diff 可降级：worker 失败 / 快照不可信任 / 内容未变的文件不出现。
+ */
+export async function buildInPlaceEditViewModel(
+	plan: InPlaceEditPlan,
+	before: SnapshotSet,
+	after: SnapshotSet,
+	output: string,
+	submitter: DiffBatchSubmitter,
+): Promise<InPlaceEditResultViewModel> {
+	const collection: DiffCollection = { specs: [], byKey: new Map() };
+	type Entry = { kind: ApplyPatchFileDiff["kind"]; label: string; path: string; cwd: string; fileId: string };
+	const entries: Entry[] = [];
+	for (const absolutePath of plan.snapshotFiles) {
+		const beforeSnapshot = before.get(absolutePath);
+		const afterSnapshot = after.get(absolutePath);
+		if (!beforeSnapshot || beforeSnapshot.kind === "unavailable") continue;
+		if (!afterSnapshot || afterSnapshot.kind === "unavailable") continue;
+		const oldContent = beforeSnapshot.kind === "present" ? beforeSnapshot.content : "";
+		const newContent = afterSnapshot.kind === "present" ? afterSnapshot.content : "";
+		if (oldContent === newContent) continue;
+		const edit = plan.edits.find((candidate) => candidate.files.includes(absolutePath))!;
+		entries.push({
+			kind: beforeSnapshot.kind === "missing" ? "Add" : afterSnapshot.kind === "missing" ? "Delete" : "Update",
+			label: edit.displayCommand,
+			path: edit.displayFiles[edit.files.indexOf(absolutePath)]!,
+			cwd: edit.cwd,
+			fileId: collectDiff(collection, oldContent, newContent, { kind: "exact" }),
+		});
+	}
+	const outputs = collection.specs.length === 0
+		? new Map<string, DiffOutput>()
+		: new Map((await submitter(collection.specs.map((spec) => spec.input)))?.map((diff) => [diff.fileId, diff]));
+	const files: InPlaceEditFileDiff[] = [];
+	for (const entry of entries) {
+		const built = builtFileDiffFromOutput(outputs.get(entry.fileId));
+		if (!built) continue;
+		files.push({ kind: entry.kind, label: entry.label, path: entry.path, cwd: entry.cwd, ...built });
+	}
+	return { kind: "in-place-edit-result", files, output };
 }

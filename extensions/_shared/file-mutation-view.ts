@@ -54,17 +54,17 @@ export function beginFileMutationResultRender(context: ToolRenderContext): Conta
 	return reusableContainer(context);
 }
 
-function fileMutationComponent(item: FileMutationRenderItem, theme: Theme): Container {
+function fileMutationComponent(item: FileMutationRenderItem, theme: Theme, rail = ""): Container {
 	const block = new Container();
-	block.addChild(new Text(item.title, 0, 0));
+	block.addChild(new Text(rail + item.title, 0, 0));
 	if (item.outcome === "failed") {
 		block.addChild(new Spacer(1));
-		block.addChild(new Text(theme.fg("error", item.message), 0, 0));
+		block.addChild(new Text(rail + theme.fg("error", item.message), 0, 0));
 		return block;
 	}
 	if (item.outcome === "pending") return block;
 	for (const preview of item.previews) {
-		block.addChild(new DiffPreviewComponent(preview, theme));
+		block.addChild(new DiffPreviewComponent(preview, theme, rail));
 	}
 	return block;
 }
@@ -73,6 +73,7 @@ export function appendFileMutationBatch(
 	container: Container,
 	items: readonly FileMutationRenderItem[],
 	theme: Theme,
+	rail = "",
 ): void {
-	for (const item of items) container.addChild(fileMutationComponent(item, theme));
+	for (const item of items) container.addChild(fileMutationComponent(item, theme, rail));
 }

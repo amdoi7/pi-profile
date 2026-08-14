@@ -1,7 +1,7 @@
 import type { PatchOperation } from "./recognize.ts";
 import { isRecord } from "./recognize.ts";
 import { isChangeStats, isDisplayDiff } from "../_shared/final-diff.ts";
-import type { ChangeStats, DisplayDiff } from "../_shared/final-diff.ts";
+import type { FileMutationKind, FileMutationResult } from "../_shared/file-result.ts";
 import type { SuccessfulChange } from "./invocation-result.ts";
 
 /**
@@ -10,28 +10,21 @@ import type { SuccessfulChange } from "./invocation-result.ts";
  * 相位纪律从注释变成 import graph：ui.ts / bash-renderer.ts 只 import 本模块与
  * recognize / patch-snapshot 的类型；构建侧（view-model-build.ts）才 import
  * diff-service 与快照。渲染路径零解析、零 IO、零 diff——本模块只有形状校验。
+ *
+ * 文件结果统一为 _shared 的 FileMutationResult（apply_patch 构建时 label="apply_patch"，
+ * in-place edit 用真实工具名）；batch 聚合额外携带 isIntent。
  */
 
-export type ApplyPatchFileDiff = {
-	kind: "Add" | "Update" | "Move" | "Delete" | "Rewrite";
-	/** 展示用原始 relative path（UI 文字）。 */
-	path: string;
-	destination?: string;
-	/** 所属 invocation 的 cwd：renderer 不再猜路径基础目录。 */
-	cwd: string;
-	changeStats: ChangeStats;
-	diffDisplay: DisplayDiff;
-	diffTruncated: boolean;
-};
+/** apply_patch 的单文件结果：FileMutationResult（kind 由构建方保证必填）。 */
+export type ApplyPatchFileDiff = FileMutationResult;
 
-export type ApplyPatchBatchFileDiff = ApplyPatchFileDiff & {
-	patchCount: number;
+export type ApplyPatchBatchFileDiff = FileMutationResult & {
 	/** 聚合 diff 为 intent（无快照，unlocated 行）时 true；渲染层据此决定 expanded 是否展开各 invocation。 */
 	isIntent?: boolean;
 };
 
 export type ApplyPatchUnapplied = {
-	kind: ApplyPatchFileDiff["kind"];
+	kind: FileMutationKind;
 	path: string;
 	destination?: string;
 	cwd: string;
@@ -87,25 +80,35 @@ export type ApplyPatchResultViewModel =
 		trailingCommand?: string;
 	};
 
+/** in-place edit（perl -pi）结果：FileMutationResult，label 归因真实工具（perl edit / sed edit）。 */
+export type InPlaceEditFileDiff = FileMutationResult;
+
+export type InPlaceEditResultViewModel = {
+	kind: "in-place-edit-result";
+	files: InPlaceEditFileDiff[];
+	/** 整条命令的原生输出（verbatim 执行，无重建拼接）。 */
+	output: string;
+};
+
+/** 渲染层消费的 view model 联合：一个 result 只属其一。 */
+export type BashResultViewModel = ApplyPatchResultViewModel | InPlaceEditResultViewModel;
+
 function isFileDiff(value: unknown): value is ApplyPatchFileDiff {
 	return isRecord(value) &&
+		typeof value.label === "string" &&
 		["Add", "Update", "Move", "Delete", "Rewrite"].includes(String(value.kind)) &&
 		typeof value.path === "string" &&
 		(value.destination === undefined || typeof value.destination === "string") &&
 		typeof value.cwd === "string" &&
 		isChangeStats(value.changeStats) &&
-		isDisplayDiff(value.diffDisplay) &&
-		typeof value.diffTruncated === "boolean";
+		isDisplayDiff(value.display) &&
+		typeof value.truncated === "boolean";
 }
 
 function isBatchFileDiff(value: unknown): value is ApplyPatchBatchFileDiff {
 	if (!isRecord(value)) return false;
-	const patchCount = value.patchCount;
 	const isIntent = value.isIntent;
 	return isFileDiff(value) &&
-		typeof patchCount === "number" &&
-		Number.isInteger(patchCount) &&
-		patchCount > 0 &&
 		(isIntent === undefined || typeof isIntent === "boolean");
 }
 
@@ -213,7 +216,25 @@ export function parseRenderedResultPayload(details: unknown): ApplyPatchResultVi
 		};
 }
 
-export function operationKindWord(operation: Pick<PatchOperation, "kind" | "destination">): Exclude<ApplyPatchFileDiff["kind"], "Rewrite"> {
+function isInPlaceEditFileDiff(value: unknown): value is InPlaceEditFileDiff {
+	return isFileDiff(value);
+}
+
+/** in-place edit 结果 payload 校验（渲染层唯一入口之一）。 */
+export function parseInPlaceEditResultPayload(details: unknown): InPlaceEditResultViewModel | undefined {
+	if (
+		!isRecord(details) ||
+		details.kind !== "in-place-edit-result" ||
+		!Array.isArray(details.files) ||
+		!details.files.every(isInPlaceEditFileDiff) ||
+		typeof details.output !== "string"
+	) {
+		return undefined;
+	}
+	return { kind: "in-place-edit-result", files: details.files, output: details.output };
+}
+
+export function operationKindWord(operation: Pick<PatchOperation, "kind" | "destination">): Exclude<FileMutationKind, "Rewrite"> {
 	if (operation.kind === "add") return "Add";
 	if (operation.kind === "delete") return "Delete";
 	return operation.destination ? "Move" : "Update";
