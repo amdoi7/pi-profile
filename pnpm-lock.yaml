@@ -91,6 +91,21 @@ importers:
         specifier: ^3.2.4
         version: 3.2.7(@types/node@26.2.0)(jiti@2.7.0)(yaml@2.9.0)
 
+  extensions/pi-peer:
+    devDependencies:
+      '@types/node':
+        specifier: ^26.0.0
+        version: 26.2.0
+      typebox:
+        specifier: ^1.3.11
+        version: 1.3.11
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+      vitest:
+        specifier: ^3.2.7
+        version: 3.2.7(@types/node@26.2.0)(jiti@2.7.0)(yaml@2.9.0)
+
   extensions/pi-worker:
     devDependencies:
       '@types/node':

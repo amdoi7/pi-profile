@@ -5,6 +5,7 @@
 /auth.json
 /models.json
 /keybindings.json
+/settings.json
 /mcp-cache.json
 /trust.json
 /update-cache.json
@@ -37,3 +38,9 @@
 /skills/skillshare
 /.pi/memory/
 /bin/tmux-bridge
+
+# pi-peer 运行时名册(会话注册文件,机器本地状态)
+/peers/
+
+# pi-worker 审计目录(worker session jsonl,机器本地状态)
+/.pi/worker-sessions/
