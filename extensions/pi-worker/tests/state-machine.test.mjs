@@ -51,7 +51,7 @@ test("run: 同 id 未终结时拒绝", () => {
 	const sm = make();
 	expectWorkerError(
 		() => sm.run({ id: ID, name: "hank" }),
-		"已存在且未终结",
+		"id exists and not terminal",
 		ID,
 	);
 });
@@ -104,36 +104,36 @@ test("steer: running 合法,状态不变", () => {
 	assert.ok(sm.records.get(ID).updatedAt >= before);
 });
 
-test("steer: idle 非法,提示 message", () => {
+test("steer: idle 非法,提示 send/collect", () => {
 	const sm = make();
 	sm.onSettled(ID);
-	expectWorkerError(() => sm.steer(ID), "id 当前 idle", "message");
+	expectWorkerError(() => sm.steer(ID), "id is idle", "use send or collect");
 });
 
-test("steer: stopping 非法(已 stop 无意义)", () => {
+test("steer: stopping 非法(stop 已发无意义)", () => {
 	const sm = make();
 	sm.stop(ID);
-	expectWorkerError(() => sm.steer(ID), "id 当前 stopping", "已 stop");
+	expectWorkerError(() => sm.steer(ID), "id is stopping", "stop already");
 });
 
 test("steer: terminal 非法", () => {
 	const sm = make();
 	sm.onExit(ID, { code: 1, signal: null });
-	expectWorkerError(() => sm.steer(ID), "id 已 failed", "重新 run");
+	expectWorkerError(() => sm.steer(ID), "id is failed", "re-run");
 });
 
-test("steer: exited 非法,提示唯一出路 collect 清账", () => {
+test("steer: exited 非法,提示唯一出路 collect 清理", () => {
 	const sm = make();
 	sm.onSettled(ID);
 	sm.onExit(ID, { code: 0, signal: null }); // idle→exited
-	const e = expectWorkerError(() => sm.steer(ID), "id 已 exited", "collect 清账");
+	const e = expectWorkerError(() => sm.steer(ID), "id is exited", "collect to clear");
 	// 提示不得指向非法动作:exited 上 run 被拒(非终态),kill 非法
-	assert.ok(!e.message.includes("重新 run"), `message "${e.message}" names illegal action 重新 run`);
+	assert.ok(!e.message.includes("re-run"), `message "${e.message}" names illegal action re-run`);
 });
 
 test("steer: 未知 id,列存活", () => {
 	const sm = make();
-	expectWorkerError(() => sm.steer("pi-worker-nobody#000000"), "id 不存在", "存活: pi-worker-hank#abc123");
+	expectWorkerError(() => sm.steer("pi-worker-nobody#000000"), "id not found", "alive: pi-worker-hank#abc123");
 });
 
 // ---------- stop ----------
@@ -147,19 +147,19 @@ test("stop: running→stopping", () => {
 test("stop: idle 非法,提示 message/collect", () => {
 	const sm = make();
 	sm.onSettled(ID);
-	expectWorkerError(() => sm.stop(ID), "id 当前 idle", "无需 stop");
+	expectWorkerError(() => sm.stop(ID), "id is idle", "no need to stop");
 });
 
-test("stop: stopping 非法(已 stop)", () => {
+test("stop: stopping 非法(stop 已发)", () => {
 	const sm = make();
 	sm.stop(ID);
-	expectWorkerError(() => sm.stop(ID), "id 当前 stopping", "已 stop");
+	expectWorkerError(() => sm.stop(ID), "id is stopping", "stop already");
 });
 
 test("stop: terminal 非法", () => {
 	const sm = make();
 	sm.onExit(ID, { code: 1, signal: null });
-	expectWorkerError(() => sm.stop(ID), "id 已 failed");
+	expectWorkerError(() => sm.stop(ID), "id is failed");
 });
 
 test("stopping → settled → idle(并入普通 idle,父仍可 collect/follow_up)", () => {
@@ -175,7 +175,7 @@ test("stopping → settled → idle(并入普通 idle,父仍可 collect/follow_u
 test("stopping: follow_up 非法(等 settled)", () => {
 	const sm = make();
 	sm.stop(ID);
-	expectWorkerError(() => sm.followUp(ID), "id 当前 stopping", "已 stop");
+	expectWorkerError(() => sm.followUp(ID), "id is stopping", "stop already");
 });
 
 test("stopping: kill 合法", () => {
@@ -203,22 +203,22 @@ test("follow_up: idle→running", () => {
 
 test("follow_up: running 非法,提示 steer", () => {
 	const sm = make();
-	expectWorkerError(() => sm.followUp(ID), "id 当前 running", "steer");
+	expectWorkerError(() => sm.followUp(ID), "id is running", "steer");
 });
 
 test("follow_up: terminal 非法", () => {
 	const sm = make();
 	sm.onSettled(ID);
 	sm.collect(ID);
-	expectWorkerError(() => sm.followUp(ID), "id 已 done", "重新 run");
+	expectWorkerError(() => sm.followUp(ID), "id is done", "re-run");
 });
 
-test("follow_up: exited 非法(进程已退出),提示唯一出路 collect 清账", () => {
+test("follow_up: exited 非法(进程已退出),提示唯一出路 collect 清理", () => {
 	const sm = make();
 	sm.onSettled(ID);
 	sm.onExit(ID, { code: 0, signal: null }); // idle→exited
-	const e = expectWorkerError(() => sm.followUp(ID), "id 已 exited", "collect 清账");
-	assert.ok(!e.message.includes("重新 run"), `message "${e.message}" names illegal action 重新 run`);
+	const e = expectWorkerError(() => sm.followUp(ID), "id is exited", "collect to clear");
+	assert.ok(!e.message.includes("re-run"), `message "${e.message}" names illegal action re-run`);
 });
 
 // ---------- collect ----------
@@ -240,7 +240,7 @@ test("collect: exited→done", () => {
 
 test("collect: running 非法,提示 kill 或等 settled", () => {
 	const sm = make();
-	expectWorkerError(() => sm.collect(ID), "id 当前 running", "kill");
+	expectWorkerError(() => sm.collect(ID), "id is running", "kill");
 });
 
 test("collect: failed→done(终态清理,清账后可重派)", () => {
@@ -268,30 +268,30 @@ test("kill: idle→killing", () => {
 test("kill: terminal 非法", () => {
 	const sm = make();
 	sm.onExit(ID, { code: 1, signal: null });
-	expectWorkerError(() => sm.kill(ID), "id 已 failed");
+	expectWorkerError(() => sm.kill(ID), "id is failed");
 });
 
-test("kill: exited 非法,提示唯一出路 collect 清账", () => {
+test("kill: exited 非法,提示唯一出路 collect 清理", () => {
 	const sm = make();
 	sm.onSettled(ID);
 	sm.onExit(ID, { code: 0, signal: null });
-	const e = expectWorkerError(() => sm.kill(ID), "id 已 exited", "collect 清账");
-	assert.ok(!e.message.includes("重新 run"), `message "${e.message}" names illegal action 重新 run`);
+	const e = expectWorkerError(() => sm.kill(ID), "id is exited", "collect to clear");
+	assert.ok(!e.message.includes("re-run"), `message "${e.message}" names illegal action re-run`);
 });
 
-test("stop: exited 非法,提示唯一出路 collect 清账", () => {
+test("stop: exited 非法,提示唯一出路 collect 清理", () => {
 	const sm = make();
 	sm.onSettled(ID);
 	sm.onExit(ID, { code: 0, signal: null });
-	const e = expectWorkerError(() => sm.stop(ID), "id 已 exited", "collect 清账");
-	assert.ok(!e.message.includes("重新 run"), `message "${e.message}" names illegal action 重新 run`);
+	const e = expectWorkerError(() => sm.stop(ID), "id is exited", "collect to clear");
+	assert.ok(!e.message.includes("re-run"), `message "${e.message}" names illegal action re-run`);
 });
 
-test("run: exited 记录拒绝,提示 collect 清账(kill 在 exited 非法,不得出现)", () => {
+test("run: exited 记录拒绝,提示 collect 清理(kill 在 exited 非法,不得出现)", () => {
 	const sm = make();
 	sm.onSettled(ID);
 	sm.onExit(ID, { code: 0, signal: null });
-	const e = expectWorkerError(() => sm.run({ id: ID, name: "hank" }), "已存在且未终结", "collect 清账");
+	const e = expectWorkerError(() => sm.run({ id: ID, name: "hank" }), "id exists and not terminal", "collect to clear");
 	assert.ok(!e.message.includes("或 kill"), `message "${e.message}" names illegal action kill`);
 });
 
@@ -340,7 +340,7 @@ test("onExit: idle→exited(进程没了,合法集合只剩 collect/status)", ()
 	const rec = sm.records.get(ID);
 	assert.equal(rec.state, "exited");
 	assert.equal(rec.processExited, true);
-	expectWorkerError(() => sm.followUp(ID), "id 已 exited");
+	expectWorkerError(() => sm.followUp(ID), "id is exited");
 	sm.collect(ID); // collect 仍合法
 	assert.equal(sm.records.get(ID).state, "done");
 });
@@ -383,7 +383,7 @@ test("status: 缺省列全部;未知 id 列存活", () => {
 	sm.onStarted("pi-worker-rin#000001");
 	const all = sm.status();
 	assert.equal(all.length, 2);
-	expectWorkerError(() => sm.status("pi-worker-nobody#000000"), "id 不存在", "存活: pi-worker-hank#abc123, pi-worker-rin#000001");
+	expectWorkerError(() => sm.status("pi-worker-nobody#000000"), "id not found", "alive: pi-worker-hank#abc123, pi-worker-rin#000001");
 });
 
 test("kill→exit→done 全链路", () => {
@@ -392,49 +392,6 @@ test("kill→exit→done 全链路", () => {
 	assert.equal(sm.records.get(ID).state, "killing");
 	sm.onExit(ID, { code: null, signal: "SIGKILL" });
 	assert.equal(sm.records.get(ID).state, "done");
-});
-
-// ---------- recover(启动恢复:jsonl 重建遗留记录) ----------
-
-const RECOVER_INPUT = {
-	id: "pi-worker-hank#0123456789ab",
-	name: "hank",
-	sessionFile: "/repo/.pi/worker-sessions/a.jsonl",
-	createdAt: 100,
-	updatedAt: 200,
-};
-
-test("recover: ∅→exited,显式状态组合(state × recovered provenance),无进程句柄", () => {
-	const sm = new WorkerStateMachine();
-	const rec = sm.recover(RECOVER_INPUT);
-	assert.equal(rec.state, "exited");
-	assert.equal(rec.recovered, true);
-	assert.equal(rec.processExited, true);
-	assert.equal(rec.sessionFile, RECOVER_INPUT.sessionFile);
-	assert.equal(rec.createdAt, 100);
-	assert.equal(rec.updatedAt, 200);
-});
-
-test("recover: 幂等——在册 id 不覆盖(live 记录优先)", () => {
-	const sm = new WorkerStateMachine();
-	sm.run({ id: RECOVER_INPUT.id, name: "hank" });
-	const rec = sm.recover({ ...RECOVER_INPUT, updatedAt: 999 });
-	assert.equal(rec.state, "starting", "在册记录不被恢复覆盖");
-	assert.equal(rec.updatedAt !== 999, true);
-});
-
-test("recover: 遗留记录合法集 = exited 同集(collect → done;steer 非法)", () => {
-	const sm = new WorkerStateMachine();
-	sm.recover(RECOVER_INPUT);
-	expectWorkerError(() => sm.steer(RECOVER_INPUT.id), "已 exited");
-	sm.collect(RECOVER_INPUT.id);
-	assert.equal(sm.status(RECOVER_INPUT.id).state, "done");
-});
-
-test("recover: 遗留 exited 非终态——同合约重派被挡,错误指向 collect", () => {
-	const sm = new WorkerStateMachine();
-	sm.recover(RECOVER_INPUT);
-	expectWorkerError(() => sm.run({ id: RECOVER_INPUT.id, name: "hank" }), "未终结", "collect");
 });
 
 // ---------- rollback(乐观迁移的补偿:CAS) ----------
@@ -475,4 +432,22 @@ test("rollback: 期间被 kill → 不覆盖 killing", () => {
 test("rollback: 不存在的 id → 静默忽略(补偿路径不抛错)", () => {
 	const sm = new WorkerStateMachine();
 	sm.rollback("pi-worker-ghost#000000", "running", "idle");
+});
+
+// ---------- O3 冷恢复 ----------
+test("onResumed:exited→starting,processExited 复位;非 exited 不动", () => {
+	const sm = new WorkerStateMachine();
+	sm.run({ id: ID, name: "hank" });
+	sm.onStarted(ID);
+	sm.onSettled(ID); // idle
+	sm.onExit(ID, { code: 1, signal: null, stderrTail: "" }); // idle 后崩 → exited
+	const before = sm.status(ID);
+	assert.equal(before.state, "exited");
+	sm.onResumed(ID);
+	const rec = sm.status(ID);
+	assert.equal(rec.state, "starting", "exited→starting");
+	assert.equal(rec.processExited, false);
+	// 非 exited 不动
+	sm.onResumed(ID);
+	assert.equal(sm.status(ID).state, "starting", "starting 状态重复调用不动");
 });

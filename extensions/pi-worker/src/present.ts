@@ -127,7 +127,17 @@ export function formatFooter(records: WorkerRecord[], opts: FooterOptions): stri
 	}
 	const decisionParts: string[] = [];
 	if (failed > 0) decisionParts.push(fg("error", `✗ ${failed} failed`));
-	if (idle > 0) decisionParts.push(fg("dim", `✓ ${idle} idle`));
+	// 非正常收尾(length 截断/aborted 中断)的 idle 是需复核的验收对象：标记 + 升 warning 色
+	const idleAbnormal = records.filter((r) => r.state === "idle" && r.stopReason && r.stopReason !== "stop");
+	if (idle > 0) {
+		const tag =
+			idleAbnormal.length === 1
+				? ` stop:${idleAbnormal[0].stopReason}`
+				: idleAbnormal.length > 1
+					? ` ${idleAbnormal.length} 异常收尾`
+					: "";
+		decisionParts.push(fg(idleAbnormal.length > 0 ? "warning" : "dim", `✓ ${idle} idle${tag}`));
+	}
 	if (exited > 0) decisionParts.push(fg("warning", `⏾ ${exited} exited`));
 	// 任一决策待办(失败归因/ idle 验收/ exited 清理)即给行动入口
 	if (failed + idle + exited > 0) decisionParts.push(fg("dim", "/pi-worker"));
@@ -139,7 +149,7 @@ export function formatFooter(records: WorkerRecord[], opts: FooterOptions): stri
 }
 
 export interface CallbackView {
-	kind: "settled" | "message" | "failed" | "recovery" | "action";
+	kind: "settled" | "message" | "failed" | "action";
 	/** ⏺ 主动作行(Claude 动作 bullet,kind 决定颜色) */
 	header: string;
 	/** settled = 四要素呈报 markdown(核验证据段不藏);failed = 诊断 */
@@ -202,6 +212,7 @@ export function formatCallbackView(msg: CallbackMessage): CallbackView {
 		if (typeof d.turns === "number") {
 			statsBits.push(d.turns === 1 ? "1 turn" : `${d.turns} turns`);
 		}
+		// stopReason 不进事件卡(一次性)：它是状态属性，常驻显示归 footer/状态行。
 		const tokens = extractTokens(d.stats);
 		if (tokens !== undefined) statsBits.push(`${formatTokens(tokens)} tokens`);
 		const cost = extractCost(d.stats);
@@ -215,15 +226,6 @@ export function formatCallbackView(msg: CallbackMessage): CallbackView {
 			body,
 			bodyIsMarkdown: true,
 			summary: statsBits.length > 0 ? `⎿ ${statsBits.join(" · ")}` : undefined,
-		};
-	}
-	if (d.type === "recovery") {
-		// 启动恢复:遗留 worker 待审计/清理是决策项(warning 级),非机械留痕
-		return {
-			kind: "recovery",
-			header: `⏺ 启动恢复`,
-			body: String(msg.content ?? ""),
-			bodyIsMarkdown: false,
 		};
 	}
 	// action-done 审计与未知类型:content 即 body,不再静默落 settled 空卡
@@ -245,21 +247,21 @@ function quotedParam(s: string): string {
 
 export function formatToolCallLine(
 	action: string,
-	params: { id?: string; name?: string; prompt?: string; model?: string; thinking?: string; tools?: string },
+	params: { id?: string; name?: string; text?: string; model?: string; thinking?: string; tools?: string },
 ): string {
 	const target = params.name || (params.id ? displayNameOf(params.id) : "");
 	const parts = [action];
 	if (target) parts.push(target);
 	if (action === "run") {
-		if (params.prompt?.trim()) parts.push(quotedParam(params.prompt));
+		if (params.text?.trim()) parts.push(quotedParam(params.text));
 		if (params.tools?.trim()) parts.push(`· tools:${params.tools.trim()}`);
 		if (params.model?.trim()) {
 			parts.push(`· ${params.model.trim()}${params.thinking?.trim() ? ` think:${params.thinking.trim()}` : ""}`);
 		} else if (params.thinking?.trim()) {
 			parts.push(`· think:${params.thinking.trim()}`);
 		}
-	} else if (action === "message" && params.prompt?.trim()) {
-		parts.push(quotedParam(params.prompt));
+	} else if (action === "send" && params.text?.trim()) {
+		parts.push(quotedParam(params.text));
 	}
 	return parts.join(" ");
 }
@@ -342,23 +344,6 @@ function markOf(r: WorkerRecord): { icon: string; color: LineColor; section: Sec
 }
 
 /**
- * recent 条目 → status 可读行(tool call 面向父 LLM:去 TUI 装饰,参数高保真)。
- * start:提取常见参数键(command/path/file)作摘要;end 标 ✓(完成态是审计信号);
- * JSON 解析失败回退剥壳文本。
- */
-export function formatRecentEntry(entry: string): string {
-	if (entry.startsWith("start:")) {
-		const [tool, ...argsRest] = entry.slice(6).split(" ");
-		const args = argsRest.join(" ");
-		const line = args ? `${tool}: ${args}` : tool;
-		return line.length > 60 ? `${line.slice(0, 60)}…` : line;
-	}
-	if (entry.startsWith("end:")) return `${entry.slice(4)} ✓`;
-	if (entry === "turn_end") return "turn_end";
-	return entry.length > 60 ? `${entry.slice(0, 60)}…` : entry;
-}
-
-/**
  * 决策队列投影(分区即治理):decision 区(failed>idle>exited)在前,
  * working 区在后;区内按创建序。终态(done/killing)不列出。
  * 单行主行定宽列(图标+name+runtime右对齐+tN,可扫读);判决证据(failed 诊断/
@@ -376,7 +361,7 @@ export interface OverlayRow {
 	value: string;
 	section: Section;
 	main: OverlayLine;
-	/** 选中行才渲染的补充行(判决证据:遗留标记 / failed 诊断 / 呈报前 3 行) */
+	/** 选中行才渲染的补充行(判决证据:failed 诊断 / 呈报前 3 行) */
 	details: OverlayLine[];
 }
 
@@ -418,12 +403,9 @@ export function formatOverlayRows(
 		// 行单行化:working 态主行带活动短摘要;模型/cost 徽章在 transcript 标题栏
 		const working = r.state === "running" || r.state === "starting" || r.state === "stopping";
 		const main = `${mark.icon} ${cols.join(" ")}${working && r.currentActivity ? ` · ${activityShort(r.currentActivity)}` : ""}`;
+		// 非正常收尾诊断:length(截断)/aborted(中断)进主行,父一眼可见
+		const mainDiag = !working && r.stopReason && r.stopReason !== "stop" ? ` · stop:${r.stopReason}` : "";
 		const details: OverlayLine[] = [];
-		// 遗留记录(exited × recovered 显式状态组合):来源与审计指针带出
-		if (r.recovered) {
-			details.push({ text: "重启遗留:最后状态未知,以 jsonl 为准", color: "warning" });
-			if (r.sessionFile) details.push({ text: r.sessionFile, color: "dim" });
-		}
 		// 判决证据拆封:failed 带退出诊断,idle 带呈报前 3 行;全文在 transcript 视图(L2)
 		if (r.state === "failed") {
 			const diag = [`exit=${r.exitCode ?? r.exitSignal ?? "?"}`];
@@ -435,11 +417,14 @@ export function formatOverlayRows(
 			const cap = 3;
 			for (const line of lines.slice(0, cap)) details.push({ text: line, color: "muted" });
 			if (lines.length > cap) details.push({ text: `…(+${lines.length - cap} 行,transcript 区看全文)`, color: "dim" });
+		} else if (r.reportError) {
+			// 呈报不可取/deliver 失败:诊断进 status,不静默空卡
+			details.push({ text: r.reportError, color: "warning" });
 		}
 		return {
 			value: r.id,
 			section: mark.section,
-			main: { text: main, color },
+			main: { text: main + mainDiag, color },
 			details,
 		};
 	});
@@ -505,7 +490,10 @@ export function actionsFor(rec: WorkerRecord): WorkerAction[] {
 		return [{ value: "kill", label: "kill", description: "撤换", irreversible: true }];
 	}
 	if (rec.state === "exited") {
-		return [{ value: "collect", label: "collect", description: "收尾清理" }];
+		return [
+			{ value: "消息", label: "消息", description: "冷恢复续接(--session 同文件,历史完整;消息即新轮指令)", needsInput: true, inputPrompt: "消息内容:" },
+			{ value: "collect", label: "collect", description: "收尾清理" },
+		];
 	}
 	return [];
 }
@@ -553,138 +541,3 @@ export function opFor(action: WorkerAction, id: string, input?: string): ActionO
 	}
 }
 
-// ---------- transcript 生命周期 block(scrollback 原位更新投影) ----------
-
-/** appendEntry 的数据契约:记录消失(collect)后静态回退渲染所需的最小集。 */
-export interface LifecycleEntryData {
-	id: string;
-	name: string;
-	prompt: string;
-	createdAt: number;
-}
-
-export interface LifecycleView {
-	icon: string;
-	iconColor: LineColor;
-	/** 主行文本(不含图标);色彩恒 dim——语义色由图标承载,正文退后 */
-	text: string;
-	textColor: LineColor;
-	/** expanded(ctrl+o)补充行 */
-	details: OverlayLine[];
-}
-
-const LIFECYCLE_ACTIVITY_MAX = 30;
-
-/** 活动标签:剥 tool: 前缀、压平空白、截断 30(grok "Running: X" 词汇对等物,工具名+参数)。 */
-function lifecycleActivity(activity: string): string {
-	const s = activity.replace(/^tool: /, "").replace(/\s+/g, " ").trim();
-	return s.length > LIFECYCLE_ACTIVITY_MAX ? `${s.slice(0, LIFECYCLE_ACTIVITY_MAX - 1)}…` : s;
-}
-
-/** prompt 单行引号化(复用 renderCall 的 40 字符截断,transcript 内视觉同源)。 */
-function quotedPrompt(prompt: string): string {
-	const oneLine = prompt.replace(/\s+/g, " ").trim();
-	return oneLine ? quotedParam(oneLine) : "";
-}
-
-/**
- * 生命周期 block 投影:grok subagent scrollback block 对等物。
- * 色彩纪律:工作态图标 accent/warning(进行中是唯一需要抓取注意力的状态);
- * 非工作态整体 dim——终态色彩由紧随的回调消息(settled 呈报/failed 诊断)承载,
- * block 退后为留痕。rec 缺失(collect 后)回退 entry data 静态渲染。
- */
-export function formatLifecycle(rec: WorkerRecord | undefined, data: LifecycleEntryData, now: number): LifecycleView {
-	const quoted = quotedPrompt(data.prompt);
-	if (!rec) {
-		return {
-			icon: "●",
-			iconColor: "dim",
-			text: [data.name, quoted].filter(Boolean).join(" "),
-			textColor: "dim",
-			details: data.prompt.split("\n").map((t) => ({ text: t, color: "muted" as const })),
-		};
-	}
-	const head = [rec.name, quoted].filter(Boolean).join(" ");
-	const elapsed = formatRuntime(rec, now);
-	let icon = "●";
-	let iconColor: LineColor = "dim";
-	const extras: string[] = [];
-	switch (rec.state) {
-		case "starting":
-		case "running":
-			iconColor = pulseBright(now) ? "accent" : "dim";
-			if (rec.currentActivity) extras.push(lifecycleActivity(rec.currentActivity));
-			break;
-		case "stopping":
-		case "killing":
-			iconColor = "warning";
-			if (rec.currentActivity) extras.push(lifecycleActivity(rec.currentActivity));
-			break;
-		case "idle":
-			icon = "✓";
-			break;
-		case "failed":
-			icon = "✗";
-			extras.push(`exit=${rec.exitCode ?? rec.exitSignal ?? "?"}`);
-			break;
-		case "exited":
-			icon = "⏾";
-			break;
-		case "done":
-			if (rec.verdict) extras.push(rec.verdict);
-			break;
-	}
-	const text = `${head} · ${elapsed}${extras.length > 0 ? ` · ${extras.join(" · ")}` : ""}`;
-	const details: OverlayLine[] = [];
-	if (rec.recovered) {
-		details.push({ text: "重启遗留:最后状态未知,以 jsonl 为准", color: "warning" });
-	}
-	const model = formatModelInfo(rec);
-	if (model) details.push({ text: model, color: "dim" });
-	if (rec.sessionFile) details.push({ text: rec.sessionFile, color: "dim" });
-	for (const e of rec.recent.slice(-4)) details.push({ text: formatRecentEntry(e), color: "dim" });
-	return { icon, iconColor, text, textColor: "dim", details };
-}
-
-/**
- * 本会话归属判定:branch 文本(JSON.stringify(session entries))里出现该 worker
- * id(run 工具调用留痕)= 本会话遗留;未引用 = 其他父 session 的遗留。
- */
-export function splitLeftoversByReference<T extends { id: string }>(
-	sessions: T[],
-	branchText: string,
-): { own: T[]; foreign: T[] } {
-	const own: T[] = [];
-	const foreign: T[] = [];
-	for (const s of sessions) (branchText.includes(s.id) ? own : foreign).push(s);
-	return { own, foreign };
-}
-
-/**
- * 启动检测提示:显示遗留但不自动认领(认领是显式动作 pi_worker action=recover,
- * 且只认领本会话的;外会话遗留直接新会话查看)。仅在可认领/外会话/可跳过时产出;
- * held-only 不打扰(活窗口自己管理)。
- */
-export function formatLeftoverHint(
-	scan: { sessions: { id: string; sessionFile: string }[]; skipped: string[]; heldElsewhere: string[] },
-	branchText: string,
-): string | undefined {
-	const { own, foreign } = splitLeftoversByReference(scan.sessions, branchText);
-	if (own.length === 0 && foreign.length === 0 && scan.skipped.length === 0) return undefined;
-	const parts: string[] = [];
-	if (own.length > 0) {
-		parts.push(
-			`本会话遗留 ${own.length} 个 worker(未自动认领):${own.map((s) => s.id).join(", ")};pi_worker action=recover 认领审计`,
-		);
-	}
-	if (foreign.length > 0) {
-		parts.push(
-			`非本会话遗留 ${foreign.length} 个 worker(不建记录;直接新会话查看):` +
-				foreign.map((s) => `${s.id} → pi --session ${s.sessionFile}(查看/续接) 或 pi --fork ${s.sessionFile}(新会话)`).join("; ") +
-				`;确认无用可删文件清理`,
-		);
-	}
-	if (scan.skipped.length > 0) parts.push(`跳过不可解析文件: ${scan.skipped.join(", ")}`);
-	if (scan.heldElsewhere.length > 0) parts.push(`另有 ${scan.heldElsewhere.length} 个由其他活窗口持有: ${scan.heldElsewhere.join(", ")}`);
-	return parts.join(";");
-}

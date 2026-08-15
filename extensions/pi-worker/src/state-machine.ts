@@ -10,7 +10,7 @@ export interface ExitInfo {
 
 /** exited 的唯一合法出路:collect(kill/steer/follow_up 非法,run 因非终态被拒)。
  * 提示文案与合法动作集同构——不得指名字典外动作。 */
-const EXITED_HINT = "唯一出路 collect 清账;清账后可按原合约重派";
+const EXITED_HINT = "send to cold-resume (--session, full history) or collect to clear";
 
 /**
  * 纯状态机:事件流 → 状态迁移 + action 合法性校验。无副作用,无进程知识。
@@ -40,9 +40,9 @@ export class WorkerStateMachine {
 		const existing = this.records.get(input.id);
 		if (existing && !TERMINAL_STATES.includes(existing.state)) {
 			// exited 上 kill 非法,通用「先 collect 或 kill」会指到死路;按状态给真实出路
-			const way = existing.state === "exited" ? EXITED_HINT : "先 collect 或 kill";
+			const way = existing.state === "exited" ? EXITED_HINT : "collect or kill first";
 			throw new WorkerError(
-				`id 已存在且未终结: ${input.id};${way},或修改合约生成新 id`,
+				`id exists and not terminal: ${input.id};${way}, or change the contract to get a new id`,
 			);
 		}
 		const now = Date.now();
@@ -53,7 +53,6 @@ export class WorkerStateMachine {
 			processExited: false,
 			createdAt: now,
 			updatedAt: now,
-			recent: [],
 			turns: 0,
 		};
 		if (existing && (existing.exitCode != null || existing.stderrTail)) {
@@ -65,43 +64,17 @@ export class WorkerStateMachine {
 		return rec;
 	}
 
-	/**
-	 * recover:persisted(stateless jsonl)→ live(stateful record),∅→exited
-	 * (最后 live 状态未知,无进程句柄)。
-	 * 显式状态组合:state=exited(合法集只剩 collect/status)× recovered provenance;
-	 * 不新增 unknown 态——那会复制 exited 的合法动作集,一个概念裂成两个词。
-	 * 幂等:在册 id 不覆盖(live 记录优先)。
-	 */
-	recover(input: { id: string; name: string; sessionFile: string; createdAt: number; updatedAt: number }): WorkerRecord {
-		const existing = this.records.get(input.id);
-		if (existing) return existing;
-		const rec: WorkerRecord = {
-			id: input.id,
-			name: input.name,
-			state: "exited",
-			processExited: true,
-			recovered: true,
-			sessionFile: input.sessionFile,
-			createdAt: input.createdAt,
-			updatedAt: input.updatedAt,
-			recent: [],
-			turns: 0,
-		};
-		this.records.set(input.id, rec);
-		return rec;
-	}
-
 	private getLive(id: string): WorkerRecord {
 		const rec = this.records.get(id);
 		if (!rec) {
-			throw new WorkerError(`id 不存在: ${id};存活: ${this.liveIds().join(", ") || "(无)"}`);
+			throw new WorkerError(`id not found: ${id}; alive: ${this.liveIds().join(", ") || "(none)"}`);
 		}
 		return rec;
 	}
 
 	/**
 	 * action 合法性检查。hints 按目标状态给替代建议;exited/terminal 用
-	 * "已 <state>",其余非合法态用 "当前 <state>"。
+	 * "is <state>",其余非合法态同模板。
 	 */
 	private requireState(
 		id: string,
@@ -111,12 +84,12 @@ export class WorkerStateMachine {
 		const rec = this.getLive(id);
 		if (legal.includes(rec.state)) return rec;
 		if (rec.state === "exited") {
-			throw new WorkerError(`id 已 exited: ${id},${hints.exited}`);
+			throw new WorkerError(`id is exited: ${id},${hints.exited}`);
 		}
 		if (TERMINAL_STATES.includes(rec.state)) {
-			throw new WorkerError(`id 已 ${rec.state}: ${id},${hints.terminal}`);
+			throw new WorkerError(`id is ${rec.state}: ${id},${hints.terminal}`);
 		}
-		throw new WorkerError(`id 当前 ${rec.state}: ${id},${hints[rec.state] ?? "无法执行"}`);
+		throw new WorkerError(`id is ${rec.state}: ${id},${hints[rec.state] ?? "no action available"}`);
 	}
 
 	/** starting→running:初始 prompt 被接受。 */
@@ -127,13 +100,22 @@ export class WorkerStateMachine {
 		this.touch(id);
 	}
 
+	/** O3 冷恢复:exited→starting(--session 同文件续接 spawn 起点)。 */
+	onResumed(id: string): void {
+		const rec = this.records.get(id);
+		if (!rec || rec.state !== "exited") return;
+		rec.state = "starting";
+		rec.processExited = false;
+		this.touch(id);
+	}
+
 	/** steer:running→running(运行中干预)。 */
 	steer(id: string): void {
 		this.requireState(id, ["running"], {
-			idle: "用 message 或 collect",
-			stopping: "已 stop,steer 无意义;等 settled 或 kill",
-			starting: "等待启动完成",
-			terminal: "无法 steer;重新 run",
+			idle: "use send or collect",
+			stopping: "stop already sent, steer is meaningless; wait for settled or kill",
+			starting: "wait for startup to finish",
+			terminal: "cannot steer; re-run",
 			exited: EXITED_HINT,
 		});
 		this.touch(id);
@@ -142,10 +124,10 @@ export class WorkerStateMachine {
 	/** stop:running→stopping(立即停止新工作、只收尾呈报)。 */
 	stop(id: string): void {
 		const rec = this.requireState(id, ["running"], {
-			stopping: "已 stop,等 settled 或 kill",
-			idle: "无需 stop;用 message 或 collect",
-			starting: "等待启动完成",
-			terminal: "无需 stop",
+			stopping: "stop already sent, wait for settled or kill",
+			idle: "no need to stop; use send or collect",
+			starting: "wait for startup to finish",
+			terminal: "no need to stop",
 			exited: EXITED_HINT,
 		});
 		rec.state = "stopping";
@@ -155,10 +137,10 @@ export class WorkerStateMachine {
 	/** follow_up:idle→running(追加轮次)。 */
 	followUp(id: string): void {
 		const rec = this.requireState(id, ["idle"], {
-			running: "用 message(steer 投递)或等 settled",
-			stopping: "已 stop,等 settled",
-			starting: "等待启动完成",
-			terminal: "无法 follow_up;重新 run",
+			running: "use send (steer delivery) or wait for settled",
+			stopping: "stop already sent, wait for settled",
+			starting: "wait for startup to finish",
+			terminal: "cannot follow_up; re-run",
 			exited: EXITED_HINT,
 		});
 		rec.state = "running";
@@ -182,10 +164,10 @@ export class WorkerStateMachine {
 	/** collect:idle|exited|failed→done(父验收后收尾;failed = 终态清理,清账后重派)。 */
 	collect(id: string): void {
 		const rec = this.requireState(id, ["idle", "exited", "failed"], {
-			running: "先 kill 或等 settled",
-			stopping: "已 stop,等 settled",
-			starting: "先 kill 或等 settled",
-			terminal: "无需 collect",
+			running: "kill first or wait for settled",
+			stopping: "stop already sent, wait for settled",
+			starting: "kill first or wait for settled",
+			terminal: "no need to collect",
 		});
 		rec.state = "done";
 		this.touch(id);
@@ -194,7 +176,7 @@ export class WorkerStateMachine {
 	/** kill:starting|running|stopping|idle→killing(撤换;进程退出后经 onExit → done)。 */
 	kill(id: string): void {
 		const rec = this.requireState(id, ["starting", "running", "stopping", "idle"], {
-			terminal: "无法 kill",
+			terminal: "cannot kill",
 			exited: EXITED_HINT,
 		});
 		rec.state = "killing";

@@ -62,9 +62,31 @@ describe("formatCallback settled XML 注入", () => {
 		assert.match(msg.content, /<report>\nr\n<\/report>/);
 	});
 
+	test("report 超 8000 字符 → LLM 注入面截断标注,details.report 留全文(渲染层不受影响)", () => {
+		const long = "x".repeat(9000);
+		const msg = formatCallback({
+			type: "settled",
+			id: "pi-worker-hank#aaaaaa",
+			name: "hank",
+			report: long,
+		});
+		assert.ok(/…\(截断|…\(truncated/.test(msg.content), "content 应有截断标注(注:文案语言无关)");
+		assert.ok(!msg.content.includes(long), "content 不含全文");
+		assert.equal(msg.details.report, long, "details 留全文(渲染层读这里)");
+	});
+
+	test("非正常 stopReason(length/aborted)→ 模板输出 <stop_reason>;stop 不输出", () => {
+		const aborted = formatCallback({ type: "settled", id: "pi-worker-hank#aaaaaa", name: "hank", report: "r", stopReason: "aborted" });
+		assert.match(aborted.content, /<stop_reason>aborted<\/stop_reason>/);
+		assert.equal(aborted.details.stopReason, "aborted");
+		const ok = formatCallback({ type: "settled", id: "pi-worker-hank#aaaaaa", name: "hank", report: "r", stopReason: "stop" });
+		assert.ok(!ok.content.includes("stop_reason"), "stop 是正常收尾,不占行");
+		assert.equal(ok.details.stopReason, "stop", "details 仍透传");
+	});
 	test("report 缺失 → 回退占位进 <report>,details.report 保留原始值", () => {
 		const msg = formatCallback({ type: "settled", id: "pi-worker-hank#aaaaaa", name: "hank", reportError: "rpc 断" });
-		assert.match(msg.content, /<report>\n\(呈报获取失败: rpc 断\)\n<\/report>/);
+		assert.match(msg.content, /<report>\n\([^\n]*\n<\/report>/);
+		assert.ok(!msg.content.includes("<report>\nr\n</report>"), "report 缺失时不是原始 report");
 		assert.equal(msg.details.report, undefined);
 		assert.equal(msg.details.reportError, "rpc 断");
 	});

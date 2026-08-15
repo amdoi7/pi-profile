@@ -90,15 +90,20 @@ test("tool_start 多标量 → 主语 + key=value(无键白名单,首个标量�
 	assert.equal(emitted[0].args, "a · newText=b");
 });
 
-test("message_end 不产生事件(turn 话语投影已移除);增量(text_delta)亦不产生", () => {
+test("message_end(user/assistant) → entry 事件(transcript 饲料);增量与 custom 不产生", () => {
 	const { events, emitted } = setup();
 	events.emitEvent({
 		type: "message_end",
 		message: { role: "assistant", content: [{ type: "text", text: "正在核对" }, { type: "text", text: "测试结果" }] },
 	});
 	events.emitEvent({ type: "message_end", message: { role: "user", content: "任务" } });
+	events.emitEvent({ type: "message_end", message: { role: "toolResult", content: "…" } });
+	events.emitEvent({ type: "message_end", customType: "RoomBus", message: { role: "user", content: "注入" } });
 	events.emitEvent({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "你好" } });
-	assert.equal(emitted.length, 0);
+	const entries = emitted.filter((e) => e.type === "entry");
+	assert.equal(entries.length, 2, "user/assistant 终稿产 entry;toolResult/custom 不产");
+	assert.equal(entries[0].entry.message.role, "assistant");
+	assert.equal(entries[1].entry.message.role, "user");
 });
 
 test("子 extension dialog → dialog 事件;notify 不产生事件", () => {

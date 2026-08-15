@@ -23,7 +23,7 @@ test("spawn 失败(error,pid 未定)→ pending reject 带 err.message,exitCbs �
 	proc.emit("error", Object.assign(new Error("spawn pi ENOENT"), { code: "ENOENT" }));
 	await assert.rejects(p, /ENOENT/);
 	assert.deepEqual(exits, [[null, null]]);
-	await assert.rejects(rpc.send({ type: "prompt", message: "x" }), /已退出/);
+	await assert.rejects(rpc.send({ type: "prompt", message: "x" }), /child exited/);
 });
 
 test("error 后 exit 同来 → exitCbs 只触发一次(守卫)", () => {
@@ -43,7 +43,7 @@ test("正常 exit → pending reject + exitCbs(code, signal)", async () => {
 	rpc.on("exit", (code, signal) => exits.push([code, signal]));
 	const p = rpc.send({ type: "get_state" });
 	proc.emit("exit", 0, null);
-	await assert.rejects(p, /已退出/);
+	await assert.rejects(p, /child exited/);
 	assert.deepEqual(exits, [[0, null]]);
 });
 

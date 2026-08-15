@@ -15,9 +15,6 @@ import {
 	formatRecentEntry,
 	formatActionMessage,
 	opFor,
-	formatLifecycle,
-	formatLeftoverHint,
-	splitLeftoversByReference,
 } from "../src/present.ts";
 import { WorkerError } from "../src/state-machine.ts";
 
@@ -30,7 +27,6 @@ function rec(partial) {
 		turns: 0,
 		createdAt: 0,
 		updatedAt: 0,
-		recent: [],
 		...partial,
 	};
 }
@@ -44,11 +40,8 @@ describe("formatFooter", () => {
 	const F0 = 1_000_000_000;
 	const fg = (c, t) => `<${c}>${t}</>`;
 
-	test("空记录 → undefined", () => {
+	test("空记录 / 无投影内容(全终态)→ undefined", () => {
 		assert.equal(formatFooter([], { now: F0 }), undefined);
-	});
-
-	test("无投影内容(done/killing)→ undefined", () => {
 		const records = [rec({ state: "done" }), rec({ state: "killing" })];
 		assert.equal(formatFooter(records, { now: F0 }), undefined);
 	});
@@ -123,6 +116,22 @@ describe("formatFooter", () => {
 		assert.equal(formatFooter(records, { now: F0 }), "✓ 1 idle · /pi-worker");
 	});
 
+	test("idle 非正常收尾(stopReason≠stop)→ 标记进 footer 且升 warning 色(常驻状态面,不靠事件卡)", () => {
+		const records = [rec({ id: "pi-worker-a#111111111111", name: "a", state: "idle", stopReason: "aborted" })];
+		assert.equal(formatFooter(records, { now: F0 }), "✓ 1 idle stop:aborted · /pi-worker");
+		assert.ok(formatFooter(records, { now: F0, fg }).includes("<warning>✓ 1 idle stop:aborted</>"));
+		// 正常 stop 的 idle 不占行(原色原文)
+		const okIdle = [rec({ id: "pi-worker-a#111111111111", name: "a", state: "idle", stopReason: "stop" })];
+		assert.equal(formatFooter(okIdle, { now: F0 }), "✓ 1 idle · /pi-worker");
+		// 多个 idle 部分异常 → 聚合计数
+		const mixed = [
+			rec({ id: "pi-worker-a#111111", name: "a", state: "idle", stopReason: "length" }),
+			rec({ id: "pi-worker-b#222222", name: "b", state: "idle", stopReason: "aborted" }),
+			rec({ id: "pi-worker-c#333333", name: "c", state: "idle", stopReason: "stop" }),
+		];
+		assert.equal(formatFooter(mixed, { now: F0 }), "✓ 3 idle 2 异常收尾 · /pi-worker");
+	});
+
 	test("双区并存:决策区在左(截尾先丢工作区,行动入口不可被截)", () => {
 		const records = [
 			rec({ state: "running", turns: 3, createdAt: F0 }),
@@ -162,6 +171,13 @@ describe("formatCallbackView", () => {
 		assert.equal(view.summary, "⎿ 3 turns · 45.2k tokens · $0.0042");
 	});
 
+	test("settled:stopReason 不进事件卡摘要(状态诊断归 footer/状态行,事件卡不钉)", () => {
+		const view = formatCallbackView(
+			msg({ type: "settled", name: "hank", report: "r", turns: 1, stopReason: "aborted" }),
+		);
+		assert.equal(view.summary, "⎿ 1 turn", "摘要只带 turns/tokens/cost,不带 stopReason");
+	});
+
 	test("settled:无 stats 无 turns → 无摘要", () => {
 		const view = formatCallbackView(msg({ type: "settled", name: "hank", report: "r" }));
 		assert.equal(view.summary, undefined);
@@ -185,14 +201,12 @@ describe("formatCallbackView", () => {
 		assert.ok(view.body.includes("SIGKILL"));
 	});
 
-	test("recovery(启动恢复):独立类型,warning 级呈现(遗留 worker 待审计/清理是决策项,非机械留痕)", () => {
+	test("recovery 类型已移除:未知类型落 action 兜底(不再有独立 recovery 卡)", () => {
 		const v = formatCallbackView({
-			content: "启动恢复:重建 2 个遗留 worker(state=exited,最后状态未知,以 jsonl 为准);pi-worker-a#111111111111, pi-worker-b#222222222222;status 审计,collect 清理",
+			content: "旧 recovery 消息(不应再产生)",
 			details: { type: "recovery", id: "recovery" },
 		});
-		assert.equal(v.kind, "recovery");
-		assert.ok(v.header.includes("启动恢复"));
-		assert.ok(v.body.includes("pi-worker-a#111111111111"), "id 列表在 body");
+		assert.equal(v.kind, "action", "未知/旧类型走 action 兜底");
 	});
 
 	test("action-done(审计):content 即 body,不再落空 settled 卡", () => {
@@ -232,26 +246,26 @@ describe("formatCallbackView", () => {
 });
 
 describe("formatToolCallLine", () => {
-	test("run:name + prompt 摘要(40 字符截断)+ 显式 model/thinking", () => {
-		assert.equal(formatToolCallLine("run", { name: "zhizao", prompt: "写测试" }), 'run zhizao "写测试"');
+	test("run:name + text 摘要(40 字符截断)+ 显式 model/thinking", () => {
+		assert.equal(formatToolCallLine("run", { name: "zhizao", text: "写测试" }), 'run zhizao "写测试"');
 		assert.equal(
-			formatToolCallLine("run", { name: "zhizao", prompt: "写测试", model: "opencode-go/deepseek-v4-flash", thinking: "max" }),
+			formatToolCallLine("run", { name: "zhizao", text: "写测试", model: "opencode-go/deepseek-v4-flash", thinking: "max" }),
 			'run zhizao "写测试" · opencode-go/deepseek-v4-flash think:max',
 		);
 		assert.equal(
-			formatToolCallLine("run", { name: "zhizao", prompt: "t".repeat(50) }),
+			formatToolCallLine("run", { name: "zhizao", text: "t".repeat(50) }),
 			`run zhizao "${"t".repeat(40)}…"`,
 		);
 		// thinking 单独指定(默认模型 + 升档):无 model 段
-		assert.equal(formatToolCallLine("run", { name: "zhizao", prompt: "x", thinking: "high" }), 'run zhizao "x" · think:high');
+		assert.equal(formatToolCallLine("run", { name: "zhizao", text: "x", thinking: "high" }), 'run zhizao "x" · think:high');
 		// tools:显式工具面(只读隔离)渲染,缺省不渲染
-		assert.equal(formatToolCallLine("run", { name: "zhizao", prompt: "审", tools: "read,ls" }), 'run zhizao "审" · tools:read,ls');
+		assert.equal(formatToolCallLine("run", { name: "zhizao", text: "审", tools: "read,ls" }), 'run zhizao "审" · tools:read,ls');
 	});
 
-	test("message:id 显示为 name(去 hash)+ 消息文本摘要", () => {
+	test("send:id 显示为 name(去 hash)+ 消息文本摘要", () => {
 		assert.equal(
-			formatToolCallLine("message", { id: "pi-worker-hank#a1b2c3d4e5f6", prompt: "先修断言" }),
-			'message hank "先修断言"',
+			formatToolCallLine("send", { id: "pi-worker-hank#a1b2c3d4e5f6", text: "先修断言" }),
+			'send hank "先修断言"',
 		);
 	});
 
@@ -423,20 +437,6 @@ describe("formatOverlayRows", () => {
 		);
 	});
 
-		describe("formatRecentEntry(tool call 可读行)", () => {
-		test("start:args 已是 watcher 摘要,直接拼 tool: args", () => {
-			assert.equal(formatRecentEntry("start:bash cd /Users/amdoi7/Desktop/ai4x"), "bash: cd /Users/amdoi7/Desktop/ai4x");
-			assert.equal(formatRecentEntry("start:read src/foo.ts"), "read: src/foo.ts");
-			const long = "x".repeat(70);
-			assert.equal(formatRecentEntry(`start:bash ${long}`).length, 61); // 总行 60 截断
-		});
-		test("end 标完成,turn_end/msg 保文字", () => {
-			assert.equal(formatRecentEntry("end:bash"), "bash ✓");
-			assert.equal(formatRecentEntry("turn_end"), "turn_end");
-			assert.equal(formatRecentEntry("msg:seal→zhizao 证据已齐"), "msg:seal→zhizao 证据已齐");
-		});
-	});
-
 		test("判决证据拆封:failed 首行 exit/stderr 诊断;idle 呈报封顶 3 行 + transcript 指引(全文在 L2 视图)", () => {
 		const failed = formatOverlayRows(
 			[rec({ id: "pi-worker-f#111111111111", name: "f", state: "failed", exitCode: 1, stderrTail: "boom", createdAt: 1 })],
@@ -488,15 +488,14 @@ describe("formatOverlayRows", () => {
 		assert.deepEqual(rows.map((r) => r.value), ["pi-worker-z#333333333333"]);
 	});
 
-	test("遗留记录(exited × recovered 显式状态组合):details 带来源标记与 session 审计指针", () => {
+	test("exited 记录:待清理决策区,无遗留来源标注(启动恢复已移除)", () => {
 		const rows = formatOverlayRows(
-			[rec({ state: "exited", recovered: true, sessionFile: "/repo/.pi/worker-sessions/a.jsonl", createdAt: 1 })],
+			[rec({ state: "exited", sessionFile: "/repo/.pi/worker-sessions/a.jsonl", createdAt: 1 })],
 			1_000_000,
 		);
-		assert.equal(rows[0].section, "decision", "遗留 = 待清理决策");
+		assert.equal(rows[0].section, "decision", "exited = 待清理决策");
 		const texts = rows[0].details.map((d) => d.text).join("\n");
-		assert.ok(texts.includes("重启遗留"), texts);
-		assert.ok(texts.includes("/repo/.pi/worker-sessions/a.jsonl"), texts);
+		assert.ok(!texts.includes("重启遗留"), "无恢复来源标注");
 	});
 });
 
@@ -548,8 +547,8 @@ describe("actionsFor(与状态机合法集一致)", () => {
 	function r(state, extra = {}) {
 		return rec({ id: "pi-worker-x#111111111111", name: "x", state, ...extra });
 	}
-	test("exited 只给 collect", () => {
-		assert.deepEqual(actionsFor(r("exited")).map((a) => a.value), ["collect"]);
+	test("exited:消息(冷恢复续接)+ collect", () => {
+		assert.deepEqual(actionsFor(r("exited")).map((a) => a.value), ["消息", "collect"]);
 	});
 	test("stopping 只给 kill", () => {
 		assert.deepEqual(actionsFor(r("stopping")).map((a) => a.value), ["kill"]);
@@ -581,129 +580,3 @@ describe("actionsFor(与状态机合法集一致)", () => {
 	});
 });
 
-describe("formatLifecycle", () => {
-	const F0 = 1_000_000_000;
-	const data = { id: "pi-worker-hank#a1b2c3d4e5f6", name: "hank", prompt: "fix auth bug", createdAt: F0 };
-
-	test("running 带活动:● 脉冲(偶数秒 accent/奇数秒 dim),name + 引号 prompt + elapsed + 活动(剥 tool: 前缀)", () => {
-		const r = rec({ state: "running", createdAt: F0, currentActivity: 'tool: rg "pi_worker"' });
-		const bright = formatLifecycle(r, data, F0 + 46_000); // 偶数秒
-		assert.equal(bright.icon, "●");
-		assert.equal(bright.iconColor, "accent");
-		assert.equal(bright.text, 'hank "fix auth bug" · 46s · rg "pi_worker"');
-		assert.equal(bright.textColor, "dim");
-		const dark = formatLifecycle(r, data, F0 + 45_000); // 奇数秒
-		assert.equal(dark.iconColor, "dim", "脉冲回 dim(词汇静态,颜色呼吸)");
-	});
-
-	test("starting 无活动:无活动段", () => {
-		const v = formatLifecycle(rec({ state: "starting", createdAt: F0 }), data, F0 + 5_000);
-		assert.equal(v.text, 'hank "fix auth bug" · 5s');
-	});
-
-	test("stopping:● warning(收尾告警)", () => {
-		const v = formatLifecycle(rec({ state: "stopping", createdAt: F0 }), data, F0 + 5_000);
-		assert.equal(v.icon, "●");
-		assert.equal(v.iconColor, "warning");
-	});
-
-	test("idle:✓ 整体 dim(色彩让位于紧随的呈报回调),保留 elapsed", () => {
-		const v = formatLifecycle(rec({ state: "idle", createdAt: F0 }), data, F0 + 90_000);
-		assert.equal(v.icon, "✓");
-		assert.equal(v.iconColor, "dim");
-		assert.equal(v.text, 'hank "fix auth bug" · 1m30s');
-	});
-
-	test("failed:✗ dim + exit 诊断", () => {
-		const v = formatLifecycle(rec({ state: "failed", createdAt: F0, exitCode: 1 }), data, F0 + 10_000);
-		assert.equal(v.icon, "✗");
-		assert.equal(v.text, 'hank "fix auth bug" · 10s · exit=1');
-	});
-
-	test("exited:⏾ dim", () => {
-		const v = formatLifecycle(rec({ state: "exited", createdAt: F0 }), data, F0 + 10_000);
-		assert.equal(v.icon, "⏾");
-	});
-
-	test("done 带 verdict:● dim + 判决留痕", () => {
-		const v = formatLifecycle(rec({ state: "done", createdAt: F0, verdict: "通过" }), data, F0 + 10_000);
-		assert.equal(v.icon, "●");
-		assert.equal(v.iconColor, "dim");
-		assert.equal(v.text, 'hank "fix auth bug" · 10s · 通过');
-	});
-
-	test("记录缺失(collect 后):静态回退 entry data,● dim 无 elapsed", () => {
-		const v = formatLifecycle(undefined, data, F0 + 10_000);
-		assert.equal(v.icon, "●");
-		assert.equal(v.iconColor, "dim");
-		assert.equal(v.text, 'hank "fix auth bug"');
-	});
-
-	test("prompt 超 40 截断;活动超 30 截断", () => {
-		const longData = { ...data, prompt: "x".repeat(50) };
-		const r = rec({ state: "running", createdAt: F0, currentActivity: `tool: bash ${"y".repeat(40)}` });
-		const v = formatLifecycle(r, longData, F0);
-		assert.ok(v.text.includes(`"${"x".repeat(40)}…"`), "prompt 截断");
-		const activity = v.text.split(" · ").pop();
-		assert.ok(activity.startsWith("bash ") && activity.endsWith("…"), "activity 截断");
-		assert.ok(activity.length <= 30, "activity ≤30 字符");
-	});
-
-	test("expanded details:模型行 + sessionFile + recent 尾;recovered 警示", () => {
-		const r = rec({
-			state: "idle",
-			createdAt: F0,
-			modelInfo: { provider: "opencode-go", id: "deepseek-v4-flash", thinkingLevel: "low" },
-			sessionFile: "/tmp/s.jsonl",
-			recent: ["start:bash ls", "end:bash"],
-			recovered: true,
-		});
-		const v = formatLifecycle(r, data, F0);
-		const texts = v.details.map((d) => d.text);
-		assert.ok(texts.some((t) => t.includes("deepseek-v4-flash") && t.includes("think:low")), "模型行");
-		assert.ok(texts.some((t) => t === "/tmp/s.jsonl"), "sessionFile");
-		assert.ok(texts.some((t) => t.includes("bash: ls")), "recent 投影");
-		assert.ok(v.details.some((d) => d.color === "warning"), "recovered 警示");
-	});
-
-	test("记录缺失时 expanded details 给完整 prompt", () => {
-		const v = formatLifecycle(undefined, { ...data, prompt: "p1\np2" }, F0);
-		assert.deepEqual(v.details.map((d) => d.text), ["p1", "p2"]);
-	});
-});
-
-describe("splitLeftoversByReference + formatLeftoverHint(本会话归属判定)", () => {
-	const sessions = [
-		{ id: "pi-worker-a#111111111111", name: "a", sessionFile: "/tmp/a.jsonl", createdAt: 1, updatedAt: 1 },
-		{ id: "pi-worker-b#222222222222", name: "b", sessionFile: "/tmp/b.jsonl", createdAt: 2, updatedAt: 2 },
-	];
-	// branch 里含 a 的 id(run 工具调用留痕),不含 b
-	const branchText = JSON.stringify([
-		{ type: "message", message: { role: "assistant", content: [{ type: "toolCall", name: "pi_worker", arguments: { name: "a" } }] } },
-		"结果:id=pi-worker-a#111111111111 pid=42",
-	]);
-
-	test("split:branch 引用的 id = 本会话遗留;未引用 = 外会话", () => {
-		const { own, foreign } = splitLeftoversByReference(sessions, branchText);
-		assert.deepEqual(own.map((s) => s.id), ["pi-worker-a#111111111111"]);
-		assert.deepEqual(foreign.map((s) => s.id), ["pi-worker-b#222222222222"]);
-	});
-
-	test("hint:own → recover 显式认领指引;foreign → pi --resume 直接新会话查看指引(不建记录)", () => {
-		const hint = formatLeftoverHint({ sessions, skipped: [], heldElsewhere: [] }, branchText);
-		assert.ok(hint.includes("pi_worker action=recover"), "own 认领指引");
-		assert.ok(hint.includes("pi-worker-a#111111111111"));
-		assert.ok(hint.includes("pi --session /tmp/b.jsonl") && hint.includes("pi --fork /tmp/b.jsonl"), "foreign 查看/派生新会话指引");
-		assert.ok(hint.includes("非本会话"), "foreign 语义标注");
-	});
-
-	test("hint:全空/held-only → undefined(不打扰)", () => {
-		assert.equal(formatLeftoverHint({ sessions: [], skipped: [], heldElsewhere: [] }, ""), undefined);
-		assert.equal(formatLeftoverHint({ sessions: [], skipped: [], heldElsewhere: ["pi-worker-x#111111111111"] }, ""), undefined);
-	});
-
-	test("hint:skipped 声明保留", () => {
-		const hint = formatLeftoverHint({ sessions: [], skipped: ["broken.jsonl"], heldElsewhere: [] }, "");
-		assert.ok(hint.includes("broken.jsonl"));
-	});
-});

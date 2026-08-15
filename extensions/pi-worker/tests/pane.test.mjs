@@ -1,21 +1,20 @@
 import { describe, test } from "vitest";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 
 import { WorkerPaneComponent, paneOverlayOptions } from "../src/pane.ts";
 
+// 测试 theme stub 输出真实 ANSI 序列(与 pi 渲染一致):truncateToWidth 只认
+// ANSI 不认 <c> 标记,双栏窄宽截断必须走真实路径才不破坏样式结构。
 const theme = {
-	fg: (c, t) => `<${c}>${t}</>`,
-	bold: (t) => `*${t}*`,
-	bg: (_c, t) => t,
+	fg: (c, t) => `\x1b[38;5;1m${t}\x1b[0m`,
+	bold: (t) => `\x1b[1m${t}\x1b[0m`,
+	bg: (c, t) => `\x1b[48;5;1m${t}\x1b[0m`,
 	accent: "",
 };
 
-/** 剥离 theme stub 标记(<c>…</> 与 *bold*),断言纯文本内容。 */
+/** 剥离 ANSI 序列,断言纯文本内容。 */
 function strip(s) {
-	return s.replace(/<\/?[a-zA-Z]*>/g, "").replace(/\*/g, "");
+	return s.replace(/\x1b\[[0-9;]*m/g, "");
 }
 
 function rec(partial) {
@@ -27,18 +26,13 @@ function rec(partial) {
 		turns: 1,
 		createdAt: 1_000_000_000,
 		updatedAt: 0,
-		recent: [],
 		...partial,
 	};
 }
 
-function fixtureFile(text) {
-	const dir = mkdtempSync(join(tmpdir(), "pi-worker-pane-"));
-	const file = join(dir, "s.jsonl");
-	const header = { type: "session", version: 3, id: "s", timestamp: "t", cwd: "/x" };
-	const entries = [header, { type: "message", id: "e0", parentId: null, timestamp: "t", message: { role: "user", content: text } }];
-	writeFileSync(file, entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
-	return file;
+function fixtureEntries(text) {
+	// transcript 数据源已平铺为 SessionEntry[](manager 持有);测试直给条目,不建文件
+	return [{ type: "message", message: { role: "user", content: text } }];
 }
 
 const tui = { terminal: { rows: 50, columns: 120 }, requestRender() {} };
@@ -48,7 +42,7 @@ function setup(records, files = {}, extra = {}) {
 	const pane = new WorkerPaneComponent({
 		records: () => records,
 		providerNameFor: () => undefined,
-		sessionFileFor: (r) => files[r.id] ?? "",
+		transcriptView: (id) => files[id],
 		theme,
 		tui,
 		onClose: () => calls.close++,
@@ -61,7 +55,7 @@ function setup(records, files = {}, extra = {}) {
 describe("合并单窗口(list + transcript 同屏)", () => {
 	test("一个 render 同时含决策队列与选中 worker 的 transcript(取消多窗口)", () => {
 		const a = rec({ id: "pi-worker-a#111111111111", name: "a", state: "idle", report: "改动:x" });
-		const out = strip(setup([a], { [a.id]: fixtureFile("任务全文A") }).pane.render(80).join("\n"));
+		const out = strip(setup([a], { [a.id]: fixtureEntries("任务全文A") }).pane.render(80).join("\n"));
 		assert.ok(out.includes("待决策"), "list 区");
 		assert.ok(out.includes("✓ a"), "worker 行");
 		assert.ok(out.includes("改动:x"), "判决证据拆封内联");
@@ -71,7 +65,7 @@ describe("合并单窗口(list + transcript 同屏)", () => {
 	test("选中切换 → transcript 区跟随重定向", () => {
 		const a = rec({ id: "pi-worker-a#111111111111", name: "a", state: "idle" });
 		const b = rec({ id: "pi-worker-b#222222222222", name: "b", state: "idle" });
-		const { pane } = setup([a, b], { [a.id]: fixtureFile("内容A"), [b.id]: fixtureFile("内容B") });
+		const { pane } = setup([a, b], { [a.id]: fixtureEntries("内容A"), [b.id]: fixtureEntries("内容B") });
 		assert.ok(strip(pane.render(80).join("\n")).includes("内容A"));
 		pane.handleInput("\x1b[B"); // ↓ 选中 b
 		const out = strip(pane.render(80).join("\n"));
@@ -87,18 +81,16 @@ describe("合并单窗口(list + transcript 同屏)", () => {
 		assert.ok(out.includes("无 session 文件"), "缺文件提示");
 	});
 
-	test("tab 切到 transcript 区:↓ 滚动 transcript 而非移动选中;esc 回 list 区不关窗", () => {
+	test("单焦点无切换:tab 无操作;PgUp/PgDn 翻看 transcript 不改变选中;esc 直接关窗", () => {
 		const a = rec({ id: "pi-worker-a#111111111111", name: "a", state: "idle" });
 		const b = rec({ id: "pi-worker-b#222222222222", name: "b", state: "idle" });
-		const { pane, calls } = setup([a, b], { [a.id]: fixtureFile("A"), [b.id]: fixtureFile("B") });
-		pane.handleInput("\t"); // → transcript 区
-		pane.handleInput("\x1b[B"); // ↓:滚动 transcript,选中不动
+		const { pane, calls } = setup([a, b], { [a.id]: fixtureEntries("A"), [b.id]: fixtureEntries("B") });
+		pane.handleInput("\t"); // tab 无操作(无 zone 切换,单焦点)
+		pane.handleInput("\x1b[B"); // ↓:恒选择 worker(不是滚动 transcript)
 		const out = strip(pane.render(80).join("\n"));
-		assert.ok(out.split("\n").some((l) => l.startsWith("→ ✓ a")), "选中仍是 a");
-		pane.handleInput("\x1b"); // esc:回 list 区
-		assert.equal(calls.close, 0, "不关窗");
-		pane.handleInput("\x1b[B");
-		assert.ok(strip(pane.render(80).join("\n")).split("\n").some((l) => l.startsWith("→ ✓ b")), "回 list 后 ↓ 移动选中");
+		assert.ok(out.split("\n").some((l) => l.startsWith("→ └─ ✓ b")), "↓ 恒移动选中");
+		pane.handleInput("\x1b"); // esc:直接关窗(无 zone 分层)
+		assert.equal(calls.close, 1, "esc 关窗");
 	});
 
 	test("esc 在 list 区关闭窗口", () => {
@@ -112,14 +104,14 @@ describe("合并单窗口(list + transcript 同屏)", () => {
 			rec({ id: "pi-worker-a#111111111111", name: "a", state: "idle" }),
 			...Array.from({ length: 3 }, (_, i) => rec({ id: `pi-worker-e${i}#22222222222${i}`, name: `e${i}`, state: "exited" })),
 		];
-		const { pane } = setup(records, { "pi-worker-a#111111111111": fixtureFile("甲") });
+		const { pane } = setup(records, { "pi-worker-a#111111111111": fixtureEntries("甲") });
 		let out = strip(pane.render(80).join("\n"));
 		assert.ok(out.includes("exited ×3"), "聚合行");
 		assert.ok(!out.includes("⏾ e0"), "exited 行不单独列出");
 		assert.ok(out.includes("❯ 甲"), "初始 transcript 是首个真实选中");
 		pane.handleInput("\x1b[B"); // ↓ 选中折叠行
 		out = strip(pane.render(80).join("\n"));
-		assert.ok(out.includes("→ ⏾ exited ×3"), "折叠行可选中");
+		assert.ok(out.includes("→ └─ ⏾ exited ×3"), "折叠行可选中");
 		assert.ok(out.includes("⏾ e0") && out.includes("⏾ e2"), "折叠行选中:transcript 区预览被聚合成员");
 		pane.handleInput("\r"); // enter 展开
 		out = strip(pane.render(80).join("\n"));
@@ -136,7 +128,46 @@ describe("合并单窗口(list + transcript 同屏)", () => {
 		for (let i = 0; i < 7; i++) pane.handleInput("\x1b[B");
 		const lines = pane.render(60);
 		assert.ok(lines.length <= 20, `渲染 ${lines.length} 行 ≤ 终端高度`);
-		assert.ok(strip(lines.join("\n")).split("\n").some((l) => l.startsWith("→ ✓ w7")), "选中行可见");
+		assert.ok(strip(lines.join("\n")).split("\n").some((l) => l.startsWith("→ └─ ✓ w7")), "选中行可见");
+	});
+});
+
+describe("光标可见性(选中行恒 → + selectedBg 整行高亮)", () => {
+	// 断言模式:strip 后定位光标行文本,再验 raw 行首 selectedBg 标记(整行高亮)
+	const cursorLine = (pane, startsWith) => {
+		const raw = pane.render(80);
+		const line = raw.find((l) => strip(l).startsWith(startsWith));
+		assert.ok(line, `找不到光标行: ${startsWith}`);
+		assert.ok(line.startsWith("\x1b[48"), `光标行未整行高亮: ${strip(line).slice(0, 40)}`);
+		return raw;
+	};
+
+	test("list 区:选中行 → + selectedBg 整行高亮,非选中行不高亮", () => {
+		const a = rec({ id: "pi-worker-a#111111111111", name: "a", state: "idle" });
+		const b = rec({ id: "pi-worker-b#222222222222", name: "b", state: "idle" });
+		const { pane } = setup([a, b], {});
+		cursorLine(pane, "→ ├─ ✓ a");
+		const other = pane.render(80).find((l) => strip(l).startsWith("  └─ ✓ b"));
+		assert.ok(other && !other.startsWith("\x1b[48"), "非选中行不高亮");
+	});
+
+	test("transcript 标题行不带箭头(单焦点,list 的 → 即唯一光标)", () => {
+		const a = rec({ id: "pi-worker-a#111111111111", name: "a", state: "idle" });
+		const b = rec({ id: "pi-worker-b#222222222222", name: "b", state: "idle" });
+		const { pane } = setup([a, b], {});
+		const lines = pane.render(80);
+		const title = lines.find((l) => strip(l).includes("✓ a") && !strip(l).includes("t1"));
+		assert.ok(title, "标题行在(右栏)");
+		assert.ok(!strip(title).trimStart().startsWith("→ "), "标题行无箭头(唯一光标在左栏)");
+	});
+
+	test("actions stage:选中动作行同样高亮", () => {
+		const r = rec({ state: "idle" });
+		const { pane } = setup([r], {});
+		pane.handleInput("\r"); // → actions
+		const raw = pane.render(80);
+		const line = raw.find((l) => strip(l).startsWith("→ 通过"));
+		assert.ok(line && line.startsWith("\x1b[48"), "选中动作 → + 高亮");
 	});
 });
 
@@ -179,6 +210,60 @@ describe("actions(判决语义不变)", () => {
 		pane.handleInput("\r");
 		await new Promise((r2) => setImmediate(r2));
 		assert.deepEqual(calls.executed, [{ action: "消息", id: r.id, input: "hi" }]);
+	});
+});
+
+	describe("段头(纯分区标签,不参与光标导航)", () => {
+	// 行断言聚焦分区与光标行为:段头不可选中(↑↓ 跳过),两条目仍在
+	const lineText = (pane) => strip(pane.render(80).join("\n"));
+
+	// 组装:两段各一个 worker(decision = idle, working = running)
+	function twoSections() {
+		return [
+			rec({ id: "pi-worker-d#333333333333", name: "d", state: "idle" }),
+			rec({ id: "pi-worker-w#444444444444", name: "w", state: "running" }),
+		];
+	}
+
+	test("段头渲染为纯标签(无 chevron),初始选中落到首条真实行", () => {
+		const { pane } = setup(twoSections(), {});
+		const out = lineText(pane);
+		assert.ok(out.includes("待决策 (1)") && out.includes("工作中 (1)"), "两段头标签");
+		assert.ok(!out.includes("▸") && !out.includes("▾"), "无折叠 chevron(无折叠语义)");
+		assert.ok(out.split("\n").some((l) => l.startsWith("→ └─ ✓ d")), "默认选中首条真实 worker");
+	});
+
+	test("↑↓ 跳过段头:光标只落真实 worker,身份恒连续", () => {
+		const { pane } = setup(twoSections(), {});
+		pane.handleInput("\x1b[A"); // ↑ 从 d 向上:跳过 decision 段头,环绕到 w
+		let out = lineText(pane);
+		assert.ok(out.split("\n").some((l) => l.startsWith("→ └─ ● w")), "↑ 跳过段头到上一段末条真实行");
+		pane.handleInput("\x1b[A"); // ↑ 从 w 向上:跳过 working 段头,环绕到 d
+		out = lineText(pane);
+		assert.ok(out.split("\n").some((l) => l.startsWith("→ └─ ✓ d")), "↑ 再次跳过段头环绕");
+		pane.handleInput("\x1b[B"); // ↓ 回到 w
+		pane.handleInput("\x1b[B"); // ↓ 从 w 向下:跳过 working 段头,环绕到 d
+		out = lineText(pane);
+		assert.ok(out.split("\n").some((l) => l.startsWith("→ └─ ✓ d")), "↓ 跳过段头环绕");
+		assert.ok(!out.split("\n").some((l) => l.startsWith("→ 待决策") || l.startsWith("→ 工作中")), "光标不落段头");
+	});
+
+	test("段头不可 enter(无折叠语义);enter 在真实行恒进动作流", () => {
+		const { pane, calls } = setup(twoSections(), {});
+		pane.handleInput("\r"); // d 上 enter
+		assert.ok(strip(pane.render(80).join("\n")).includes("通过"), "真实行 enter → 动作流");
+		pane.handleInput("\x1b"); // 回 list
+		pane.handleInput("\x1b[B"); // → w
+		pane.handleInput("\r");
+		assert.ok(strip(pane.render(80).join("\n")).includes("stop"), "working 行 enter → 动作流");
+		pane.handleInput("\x1b");
+	});
+
+	test("PgUp/PgDn 翻看 transcript,不改变选中(list 无翻页,单焦点)", () => {
+		const { pane } = setup(twoSections(), {});
+		pane.handleInput("\x1b[5~"); // PgUp
+		const out = lineText(pane);
+		assert.ok(out.split("\n").some((l) => l.startsWith("→ └─ ✓ d")), "PgUp 不改变选中(翻看 transcript)");
 	});
 });
 

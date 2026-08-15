@@ -1,14 +1,14 @@
 import { formatModelInfo, summarizeArgs, extractCost, extractTokens, latestStats, formatTokens, type LineColor } from "./present.ts";
-import type { WorkerRecord } from "./types.ts";
+import type { SessionEntry, WorkerRecord } from "./types.ts";
 
 /**
- * worker session jsonl → transcript 投影(纯函数,合并窗口 transcript 区的唯一读入口)。
+ * worker transcript 投影(纯函数,合并窗口 transcript 区的唯一读入口)。
+ * 数据源平铺为 SessionEntry[](来源不感知:live = RPC 事件流增量 + get_messages
+ * 当前分支回填;dead = 文件一次性解析 parseSessionEntries)——视图层不再碰文件 IO。
  * message 粒度(不按 delta):只投影 text(assistant 走 Markdown 管线)与 toolCall;
  * thinking 不投影(占位行零信息量);≥3 连续 toolCall 折叠为一行(轨迹链刷屏防护);
- * toolResult/custom/compaction 等不投影(成败信号由
- * pane 诊断与回调承担)。投影保真:行内容不截断(渲染层按宽度截断);
- * v3 树结构沿 parentId 回溯当前分支(文件末尾 message 条目为 tip),v1 线性按顺序。
- * 未知条目类型/坏行跳过不抛错(诊断面在 session 文件本身,视图不做纠错)。
+ * toolResult/custom/compaction 等不投影(成败信号由 pane 诊断与回调承担)。
+ * 投影保真:行内容不截断(渲染层按宽度截断)。
  */
 
 export interface TranscriptLine {
@@ -18,15 +18,6 @@ export interface TranscriptLine {
 	markdown?: boolean;
 	/** 消息起点(user 首行 / assistant text 块 / toolCall 行):↑↓ 按消息粒度浏览的锚点 */
 	anchor?: boolean;
-}
-
-interface SessionEntry {
-	type?: string;
-	id?: string;
-	parentId?: string | null;
-	message?: { role?: string; [k: string]: unknown };
-	customType?: string;
-	data?: unknown;
 }
 
 
@@ -117,8 +108,18 @@ function currentBranch(entries: SessionEntry[]): SessionEntry[] {
 	return branch;
 }
 
-/** jsonl 全文 → transcript 行。 */
-export function projectTranscript(content: string): TranscriptLine[] {
+/** 条目序列(当前分支) → transcript 行。 */
+export function projectEntries(entries: SessionEntry[]): TranscriptLine[] {
+	const out: TranscriptLine[] = [];
+	for (const e of entries) {
+		if (e.type === "message" && e.message) projectMessage(e.message, out);
+	}
+	return out;
+}
+
+/** dead worker 的数据源(进程不在,文件是唯一真相):jsonl 全文 → 当前分支 message 条目。
+ * live 不走这里(get_messages 原生返回当前分支,事件流增量追加)。 */
+export function parseSessionEntries(content: string): SessionEntry[] {
 	const entries: SessionEntry[] = [];
 	for (const line of content.split("\n")) {
 		const t = line.trim();
@@ -129,11 +130,12 @@ export function projectTranscript(content: string): TranscriptLine[] {
 			// 坏行跳过(写入中的部分行/手改):视图不纠错
 		}
 	}
-	const out: TranscriptLine[] = [];
-	for (const e of currentBranch(entries)) {
-		projectMessage(e.message as NonNullable<SessionEntry["message"]>, out);
-	}
-	return out;
+	return currentBranch(entries);
+}
+
+/** jsonl 全文 → transcript 行(parse + 分支回溯 + 投影,测试与一次性场景用)。 */
+export function projectTranscript(content: string): TranscriptLine[] {
+	return projectEntries(parseSessionEntries(content));
 }
 
 /**
@@ -169,44 +171,56 @@ export function transcriptTitle(
 
 // ---------- transcript 区(合并窗口内嵌,单窗口终局) ----------
 
-import { readFileSync, statSync } from "node:fs";
 import { getMarkdownTheme, type Theme } from "@earendil-works/pi-coding-agent";
 import { Markdown } from "@earendil-works/pi-tui";
 
 /**
- * 内嵌 transcript 区:grok framed 子视图的内容核,去掉独立窗口壳
- * (终局是合并单窗口:tasks panel 的 entry 即 worker 代表,transcript 同屏)。
- * 活性:render 重 stat 文件,size 变才重读重解析;底部跟随(在底部时新内容
- * 自动可见,向上滚动脱离 follow,回底恢复)。文件缺失给提示行,不抛错。
+ * 内嵌 transcript 区:grok framed 子视图的内容核,去掉独立窗口壳。
+ * 数据源 = view() 回调(manager 持有:live 事件流 buffer + get_messages 回填,
+ * dead 文件一次性解析缓存)——渲染路径零磁盘 IO,无轮询重解析。
+ * 投影缓存按(数组引用 + 长度)(manager 原位 push / 回填整体替换均可检出)。
+ * 底部跟随(在底部时新内容自动可见,向上滚动脱离 follow,回底恢复)。
+ * 空/无源给状态分化提示行,不抛错。
  */
 export class TranscriptZone {
-	private file: string;
 	private lines: TranscriptLine[] = [];
-	private lastSize = -1;
+	/** 投影缓存的输入指纹:同一数组原位追加 → 长度变;回填替换 → 引用变 */
+	private projSrc: SessionEntry[] | undefined;
+	private projLen = -1;
 	private offset = 0;
 	private follow = true;
-	private missing = false;
 	private pendingDelta = 0;
-	private pendingMessageSteps = 0;
-	/** markdown 渲染缓存:(宽度+原文) → 渲染行;setFile 重定向时清空 */
+	/** markdown 渲染缓存:(宽度+原文) → 渲染行;resetView 重定向时清空 */
 	private mdCache = new Map<string, string[]>();
-
-	constructor(
-		deps: { file: string; theme: Theme },
-	) {
-		this.file = deps.file;
-		this.theme = deps.theme;
-	}
+	private readonly view: () => SessionEntry[] | undefined;
 	private readonly theme: Theme;
+	private readonly stateGetter?: () => string | undefined;
 
-	/** 重定向到另一 worker 的 session 文件:强制重读,滚动回底部(follow)。 */
-	setFile(file: string): void {
-		if (file === this.file) return;
-		this.file = file;
-		this.lastSize = -1;
+	constructor(deps: { view: () => SessionEntry[] | undefined; theme: Theme; state?: () => string | undefined }) {
+		this.view = deps.view;
+		this.theme = deps.theme;
+		this.stateGetter = deps.state;
+	}
+
+	/** 重定向到另一 worker:滚动回底部(follow),投影与 md 缓存失效。 */
+	resetView(): void {
+		this.projSrc = undefined;
+		this.projLen = -1;
 		this.offset = 0;
 		this.follow = true;
 		this.mdCache.clear();
+	}
+
+	/** 缺失提示按 worker 状态分化:starting = 等待握手(transient);终态 = 已清理/无产物(permanent)。 */
+	private missingLine(): TranscriptLine {
+		const st = this.stateGetter?.();
+		if (st === "starting" || st === "running") {
+			return { text: "(⏳ 等待握手,worker 运行中尚未产出 transcript…)", color: "dim" };
+		}
+		if (st === "done" || st === "failed" || st === "exited") {
+			return { text: "(该 worker 无 session 文件:已清理或未握手)", color: "dim" };
+		}
+		return { text: "(无 session 文件:worker 未握手或记录已清理)", color: "dim" };
 	}
 
 	/** delta 行滚动(渲染行空间;pending 在下一次 renderBody 生效,那里才知道渲染后总长)。 */
@@ -214,23 +228,16 @@ export class TranscriptZone {
 		this.pendingDelta += delta;
 	}
 
-	/** 消息粒度浏览:↑↓ 逐条跳到前/后一条消息起点(渲染行空间,下一次 renderBody 生效)。 */
-	scrollMessage(direction: -1 | 1): void {
-		this.pendingMessageSteps += direction;
-	}
-
-	private reload(): void {
-		try {
-			const size = statSync(this.file).size;
-			if (size !== this.lastSize) {
-				this.lastSize = size;
-				this.lines = projectTranscript(readFileSync(this.file, "utf8"));
-				this.missing = false;
-			}
-		} catch {
-			// 首次读不到 → 缺失提示;中途消失保留旧投影(不闪烁)
-			if (this.lastSize < 0) this.missing = true;
+	/** 当前正文行:无源/空 → 状态提示;否则投影(缓存命中跳过)。 */
+	private body(): TranscriptLine[] {
+		const entries = this.view();
+		if (!entries || entries.length === 0) return [this.missingLine()];
+		if (entries !== this.projSrc || entries.length !== this.projLen) {
+			this.projSrc = entries;
+			this.projLen = entries.length;
+			this.lines = projectEntries(entries);
 		}
+		return this.lines;
 	}
 
 	/** markdown 块经 pi 原生管线渲染(getMarkdownTheme 含 cli-highlight 代码高亮,
@@ -249,25 +256,16 @@ export class TranscriptZone {
 	/** 当前内容的渲染行数:布局按需分配高度用(空 transcript 不独占窗口)。
 	 * 与 renderBody 同一 materialize 路径(mdCache 命中,成本可忽略)。 */
 	measureBody(width: number): number {
-		this.reload();
-		const body: TranscriptLine[] = this.missing
-			? [{ text: "(无 session 文件:worker 未握手或记录已清理)", color: "dim" }]
-			: this.lines;
 		let n = 0;
-		for (const l of body) n += this.materialize(l, width).length;
+		for (const l of this.body()) n += this.materialize(l, width).length;
 		return n;
 	}
 
 	/** 窗口化正文:恒返回 height 行(不足补空行,布局稳定)。 */
 	renderBody(width: number, height: number): string[] {
-		this.reload();
-		const body: TranscriptLine[] = this.missing
-			? [{ text: "(无 session 文件:worker 未握手或记录已清理)", color: "dim" }]
-			: this.lines;
+		const body = this.body();
 		const rendered: string[] = [];
-		const anchors: number[] = [];
 		for (const l of body) {
-			if (l.anchor) anchors.push(rendered.length);
 			rendered.push(...this.materialize(l, width));
 		}
 		const maxOffset = Math.max(0, rendered.length - height);
@@ -275,19 +273,6 @@ export class TranscriptZone {
 			this.offset = Math.min(Math.max(0, this.offset + this.pendingDelta), maxOffset);
 			this.follow = this.offset >= maxOffset;
 			this.pendingDelta = 0;
-		}
-		if (this.pendingMessageSteps !== 0) {
-			if (anchors.length > 0) {
-				// 当前锚点 = 不晚于 offset 的最后一个锚点;步进后钳到边界
-				let ai = 0;
-				for (let k = 0; k < anchors.length; k++) if (anchors[k] <= this.offset) ai = k;
-				ai = Math.min(Math.max(0, ai + this.pendingMessageSteps), anchors.length - 1);
-				this.offset = Math.min(anchors[ai], maxOffset);
-			} else {
-				this.offset = Math.min(Math.max(0, this.offset + this.pendingMessageSteps), maxOffset);
-			}
-			this.follow = this.offset >= maxOffset;
-			this.pendingMessageSteps = 0;
 		}
 		if (this.follow) this.offset = maxOffset;
 		this.offset = Math.min(this.offset, maxOffset);

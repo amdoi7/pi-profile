@@ -4,10 +4,9 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { registerWorkerMessagingTool } from "./src/messaging.ts";
-import { registerLifecycleRenderer } from "./src/lifecycle-block.ts";
 import { WorkerManager } from "./src/manager.ts";
 import { registerWorkerPaneCommand } from "./src/pane.ts";
-import { formatCallbackView, formatFooter, formatLeftoverHint, toastFor } from "./src/present.ts";
+import { formatCallbackView, formatFooter, toastFor } from "./src/present.ts";
 import { registerPiWorkerTool } from "./src/tool.ts";
 import type { WorkerRecord } from "./src/types.ts";
 
@@ -69,15 +68,12 @@ export default function (pi: ExtensionAPI): void {
 	});
 	registerPiWorkerTool(pi, manager);
 	registerWorkerPaneCommand(pi, manager);
-	// transcript 生命周期 block(grok scrollback block 对等物):entry renderer 注册,
-	// append 在 tool.ts run 成功路径
-	registerLifecycleRenderer(pi, manager);
 
 	// 回调 renderer:呈报即验收界面。settled 报告全文(核验证据段)不折叠;
 	// failed 诊断 + stderr 尾;action 审计(路由/机械动作)dim。
 	pi.registerMessageRenderer("pi-worker", (message, { outputPad }, theme) => {
 		const view = formatCallbackView(message as never);
-		const headColor = view.kind === "failed" ? "error" : view.kind === "recovery" ? "warning" : view.kind === "action" ? "dim" : "accent";
+		const headColor = view.kind === "failed" ? "error" : view.kind === "action" ? "dim" : "accent";
 		const box = new Box(outputPad, 1, (t) => theme.bg("customMessageBg", t));
 		box.addChild(new Text(theme.fg(headColor, theme.bold(view.header)), 0, 0));
 		// ⎿ 续行摘要:紧随 header(Claude 保真:回执先于详情,长报告不埋卡底)
@@ -95,18 +91,6 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("session_start", async (_event, ctx) => {
 		ui = ctx.ui;
 		theme = ctx.ui.theme as unknown as ThemeLike;
-		// 启动只检测遗留并提示(显示但不自动认领);认领是显式动作 pi_worker action=recover
-		const scan = await manager.scanLeftovers(ctx.cwd);
-		const branchText = JSON.stringify(ctx.sessionManager.getBranch());
-		const hint = formatLeftoverHint(scan, branchText);
-		if (hint) {
-			pi.sendMessage({
-				customType: "pi-worker",
-				content: hint,
-				display: true,
-				details: { type: "recovery", id: "recovery" },
-			});
-		}
 		refreshFooter();
 	});
 	pi.on("session_shutdown", () => {

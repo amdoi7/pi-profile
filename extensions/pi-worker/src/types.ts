@@ -11,8 +11,12 @@ export interface WorkerRecord {
 	id: string;
 	name: string;
 	state: WorkerState;
-	/** 最近一轮的呈报全文(get_last_assistant_text) */
+	/** 最近一轮的呈报全文(get_messages 末条 assistant text) */
 	report?: string;
+	/** 末条 assistant stopReason(stop|length|toolUse|error|aborted) */
+	stopReason?: string;
+	/** 呈报获取/deliver 失败诊断(status 可见,不静默) */
+	reportError?: string;
 	/** 最近一轮用量快照(turn_end 拉取并覆写,投影唯一读入口) */
 	latestStats?: Record<string, unknown>;
 	/** 进程已退出(idle 后崩溃等) */
@@ -23,8 +27,6 @@ export interface WorkerRecord {
 	pid?: number;
 	createdAt: number;
 	updatedAt: number;
-	/** 最近事件摘要(tool_execution/turn_end),供 status 展示,上限 10 */
-	recent: string[];
 	/** turn_end 计数(footer ▸t<n>) */
 	turns: number;
 	/** spawn 指定的模型/档位(run 合约参数) */
@@ -36,12 +38,12 @@ export interface WorkerRecord {
 	sessionFile?: string;
 	/** 当前执行的非 thinking 活动(tool/text),overlay 显示;思考中为 undefined */
 	currentActivity?: string;
-	/** 启动恢复 provenance:jsonl 重建,最后状态未知(显式状态组合:state × recovered) */
-	recovered?: boolean;
 	/** 终审结论(collect 工具参数落记录,status 可审计) */
 	verdict?: CollectVerdict;
 	/** run 合约的归一化工具面(集合语义);缺省 = 全量白名单,不显 */
 	tools?: string;
+	/** run 时的工作目录(O3 冷恢复 spawn 用) */
+	cwd?: string;
 }
 
 /** 非法 action/迁移时抛出,message 即 actionable 错误文案 */
@@ -63,6 +65,16 @@ export interface RunInput {
 }
 
 export const TERMINAL_STATES: readonly WorkerState[] = ["done", "failed"] as const;
+
+/** session jsonl 条目(transcript 投影的统一输入:live 来自 RPC 事件流/get_messages,
+ * dead 来自文件一次性解析;视图不感知来源)。结构对齐 session v3 条目。 */
+export interface SessionEntry {
+	type?: string;
+	id?: string;
+	parentId?: string | null;
+	message?: { role?: string; content?: unknown; [k: string]: unknown };
+	customType?: string;
+}
 
 /** collect 终审结论枚举(工具参数面;打回 = message 重派,不经 collect) */
 export const COLLECT_VERDICTS = ["通过", "丢弃", "强制放行"] as const;

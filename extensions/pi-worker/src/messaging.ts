@@ -16,7 +16,9 @@ type SendParams = Static<typeof sendMessageParams>;
 /** 工具描述(L2 机制权威):反问是常态——问父比独自死磕便宜;回合语义区分报告(继续推进)与阻塞提问(结束本轮等答复)。 */
 export const SEND_MESSAGE_DESCRIPTION =
 	"Send an async message to parent or a peer worker. Asking is expected, not exceptional: brief ambiguity, contradiction with repo evidence, and scope/trade-off decisions go to the parent immediately — do not deliberate alone. " +
-	"Fire-and-forget: after a report keep working; after a blocking question end your turn (the reply arrives as a new turn). Routine progress belongs in your reply text.";
+	"Fire-and-forget: after a report keep working; after a blocking question end your turn (the reply arrives as a new turn). Routine progress belongs in your reply text. " +
+	"Peers: address another worker by name when the task names one; unknown/offline targets get an explicit failure receipt — no roster is injected, derive targets from task context. " +
+	"Wake quota: at most 6 parent-waking messages per 2 minutes per worker — beyond that they still land but stay quiet (no turn triggered); identical text repeated within 60s is dropped. Batch what the parent must see; prefer quiet=true for routine progress.";
 
 /**
  * 子进程专用(PI_WORKER_CHILD=1):向 parent 或其他 worker 发异步消息。
@@ -32,7 +34,7 @@ export function registerWorkerMessagingTool(pi: ExtensionAPI): void {
 		async execute(_toolCallId, p: SendParams) {
 			const to = p.to ?? "parent";
 			return {
-				content: [{ type: "text", text: `消息已发送给「${to}」:「${p.text}」。` }],
+				content: [{ type: "text", text: `sent to ${to}: "${p.text}"` }],
 				details: { to, text: p.text, quiet: p.quiet ?? false },
 			};
 		},

@@ -35,8 +35,8 @@ describe("buildSpawnArgs", () => {
 		const idx = args.indexOf("--append-system-prompt");
 		assert.ok(idx >= 0, "preamble 注入通道存在");
 		const preamble = args[idx + 1] ?? "";
-		assert.ok(preamble.includes("worker「a」"), "含身份");
-		assert.ok(preamble.includes("先回执"), "含先回执契约");
+		assert.ok(preamble.includes('worker "a"'), "含身份");
+		assert.ok(preamble.includes("Ack first"), "含先回执契约");
 	});
 
 	test("model/thinking 参数透传,preamble 不重复", () => {
@@ -51,6 +51,16 @@ describe("buildSpawnArgs", () => {
 		assert.ok(args.includes("--thinking") && args[args.indexOf("--thinking") + 1] === "high");
 		// preamble 只注入一次
 		assert.equal(args.filter((a) => a === "--append-system-prompt").length, 1);
+	});
+
+	test("O3:session 参数透传 --session(冷恢复同文件续接)", () => {
+		const args = buildSpawnArgs({
+			cwd: "/repo",
+			id: "pi-worker-a#123abc",
+			name: "a",
+			session: "/repo/.pi/worker-sessions/p1/x.jsonl",
+		});
+		assert.ok(args.includes("--session") && args[args.indexOf("--session") + 1] === "/repo/.pi/worker-sessions/p1/x.jsonl");
 	});
 
 	test("run 合约 tools 透传 -t(只读审计面);缺省白名单由既有测试守卫", () => {
@@ -85,14 +95,14 @@ describe("buildWorkerPreamble", () => {
 			name: "a",
 			id: "pi-worker-a#123abc",
 		});
-		assert.ok(preamble.includes("先回执"), "先回执契约");
+		assert.ok(preamble.includes("Ack first"), "ack contract");
 		assert.ok(!preamble.includes("四要素"), "四要素在质量契约(机制加载),不重复");
 		assert.ok(!preamble.includes("AGENTS.md"), "机制(AGENTS.md 加载)不写成 prompt");
 	});
 });
 
-test("spawn 归属:--session-dir 带父 pid 命名空间(同 cwd 多 TUI 窗口不互相认领)", () => {
+test("spawn 审计目录:--session-dir 带 <cwd>/.pi/worker-sessions(内置约定)", () => {
 	const args = buildSpawnArgs({ cwd: "/repo", id: "pi-worker-a#123abc", name: "a" });
 	const i = args.indexOf("--session-dir");
-	assert.equal(args[i + 1], `/repo/.pi/worker-sessions/p${process.pid}`, "归属 = 当前父进程 pid");
+	assert.equal(args[i + 1], "/repo/.pi/worker-sessions");
 });

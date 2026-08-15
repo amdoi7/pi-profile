@@ -2,6 +2,7 @@ import type { Readable } from "node:stream";
 import { SEND_MESSAGE_TOOL } from "./messaging.ts";
 import { summarizeArgs } from "./present.ts";
 import type { RpcLike } from "./rpc-client.ts";
+import type { SessionEntry } from "./types.ts";
 
 const STDERR_TAIL_MAX = 4096;
 
@@ -18,6 +19,9 @@ export type WorkerEvent =
 	/** 显示态:tool 活动(args 已截断 60 字符) */
 	| { type: "toolStart"; toolName: string; args: string }
 	| { type: "toolEnd"; toolName: string }
+	/** transcript 饲料:终稿消息(message_end.message 为 authoritative,rpc.md 契约);
+	 * 只产 user/assistant,custom 注入(bus/peer)不产(视图不投影,免得双份) */
+	| { type: "entry"; entry: SessionEntry }
 	/** 显示态:子进程阶段词汇(grok Retrying/Compacting 对等);label 缺省 = 该阶段结束 */
 	| { type: "activity"; phase: "retrying" | "compacting"; label?: string }
 	/** 子 extension dialog:需回 cancelled 防子进程挂起 */
@@ -61,14 +65,22 @@ export function attachWatcher(
 			emit({ type: "settled" });
 			return;
 		}
-		if (ev.type === "message_update" || ev.type === "message_end") {
-			// 消息事件不产生领域事件:增量(text_delta)粒度太细,终稿(message_end)
-			// 的唯一消费者(turn 话语预览)已移除;呈报走 get_last_assistant_text RPC。
+		if (ev.type === "message_update") {
+			// 增量(text_delta)粒度太细,不产生领域事件;终稿走 message_end
+			return;
+		}
+		if (ev.type === "message_end") {
+			// transcript 视图的原生增量饲料(取代文件轮询);message_end.message 为 authoritative
+			if (typeof ev.customType === "string") return; // 注入的 custom 条目(bus/peer):jsonl 里 type=custom 不投影,事件流同语义
+			const m = ev.message as { role?: unknown } | undefined;
+			if (m && (m.role === "user" || m.role === "assistant")) {
+				emit({ type: "entry", entry: { type: "message", message: m as SessionEntry["message"] } });
+			}
 			return;
 		}
 		if (ev.type === "tool_execution_start") {
 			const toolName = String(ev.toolName ?? "");
-			// 参数摘要(显示数据):提取常见可读键,避免破碎 JSON 污染 recent/activity
+			// 参数摘要(显示数据):提取常见可读键,避免破碎 JSON 污染 activity/transcript
 			const args = summarizeToolArgs(ev.args);
 			if (toolName === SEND_MESSAGE_TOOL && typeof ev.toolCallId === "string") {
 				const a = ev.args as { to?: unknown; text?: unknown; quiet?: unknown } | undefined;

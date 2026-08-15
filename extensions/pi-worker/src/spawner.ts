@@ -11,6 +11,8 @@ export interface SpawnOptions {
 	thinking?: string;
 	/** run 合约归一化工具面;缺省 = WORKER_TOOL_ALLOWLIST */
 	tools?: string;
+	/** O3 冷恢复:--session 同文件续接(历史完整);缺省 = 新会话 */
+	session?: string;
 }
 
 const TERMINATE_GRACE_MS = 2000;
@@ -24,8 +26,7 @@ const SELF_INDEX_PATH = fileURLToPath(new URL("../index.ts", import.meta.url));
  * - --no-extensions -e <自身>:子进程只加载 pi-worker 自身(send_message),
  *   不加载父的扩展列表(btw/context-ui/custom-footer 等,rpc 模式无 UI);
  * - -t 白名单:限制工具面(上下文 + 安全);
- * - --session-dir:审计目录内置约定 <cwd>/.pi/worker-sessions/p<父pid>
- *   (归属命名空间:恢复按目录判定所有者,同 cwd 多窗口互不认领)。
+ * - --session-dir:审计目录内置约定 <cwd>/.pi/worker-sessions。
  */
 export function buildSpawnArgs(opts: SpawnOptions): string[] {
 	const preamble = preambleOverride(() => buildWorkerPreamble({ name: opts.name, id: opts.id }));
@@ -33,7 +34,7 @@ export function buildSpawnArgs(opts: SpawnOptions): string[] {
 		"--mode",
 		"rpc",
 		"--session-dir",
-		workerSessionDir(opts.cwd, process.pid),
+		workerSessionDir(opts.cwd),
 		"--name",
 		opts.id,
 		"--no-extensions",
@@ -44,6 +45,7 @@ export function buildSpawnArgs(opts: SpawnOptions): string[] {
 		"--append-system-prompt",
 		preamble,
 	];
+	if (opts.session) args.push("--session", opts.session); // 冷恢复:同文件续写,审计目录以文件为准
 	if (opts.model) args.push("--model", opts.model);
 	if (opts.thinking) args.push("--thinking", opts.thinking);
 	return args;

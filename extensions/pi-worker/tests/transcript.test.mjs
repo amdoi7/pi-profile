@@ -130,7 +130,6 @@ describe("transcriptTitle", () => {
 		turns: 2,
 		createdAt: 1_000_000_000,
 		updatedAt: 0,
-		recent: [],
 		modelInfo: { provider: "opencode-go", id: "deepseek-v4-flash", thinkingLevel: "low" },
 		currentActivity: "tool: rg x",
 	};

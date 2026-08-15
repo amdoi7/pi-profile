@@ -67,6 +67,43 @@ test(
 );
 
 test(
+	"O4 授权链:run 带 parentSessionFile → 子 jsonl header 真实落 parentSession(恢复归属的数据链)",
+	async () => {
+		const parentFile = join(cwd, "parent-session.jsonl");
+		const { id } = manager.run({ name: "t1chain", prompt: "只回复两个字:完成" }, cwd, { parentSessionFile: parentFile });
+		await waitFor(() => findCallback("settled", id), "settled 回调");
+		const msg = findCallback("settled", id);
+		const sessionFile = msg.details.sessionFile;
+		assert.ok(sessionFile?.endsWith(".jsonl"), "审计指针");
+		const header = JSON.parse(readFileSync(sessionFile, "utf8").split("\n")[0]);
+		assert.equal(header.type, "session");
+		assert.equal(header.parentSession, parentFile, "new_session(parentSession) 原生写入 header;恢复时凭此认领");
+		manager.collect(id);
+	},
+	LONG,
+);
+
+test(
+	"O3 冷恢复:settled 后杀进程 → exited → message 续接,历史完整(暗号记忆)是新轮上下文",
+	async () => {
+		const { id } = manager.run({ name: "t5resume", prompt: "记住暗号:蓝鲸742。只回复:收到" }, cwd);
+		await waitFor(() => findCallback("settled", id), "首轮 settled");
+		// 模拟进程死亡:直接杀子进程 → watcher exit → idle 后进程崩 → exited
+		manager.handles.get(id)?.proc.kill("SIGKILL");
+		await waitFor(() => manager.status(id).state === "exited", "exited 态");
+		// 冷恢复续接:--session 同文件,消息即新轮指令
+		const via = await manager.message(id, "暗号是什么?只回复暗号本身");
+		assert.equal(via, "prompt");
+		await waitFor(() => manager.status(id).state === "idle", "续接后轮 settled");
+		const rec = manager.status(id);
+		assert.ok(rec.report?.includes("蓝鲸742"), `续接后应记得暗号(历史完整): ${rec.report}`);
+		assert.equal(rec.recovered, undefined, "复活后不再是遗留记录");
+		manager.collect(id);
+	},
+	LONG,
+);
+
+test(
 	"message:settled 后父 message 触发新轮 → 新呈报 → collect(ask 通道已移除)",
 	async () => {
 		const { id } = manager.run({ name: "t2", prompt: "只回复两个字:完成" }, cwd);
@@ -172,43 +209,13 @@ test(
 
 		await assert.rejects(
 			() => manager.steer(id, "x"),
-			(e) => String(e.message).includes("id 当前 idle") && String(e.message).includes("message"),
+			(e) => String(e.message).includes("id is idle") && String(e.message).includes("send or collect"),
 		);
 		await assert.rejects(
 			() => manager.followUp("pi-worker-nobody#000000", "x"),
-			(e) => String(e.message).includes("id 不存在") && String(e.message).includes("存活"),
+			(e) => String(e.message).includes("id not found") && String(e.message).includes("alive"),
 		);
 		manager.collect(id);
-	},
-	LONG,
-);
-
-test(
-	"recovery(G1):真实 worker jsonl → 新 manager recoverFromDisk 重建遗留记录(端到端验证 --name → session_info 假设)",
-	async () => {
-		const { id } = manager.run({ name: "rec", prompt: "只回复两个字:完成" }, cwd);
-		await waitFor(() => findCallback("settled", id), "rec settled");
-		// 不收起:模拟父在验收前崩溃/重启(collect 是终态,收起后不应复活)
-
-		// 模拟父重启:全新 manager(records 空),从磁盘恢复
-		const delivered2 = [];
-		const manager2 = new WorkerManager({ deliver: (m) => delivered2.push(m) });
-		const res = await manager2.recoverFromDisk(cwd);
-		assert.ok(res.recovered > 0, "应恢复至少 1 个遗留 worker");
-		const rec = manager2.sm.records.get(id);
-		assert.ok(rec, `应恢复到本次 worker id=${id};实际: ${[...manager2.sm.records.keys()].join(", ")}`);
-		assert.equal(rec.state, "exited");
-		assert.equal(rec.recovered, true);
-		assert.match(rec.sessionFile ?? "", /\.jsonl$/, "审计指针指向真实 jsonl");
-		const audit = delivered2.find((m) => m.details?.type === "recovery");
-		assert.ok(audit && audit.content.includes(id), `恢复审计应载 id: ${audit?.content}`);
-		manager2.collect(id);
-		assert.equal(manager2.status(id).state, "done", "遗留记录可清理");
-
-		// 终态语义:collect 标记落盘后,再次重启不复活(恢复去重,审计保留)
-		const manager3 = new WorkerManager({ deliver: () => {} });
-		await manager3.recoverFromDisk(cwd);
-		assert.ok(!manager3.sm.records.has(id), "已收起 worker 不复活");
 	},
 	LONG,
 );
@@ -341,4 +348,76 @@ test(
 		assert.notEqual(exit.code, null, `stdin EOF 后应自动退出,实际挂起 ${Date.now() - start}ms`);
 	},
 	20000,
+);
+
+test(
+	"并行 3 worker 各自独立 settled:回调按 id 隔离,无串扰",
+	async () => {
+		// 一次 run 3 个 worker,各自独立 settle。验证:
+		// 1) 每个 settled 回调 content/细节都带自己的 id(不互相串);
+		// 2) 各自可独立 collect,互不影响;
+		// 3) 3 个 session jsonl 都落盘。
+		const ids = [];
+		for (const n of ["p1", "p2", "p3"]) {
+			const { id } = manager.run({ name: n, prompt: "只回复两个字:完成" }, cwd);
+			ids.push(id);
+		}
+		assert.equal(new Set(ids).size, 3, "3 个 worker id 互异");
+
+		for (const id of ids) {
+			await waitFor(
+				() => findCallback("settled", id),
+				`并行 worker ${id} settled(delivered: ${dump()})`,
+			);
+			const msg = findCallback("settled", id);
+			assert.match(msg.content, new RegExp(`^settled id=pi-worker-p[123]#`), `settled 回调应带自身 id: ${msg.content.slice(0, 60)}`);
+		}
+
+		// 独立 collect:先收 p1、p3,只剩 p2 仍在 (idle→done)
+		manager.collect(ids[0]);
+		manager.collect(ids[2]);
+		assert.equal(manager.status(ids[0]).state, "done");
+		assert.equal(manager.status(ids[2]).state, "done");
+		manager.collect(ids[1]);
+		assert.equal(manager.status(ids[1]).state, "done");
+
+		// 3 个 worker 的 session jsonl 审计指针都在记录上;验证文件真实存在(落盘审计)
+		for (const id of ids) {
+			const sf = manager.status(id).sessionFile ?? "";
+			assert.match(sf, /\.jsonl$/, `worker ${id} 应有 sessionFile 持针: ${sf}`);
+			const abs = sf.startsWith("/") ? sf : join(cwd, sf);
+			assert.ok(existsSync(abs), `sessionFile 应真实落盘: ${abs}`);
+		}
+	},
+	LONG,
+);
+
+test(
+	"竞态 collect:先 collect 一个 worker,另一个仍正常 follow_up + settle + collect",
+	async () => {
+		// 两个 worker 几乎同时落 idle;先 collect A,再对 B 发 message(追加轮次)。
+		// 验证:collect A 不传染 B,B 仍能 message→settled→collect。
+		const { id: a } = manager.run({ name: "ra", prompt: "只回复两个字:完成" }, cwd);
+		const { id: b } = manager.run({ name: "rb", prompt: "只回复两个字:完成" }, cwd);
+
+		await waitFor(() => findCallback("settled", a), `A settled(delivered: ${dump()})`);
+		await waitFor(() => findCallback("settled", b), `B settled(delivered: ${dump()})`);
+		assert.equal(manager.status(a).state, "idle");
+		assert.equal(manager.status(b).state, "idle");
+
+		// 收集 A,B 不受影响
+		manager.collect(a);
+		assert.equal(manager.status(a).state, "done");
+		assert.equal(manager.status(b).state, "idle", "collect A 不影响 B 的 idle");
+
+		// B 仍可追加轮次(follow_up 语义)
+		await manager.message(b, "父指令:请回复:确认开工");
+		await waitFor(
+			() => manager.status(b).state === "idle" && String(manager.status(b).report ?? "").includes("确认开工"),
+			`B message 后新轮 settled(state=${manager.status(b).state}, report=${String(manager.status(b).report ?? "").slice(0, 40)})`,
+		);
+		manager.collect(b);
+		assert.equal(manager.status(b).state, "done");
+	},
+	LONG,
 );

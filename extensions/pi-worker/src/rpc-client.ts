@@ -55,7 +55,7 @@ export class RpcClient implements RpcLike {
 		proc.on("exit", (code, signal) => {
 			if (this.exited) return;
 			this.exited = true;
-			const err = new RpcError(`子进程已退出(exit=${code ?? signal ?? "?"})`);
+			const err = new RpcError(`child exited (exit=${code ?? signal ?? "?"})`);
 			for (const { reject, timer } of this.pending.values()) {
 				clearTimeout(timer);
 				reject(err);
@@ -75,7 +75,7 @@ export class RpcClient implements RpcLike {
 
 	send(cmd: Record<string, unknown>, opts?: { timeoutMs?: number }): Promise<Record<string, unknown>> {
 		if (this.exited) {
-			return Promise.reject(new RpcError(`子进程已退出,无法发送 ${String(cmd.type)}`));
+			return Promise.reject(new RpcError(`child exited, cannot send ${String(cmd.type)}`));
 		}
 		const timeoutMs = opts?.timeoutMs ?? 15000;
 		const id = `r${this.nextId++}`;
@@ -84,7 +84,7 @@ export class RpcClient implements RpcLike {
 		return new Promise((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.pending.delete(id);
-				reject(new RpcError(`RPC 超时(${timeoutMs}ms): ${String(cmd.type)}`, String(cmd.type)));
+				reject(new RpcError(`RPC timeout (${timeoutMs}ms): ${String(cmd.type)}`, String(cmd.type)));
 			}, timeoutMs);
 			this.pending.set(id, { resolve, reject, timer });
 
@@ -92,7 +92,7 @@ export class RpcClient implements RpcLike {
 				if (!err) return;
 				this.pending.delete(id);
 				clearTimeout(timer);
-				reject(new RpcError(`stdin 写入失败: ${err.message}`, String(cmd.type)));
+				reject(new RpcError(`stdin write failed: ${err.message}`, String(cmd.type)));
 			});
 		});
 	}
@@ -127,7 +127,7 @@ export class RpcClient implements RpcLike {
 			this.pending.delete(String(msg.id));
 			clearTimeout(p.timer);
 			if (msg.success === false) {
-				p.reject(new RpcError(String(msg.error ?? `RPC 失败: ${String(msg.command)}`), String(msg.command)));
+				p.reject(new RpcError(String(msg.error ?? `RPC failed: ${String(msg.command)}`), String(msg.command)));
 			} else {
 				p.resolve((msg.data as Record<string, unknown>) ?? {});
 			}

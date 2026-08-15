@@ -22,7 +22,6 @@ describe("applyHandshakeState(握手 get_state → 记录映射,纯函数)", () 
 		processExited: false,
 		createdAt: 1,
 		updatedAt: 1,
-		recent: [],
 		turns: 0,
 	});
 
@@ -64,7 +63,10 @@ function setup() {
 			raw: [],
 			send: async (cmd) => {
 				rpc.sent.push(cmd.type);
-				if (cmd.type === "get_last_assistant_text") return { text: "报告全文" };
+				if (cmd.type === "get_messages")
+					return {
+						messages: [{ role: "assistant", content: [{ type: "text", text: "报告全文" }], stopReason: "stop" }],
+					};
 				if (cmd.type === "get_session_stats") {
 					if (statsDelay > 0) await new Promise((r) => setTimeout(r, statsDelay));
 					return { tokens: { total: 15 }, cost: 0.001 };
@@ -74,6 +76,7 @@ function setup() {
 			writeRaw: (o) => rpc.raw.push(o),
 		};
 		manager.handles.set(id, { rpc, proc: { exitCode: 0, signalCode: null, kill() {} }, sessionDir: "/tmp", watcher: { dispose: () => {} } });
+		manager.transcripts.set(id, { entries: [], hydrated: false, hydrating: false, queue: [] }); // 与 run() 同接线
 		return rpc;
 	};
 	const settle = async (id) => {
@@ -104,7 +107,14 @@ describe("message(父→子统一通道:同一功能,FSM 按状态选投递语�
 	test("starting/stopping → WorkerError(可行动提示,不静默)", async () => {
 		const { manager, add } = setup();
 		add("pi-worker-hank#aaaaaa", "hank", "starting");
-		await assert.rejects(() => manager.message("pi-worker-hank#aaaaaa", "x"), /当前 starting/);
+		await assert.rejects(() => manager.message("pi-worker-hank#aaaaaa", "x"), /is starting/);
+	});
+
+	test("exited 无 sessionFile → WorkerError(不可续接,指明清账重派);有 sessionFile 走冷恢复(live 覆盖)", async () => {
+		const { manager, add } = setup();
+		add("pi-worker-hank#aaaaaa", "hank", "idle");
+		manager.onWorkerEvent("pi-worker-hank#aaaaaa", { type: "exited", code: 1, signal: null, stderrTail: "" });
+		await assert.rejects(() => manager.message("pi-worker-hank#aaaaaa", "继续"), /no session file, cannot cold-resume/);
 	});
 });
 
@@ -231,13 +241,87 @@ describe("onWorkerEvent(唯一反应者)", () => {
 		const rpc = add("pi-worker-hank#aaaaaa", "hank", "running");
 		manager.onWorkerEvent("pi-worker-hank#aaaaaa", { type: "turnEnd" });
 		await settle("pi-worker-hank#aaaaaa");
-		assert.deepEqual(rpc.sent, ["get_session_stats", "get_last_assistant_text"]); // turn_end 先拉快照,settled 复用
+		assert.deepEqual(rpc.sent, ["get_session_stats", "get_messages"]); // turn_end 先拉快照,settled 复用
 		assert.equal(delivered[0].details.type, "settled");
 		assert.equal(delivered[0].details.report, "报告全文");
 		assert.equal(delivered[0].details.turns, 1);
 		assert.equal(manager.sm.records.get("pi-worker-hank#aaaaaa").report, "报告全文");
 	});
 
+	test("settled 时句柄已回收(exit 先到):回调仍送达(占位呈报),不静默丢", async () => {
+		// 真实时序:oneshot worker agent_settled 与进程 exit 顺序不定;exit 先处理
+		// 则 handle 已回收。此时 settled 必须仍投递回调(占位呈报),不能 return——
+		// 否则状态 idle 但父看不到任何回调(用户报告场景)。
+		const { manager, delivered, add } = setup();
+		const id = "pi-worker-hank#aaaaaa";
+		add(id, "hank", "running");
+		// 模拟 exit 先到且句柄被回收,但状态仍可 settled(进程退出码 0、settled 事件后到)
+		manager.handles.delete(id);
+		manager.onWorkerEvent(id, { type: "settled" });
+		await new Promise((r) => setTimeout(r, 10));
+		assert.equal(manager.sm.records.get(id).state, "idle", "settled 应迁移 idle");
+		assert.ok(delivered.length >= 1, "settled 后必须有回调,不能静默丢");
+		const last = delivered[delivered.length - 1];
+		assert.equal(last.details.type, "settled");
+		assert.equal(typeof last.details.reportError, "string", "回调应带诊断占位(reportError 存在)");
+	});
+
+	test("get_messages 路径:末条 assistant 取 text,排除 thinking/toolCall,stopReason 透传", async () => {
+		const { manager, delivered, add } = setup();
+		const id = "pi-worker-hank#aaaaaa";
+		const rpc = add(id, "hank", "running");
+		rpc.send = async (cmd) => {
+			rpc.sent.push(cmd.type);
+			if (cmd.type === "get_messages")
+				return {
+					messages: [
+						{ role: "user", content: "do it" },
+						{
+							role: "assistant",
+							content: [
+								{ type: "thinking", thinking: "想" },
+								{ type: "toolCall", id: "c1", name: "bash", arguments: {} },
+								{ type: "text", text: "最终报告正文" },
+							],
+							stopReason: "stop",
+						},
+					],
+				};
+			if (cmd.type === "get_session_stats") return { tokens: { total: 9 } };
+			return { ok: true };
+		};
+		manager.onWorkerEvent(id, { type: "settled" });
+		await new Promise((r) => setTimeout(r, 10));
+		const last = delivered[delivered.length - 1];
+		assert.equal(last.details.report, "最终报告正文", "应取末条 assistant 的 text 块");
+		assert.equal(last.details.stopReason, "stop", "stopReason 应透传");
+		assert.equal(manager.sm.records.get(id).stopReason, "stop");
+	});
+
+	test("get_messages 路径:末条 assistant 仅 toolCall 无 text(报告经 send_message)→ report 空占位,stopReason=aborted 透传", async () => {
+		const { manager, delivered, add } = setup();
+		const id = "pi-worker-hank#aaaaaa";
+		const rpc = add(id, "hank", "running");
+		rpc.send = async (cmd) => {
+			rpc.sent.push(cmd.type);
+			if (cmd.type === "get_messages")
+				return {
+					messages: [
+						{ role: "assistant", content: [{ type: "text", text: "旧文本(不该被取)" }] },
+						{ role: "assistant", content: [{ type: "toolCall", id: "c1", name: "send_message", arguments: {} }], stopReason: "aborted" },
+					],
+				};
+			if (cmd.type === "get_session_stats") return { tokens: { total: 9 } };
+			return { ok: true };
+		};
+		manager.onWorkerEvent(id, { type: "settled" });
+		await new Promise((r) => setTimeout(r, 10));
+		const last = delivered[delivered.length - 1];
+		assert.equal(last.details.report, "", "末条无 text 不回退残留,留空走占位");
+		assert.equal(last.details.stopReason, "aborted", "aborted 应透传(父需知中断)");
+		assert.ok(last.content.includes("<report>"), "内容应有占位(report 块存在)");
+		assert.ok(last.content.includes("<stop_reason>aborted</stop_reason>"), "非正常收尾应进模板");
+	});
 	test("settled 后留 idle 等父验收;显式 collect → done", async () => {
 		const { manager, delivered, add, settle } = setup();
 		add("pi-worker-hank#aaaaaa", "hank", "running");
@@ -303,7 +387,7 @@ describe("onWorkerEvent(唯一反应者)", () => {
 		// 无 handles 条目:事件流上 throw 无捕获者,会成为父进程 uncaughtException
 		manager.onWorkerEvent("pi-worker-ghost#aaaaaa", { type: "dialog", id: "u1" });
 		assert.ok(
-			delivered.some((m) => m.details.type === "failed" && /句柄/.test(m.content)),
+			delivered.some((m) => m.details.type === "failed"),
 			"诊断回调送达而非 throw",
 		);
 	});
@@ -314,55 +398,7 @@ describe("onWorkerEvent(唯一反应者)", () => {
 		manager.sm.onExit("pi-worker-seal#bbbbbb", { code: 1, signal: null, stderrTail: "" });
 		const result = await manager.bus.post("parent", "seal", "hi");
 		assert.equal(result.ok, false);
-		assert.match(result.reason ?? "", /不存在或歧义/);
-	});
-});
-
-describe("recoverFromDisk(启动恢复:worker-sessions 目录即 registry)", () => {
-	const mkSessionsDir = () => {
-		const dir = mkdtempSync(join(tmpdir(), "piw-mgr-"));
-		const sessionsDir = join(dir, ".pi", "worker-sessions");
-		mkdirSync(sessionsDir, { recursive: true });
-		return { dir, sessionsDir };
-	};
-	const WORKER_JSONL = (name) =>
-		[
-			JSON.stringify({ type: "session", version: 3, id: "u1", timestamp: "2026-08-12T10:00:00.000Z", cwd: "/repo" }),
-			JSON.stringify({ type: "session_info", id: "k1", parentId: null, timestamp: "2026-08-12T10:00:01.000Z", name }),
-		].join("\n") + "\n";
-
-	test("jsonl 重建 → exited/recovered 记录进 status;quiet 审计留痕;幂等", async () => {
-		const { dir, sessionsDir } = mkSessionsDir();
-		writeFileSync(join(sessionsDir, "a.jsonl"), WORKER_JSONL("pi-worker-hank#0123456789ab"));
-		writeFileSync(join(sessionsDir, "broken.jsonl"), "not json\n");
-		const { manager, delivered, changes } = setup();
-
-		const res = await manager.recoverFromDisk(dir);
-		assert.equal(res.recovered, 1);
-		assert.deepEqual(res.skippedFiles, ["broken.jsonl"], "不可解析文件显式列出(丢弃范围声明)");
-
-		const rec = manager.sm.records.get("pi-worker-hank#0123456789ab");
-		assert.equal(rec.state, "exited");
-		assert.equal(rec.recovered, true);
-		assert.equal(rec.sessionFile, join(sessionsDir, "a.jsonl"));
-		assert.ok(changes.length > 0, "footer 投影重算");
-
-		const audit = delivered.find((m) => m.details?.type === "recovery");
-		assert.ok(audit, "恢复审计 quiet 留痕");
-		assert.ok(audit.content.includes("pi-worker-hank#0123456789ab"), "审计载重建 id");
-		assert.ok(audit.content.includes("broken.jsonl"), "审计载丢弃范围");
-
-		// 幂等:再次恢复不重复、不再留痕
-		const again = await manager.recoverFromDisk(dir);
-		assert.equal(again.recovered, 0);
-		assert.equal(manager.sm.records.size, 1);
-	});
-
-	test("无 worker-sessions 目录 → recovered=0,不留痕(无遗留是合法态)", async () => {
-		const { manager, delivered } = setup();
-		const res = await manager.recoverFromDisk(join(tmpdir(), `piw-mgr-nonexistent-${Date.now()}`));
-		assert.equal(res.recovered, 0);
-		assert.equal(delivered.length, 0);
+		assert.ok(String(result.reason ?? "").length > 0, "不可寻址显式失败(reason 存在)");
 	});
 });
 
@@ -386,13 +422,13 @@ describe("collect verdict(终审结论成工具参数,不再是散文)", () => {
 	test("非法状态 collect 带 verdict → 抛错且不落 verdict(fail fast 不留痕迹)", () => {
 		const { manager, add } = setup();
 		add("pi-worker-hank#aaaaaa", "hank", "running");
-		assert.throws(() => manager.collect("pi-worker-hank#aaaaaa", "通过"), /先 kill 或等 settled/);
+		assert.throws(() => manager.collect("pi-worker-hank#aaaaaa", "通过"), /kill first or wait for settled/);
 		assert.equal(manager.sm.records.get("pi-worker-hank#aaaaaa").verdict, undefined);
 	});
 });
 
-describe("collect 落收起标记 + 恢复归属声明", () => {
-	test("collect:session 文件尾追加 pi-worker-collected 条目(恢复去重,审计保留)", async () => {
+describe("collect 落收起标记(审计留痕)", () => {
+	test("collect:session 文件尾追加 pi-worker-collected 条目(verdict 入标记,终审留痕)", async () => {
 		const { manager, add } = setup();
 		const dir = mkdtempSync(join(tmpdir(), "piw-collect-"));
 		const file = join(dir, "s.jsonl");
@@ -404,65 +440,59 @@ describe("collect 落收起标记 + 恢复归属声明", () => {
 		assert.ok(tail.includes('"pi-worker-collected"'), "标记落盘");
 		assert.ok(tail.includes('"通过"'), "verdict 入标记(终审留痕)");
 	});
+});
 
-	test("recoverFromDisk:活他窗口持有的 worker 不恢复且在恢复消息中声明;已收起不恢复", async () => {
-		const { manager } = setup();
-		const dir = mkdtempSync(join(tmpdir(), "piw-rec-own-"));
-		const base = join(dir, ".pi", "worker-sessions");
-		mkdirSync(join(base, `p${process.pid}`), { recursive: true });
-		const HEADER = { type: "session", version: 3, id: "u", timestamp: "2026-08-12T10:00:00.000Z", cwd: "/r" };
-		const put = (sub, file, name, extra = []) => {
-			const d = sub ? join(base, sub) : base;
-			mkdirSync(d, { recursive: true });
-			writeFileSync(join(d, file), [HEADER, { type: "session_info", id: "i", parentId: null, timestamp: "t", name }, ...extra].map((l) => JSON.stringify(l)).join("\n") + "\n");
+describe("O4 握手授权链(handshake:new_session parentSession → 重取 get_state)", () => {
+	const mkHandle = () => {
+		const sent = [];
+		const rpc = {
+			sent,
+			send: async (cmd) => {
+				sent.push(cmd);
+				if (cmd.type === "get_state") return { sessionFile: `/sess/${sent.filter((c) => c.type === "get_state").length}.jsonl` };
+				if (cmd.type === "new_session") return { cancelled: false };
+				return { ok: true };
+			},
 		};
-		put(`p${process.pid}`, "mine.jsonl", "pi-worker-mine#aaaaaaaaaaaa");
-		put("p1", "held.jsonl", "pi-worker-held#bbbbbbbbbbbb"); // pid 1 恒活(launchd/init)
-		put(null, "collected.jsonl", "pi-worker-gone#cccccccccccc", [{ type: "custom", customType: "pi-worker-collected", id: "c", parentId: null, timestamp: "t", data: {} }]);
-		const res = await manager.recoverFromDisk(dir);
-		assert.equal(res.recovered, 1, "只恢复本实例的");
-		assert.ok(manager.sm.records.has("pi-worker-mine#aaaaaaaaaaaa"));
-		assert.ok(!manager.sm.records.has("pi-worker-held#bbbbbbbbbbbb"), "活他窗口持有不认领");
-		assert.ok(!manager.sm.records.has("pi-worker-gone#cccccccccccc"), "已收起不复活");
-		assert.deepEqual(res.heldElsewhere, ["pi-worker-held#bbbbbbbbbbbb"]);
-	});
-});
+		return { rpc, proc: { exitCode: null, signalCode: null, kill() {} }, sessionDir: "/tmp", watcher: { dispose: () => {} } };
+	};
 
-describe("遗留检测与认领分离(启动不自动恢复)", () => {
-	test("scanLeftovers 只读:返回扫描结果但不建记录(自动恢复废除)", async () => {
+	test("有 parentSessionFile:get_state → new_session(parentSession) → 重取 get_state → prompt;sessionFile 以重取为准", async () => {
 		const { manager } = setup();
-		const dir = mkdtempSync(join(tmpdir(), "piw-scan-"));
-		const base = join(dir, ".pi", "worker-sessions");
-		mkdirSync(base, { recursive: true });
-		writeFileSync(
-			join(base, "a.jsonl"),
-			[
-				{ type: "session", version: 3, id: "u", timestamp: "2026-08-12T10:00:00.000Z", cwd: "/r" },
-				{ type: "session_info", id: "i", parentId: null, timestamp: "t", name: "pi-worker-left#aaaaaaaaaaaa" },
-			].map((l) => JSON.stringify(l)).join("\n") + "\n",
-		);
-		const scan = await manager.scanLeftovers(dir);
-		assert.equal(scan.sessions.length, 1, "检测到遗留");
-		assert.equal(manager.sm.records.size, 0, "不建记录:认领是显式动作(recover)");
+		const id = "pi-worker-hank#aaaaaa";
+		manager.sm.run({ id, name: "hank" }); // starting
+		const handle = mkHandle();
+		await manager.handshake(handle, id, "任务", "/sess/parent.jsonl");
+		assert.deepEqual(handle.rpc.sent.map((c) => c.type), ["get_state", "new_session", "get_state", "prompt"]);
+		assert.equal(handle.rpc.sent[1].parentSession, "/sess/parent.jsonl", "授权链参数透传");
+		assert.equal(manager.sm.records.get(id).sessionFile, "/sess/2.jsonl", "new_session 后的新文件才是带链 header");
+		assert.equal(manager.sm.records.get(id).state, "running", "prompt 接受后 onStarted");
 	});
-});
 
-describe("recoverFromDisk 归属分类(claim 谓词)", () => {
-	test("claim 给定:只认领谓词通过的;其余进 foreign 不建记录", async () => {
+	test("无 parentSessionFile(ephemeral 父):跳过 new_session,legacy 序列不回归", async () => {
 		const { manager } = setup();
-		const dir = mkdtempSync(join(tmpdir(), "piw-claim-"));
-		const base = join(dir, ".pi", "worker-sessions");
-		mkdirSync(base, { recursive: true });
-		const HEADER = { type: "session", version: 3, id: "u", timestamp: "2026-08-12T10:00:00.000Z", cwd: "/r" };
-		const put = (file, name) =>
-			writeFileSync(join(base, file), [HEADER, { type: "session_info", id: "i", parentId: null, timestamp: "t", name }].map((l) => JSON.stringify(l)).join("\n") + "\n");
-		put("mine.jsonl", "pi-worker-mine#aaaaaaaaaaaa");
-		put("other.jsonl", "pi-worker-other#bbbbbbbbbbbb");
-		const res = await manager.recoverFromDisk(dir, { claim: (id) => id.includes("mine") });
-		assert.equal(res.recovered, 1);
-		assert.deepEqual(res.foreign.map((s) => s.id), ["pi-worker-other#bbbbbbbbbbbb"]);
-		assert.ok(manager.sm.records.has("pi-worker-mine#aaaaaaaaaaaa"));
-		assert.ok(!manager.sm.records.has("pi-worker-other#bbbbbbbbbbbb"), "外会话不建记录");
+		const id = "pi-worker-hank#aaaaaa";
+		manager.sm.run({ id, name: "hank" });
+		const handle = mkHandle();
+		await manager.handshake(handle, id, "任务");
+		assert.deepEqual(handle.rpc.sent.map((c) => c.type), ["get_state", "prompt"]);
+		assert.equal(manager.sm.records.get(id).sessionFile, "/sess/1.jsonl");
+	});
+
+	test("new_session cancelled → 不重取,无链启动(prompt 照发,legacy 恢复接管)", async () => {
+		const { manager } = setup();
+		const id = "pi-worker-hank#aaaaaa";
+		manager.sm.run({ id, name: "hank" });
+		const handle = mkHandle();
+		handle.rpc.send = async (cmd) => {
+			handle.rpc.sent.push(cmd);
+			if (cmd.type === "get_state") return { sessionFile: "/sess/orig.jsonl" };
+			if (cmd.type === "new_session") return { cancelled: true };
+			return { ok: true };
+		};
+		await manager.handshake(handle, id, "任务", "/sess/parent.jsonl");
+		assert.deepEqual(handle.rpc.sent.map((c) => c.type), ["get_state", "new_session", "prompt"]);
+		assert.equal(manager.sm.records.get(id).sessionFile, "/sess/orig.jsonl");
 	});
 });
 
@@ -513,7 +543,7 @@ describe("乐观迁移失败回滚(效果未落地 ⇒ 状态不留在意图上)
 		rpc.send = async () => {
 			throw new Error("EPIPE");
 		};
-		await assert.rejects(() => manager.message(ID, "打回:测试没写"), /follow_up 发送失败/);
+		await assert.rejects(() => manager.message(ID, "打回:测试没写"), /follow_up send failed/);
 		assert.equal(manager.sm.records.get(ID).state, "idle");
 		manager.collect(ID); // idle 合法 ⇒ 不必靠 kill 逃生
 		assert.equal(manager.sm.records.get(ID).state, "done");
@@ -525,7 +555,7 @@ describe("乐观迁移失败回滚(效果未落地 ⇒ 状态不留在意图上)
 		rpc.send = async () => {
 			throw new Error("子进程管道已断");
 		};
-		await assert.rejects(() => manager.stop(ID), /stop 发送失败/);
+		await assert.rejects(() => manager.stop(ID), /stop send failed/);
 		assert.equal(manager.sm.records.get(ID).state, "running");
 	});
 
@@ -547,7 +577,7 @@ describe("乐观迁移失败回滚(效果未落地 ⇒ 状态不留在意图上)
 			manager.sm.onSettled(ID); // stopping → idle
 			throw new Error("管道已断");
 		};
-		await assert.rejects(() => manager.stop(ID), /stop 发送失败/);
+		await assert.rejects(() => manager.stop(ID), /stop send failed/);
 		assert.equal(manager.sm.records.get(ID).state, "idle");
 	});
 
@@ -561,7 +591,7 @@ describe("乐观迁移失败回滚(效果未落地 ⇒ 状态不留在意图上)
 			rpc.send = async () => {
 				throw new Error("管道已断");
 			};
-			await assert.rejects(() => manager.stop(ID), /stop 发送失败/);
+			await assert.rejects(() => manager.stop(ID), /stop send failed/);
 			await vi.advanceTimersByTimeAsync(60000);
 			await vi.runAllTicks();
 			assert.equal(rpc.sent.includes("abort"), false, rpc.sent.join(","));
@@ -570,5 +600,84 @@ describe("乐观迁移失败回滚(效果未落地 ⇒ 状态不留在意图上)
 		} finally {
 			vi.useRealTimers();
 		}
+	});
+});
+
+describe("transcriptView(live 事件流+回填 / dead 文件解析;视图零 IO)", () => {
+	const entry = (role, text) => ({ type: "entry", entry: { type: "message", message: { role, content: text } } });
+
+	test("live:entry 事件入 buffer;view 触发 get_messages 回填,历史+增量合并且边界去重", async () => {
+		const { manager, add } = setup();
+		add("pi-worker-hank#aaaaaa", "hank", "running");
+		// 事件先到(回填前):buffer 只有增量
+		manager.onWorkerEvent("pi-worker-hank#aaaaaa", entry("user", "任务"));
+		assert.equal(manager.transcriptView("pi-worker-hank#aaaaaa").length, 1);
+		// 回填完成(假 rpc get_messages 返回「报告全文」assistant):历史替换头部
+		await new Promise((r) => setTimeout(r, 20));
+		const entries = manager.transcriptView("pi-worker-hank#aaaaaa");
+		const roles = entries.map((e) => e.message.role);
+		assert.deepEqual(roles, ["assistant", "user"], "回填历史在前 + 事件增量在后(不覆盖不丢)");
+	});
+
+	test("回填与飞行事件重叠 → 按内容去重(不双行)", async () => {
+		const { manager, add } = setup();
+		const rpc = add("pi-worker-hank#aaaaaa", "hank", "running");
+		// 让 get_messages 挂起,飞行期塞入与快照同文的消息
+		let release;
+		const gate = new Promise((r) => (release = r));
+		const origSend = rpc.send.bind(rpc);
+		rpc.send = async (cmd) => {
+			if (cmd.type === "get_messages") {
+				await gate;
+				return { messages: [{ role: "assistant", content: [{ type: "text", text: "快照含它" }] }] };
+			}
+			return origSend(cmd);
+		};
+		manager.transcriptView("pi-worker-hank#aaaaaa"); // 触发回填(挂起)
+		await new Promise((r) => setTimeout(r, 5));
+		manager.onWorkerEvent("pi-worker-hank#aaaaaa", {
+			type: "entry",
+			entry: { type: "message", message: { role: "assistant", content: [{ type: "text", text: "快照含它" }] } },
+		});
+		release();
+		await new Promise((r) => setTimeout(r, 20));
+		const entries = manager.transcriptView("pi-worker-hank#aaaaaa");
+		assert.equal(entries.filter((e) => JSON.stringify(e.message).includes("快照含它")).length, 1, "重叠去重,不双行");
+	});
+
+	test("dead(无句柄):session 文件一次性解析缓存;无文件 → 空(视图缺失提示)", async () => {
+		const { manager } = setup();
+		manager.sm.run({ id: "pi-worker-ghost#bbbbbb", name: "ghost" });
+		manager.sm.onStarted("pi-worker-ghost#bbbbbb");
+		manager.sm.onSettled("pi-worker-ghost#bbbbbb");
+		const rec = manager.sm.records.get("pi-worker-ghost#bbbbbb");
+		const dir = mkdtempSync(join(tmpdir(), "pi-worker-dead-"));
+		rec.sessionFile = join(dir, "s.jsonl");
+		writeFileSync(
+			rec.sessionFile,
+			[
+				JSON.stringify({ type: "session", version: 3, id: "s" }),
+				JSON.stringify({ type: "message", id: "e0", parentId: null, message: { role: "user", content: "遗留任务" } }),
+			].join("\n") + "\n",
+		);
+		// 无句柄(dead)→ 文件解析
+		const v1 = manager.transcriptView("pi-worker-ghost#bbbbbb");
+		assert.equal(v1.length, 1);
+		assert.equal(v1[0].message.content, "遗留任务");
+		// 缓存:删文件后再读仍是缓存(静态真相,不重读)
+		const v2 = manager.transcriptView("pi-worker-ghost#bbbbbb");
+		assert.equal(v2, v1, "同一缓存数组(原位语义供投影缓存检出)");
+		// 无文件无产物
+		manager.sm.run({ id: "pi-worker-none#cccccc", name: "none" });
+		manager.sm.onStarted("pi-worker-none#cccccc");
+		assert.deepEqual(manager.transcriptView("pi-worker-none#cccccc"), [], "无源 → 空(视图给缺失提示)");
+	});
+
+	test("collect 清账 → buffer 删除", async () => {
+		const { manager, add } = setup();
+		add("pi-worker-hank#aaaaaa", "hank", "idle");
+		manager.transcriptView("pi-worker-hank#aaaaaa");
+		manager.collect("pi-worker-hank#aaaaaa", "通过");
+		assert.equal(manager.transcripts.has("pi-worker-hank#aaaaaa"), false);
 	});
 });

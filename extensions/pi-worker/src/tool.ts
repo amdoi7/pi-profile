@@ -3,21 +3,19 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { ID_RE, NAME_RE, THINKING_LEVELS } from "./contract.ts";
-import { appendLifecycleEntry } from "./lifecycle-block.ts";
 import type { WorkerManager } from "./manager.ts";
-import { actionsFor, extractCost, formatRecentEntry, formatToolCallLine, latestStats } from "./present.ts";
+import { extractCost, formatToolCallLine, latestStats } from "./present.ts";
 import { WorkerError } from "./state-machine.ts";
 import { COLLECT_VERDICTS, type WorkerRecord } from "./types.ts";
 
 const piWorkerParams = Type.Object({
-	action: StringEnum(["run", "message", "stop", "collect", "kill", "status", "recover"]),
+	action: StringEnum(["run", "send", "stop", "collect", "kill", "status"]),
 	// 寻址收紧:id 只收系统生成的完整 id(name 可重名,不进寻址面);
 	// pattern 与 contract.ts 单一事实源同源,schema 层先拦截,运行时记录查找仍是兑底
 	id: Type.Optional(
 		Type.String({
 			pattern: ID_RE.source,
-			description:
-				"worker address: the full id returned by run; required for message/stop/collect/kill; for status, omit to list all",
+			description: "worker address: the full id returned by run; required for send/stop/collect/kill; for status, omit to list all",
 		}),
 	),
 	name: Type.Optional(
@@ -27,9 +25,9 @@ const piWorkerParams = Type.Object({
 				"required for run: worker name for display and redispatch (names may repeat; addressing uses id only)",
 		}),
 	),
-	prompt: Type.Optional(
+	text: Type.Optional(
 		Type.String({
-			description: "required for run: self-contained task brief; for message: the message text",
+			description: "required for run: self-contained task brief; for send: the message text",
 		}),
 	),
 	model: Type.Optional(Type.String({ description: "for run: worker model as provider/id; omit = default model" })),
@@ -58,16 +56,16 @@ export function registerPiWorkerTool(pi: ExtensionAPI, manager: WorkerManager): 
 		label: "Pi Worker",
 		// 回调线格式(settled XML / failed 线)是 bridge.ts 的 wire contract,注释已载;
 		// 渲染层已呈现 header/report,父模型无需知道格式才能行动——不进 prompt
-		description:
-			"Dispatch and manage pi workers: async tasks in independent sessions. run returns immediately; results arrive as callback messages.\n" +
-			"Use when a task is self-contained, needs an independent context, or parallelizes. Do not use for tasks you can complete directly or for simple questions.\n" +
-			"- run: create and dispatch a new session → {id, pid}; add rounds to an existing worker via message.\n" +
-			"- message: send text to a worker; running → effective at turn boundary, idle → triggers a new turn; terminal states reject.\n" +
-			"- stop: stop new work; the worker only finishes its report and settles.\n" +
-			"- kill: terminate immediately (exit → done); re-dispatch via run.\n" +
-			"- collect: mark done and terminate the process.\n" +
-			"- status: return worker records (state, usage, legal actions); omit id to list all; claimed records appear as state=exited with the recovered marker (last state unknown) — collect to clear.\n" +
-			"- recover: claim THIS session's leftover workers from disk (never automatic; startup only shows a hint; workers of other parent sessions are listed with a pi --session/--fork path, not claimed) — then status to audit, collect to clear.",
+		description: `Dispatch and manage pi workers: async tasks in independent sessions. run returns immediately; results arrive as callback messages.
+Use when a task is self-contained, needs an independent context, or parallelizes. Do not use for tasks you can complete directly or for simple questions.
+
+Actions:
+- run: spawn a worker session → returns {id} (the address for all later actions)
+- send: deliver text; running → steer (effective after current tool call), idle → triggers a new turn, exited → cold-resume via --session with full history; other terminal states reject
+- stop: stop new work; the worker only finishes its report and settles
+- collect: mark done and clear the record; optional verdict = final review conclusion
+- status: worker records (state, usage, legal actions); omit id to list all; exited records can be cold-resumed via send, cleared via collect`,
+
 		parameters: piWorkerParams,
 		renderCall(args, theme, _context) {
 			const line = formatToolCallLine(String(args.action ?? ""), args);
@@ -75,7 +73,7 @@ export function registerPiWorkerTool(pi: ExtensionAPI, manager: WorkerManager): 
 		},
 		async execute(_toolCallId, params: PiWorkerParams, _signal, _onUpdate, ctx) {
 			try {
-				const result = await dispatch(manager, params, ctx.cwd, pi, ctx);
+				const result = await dispatch(manager, params, ctx.cwd, ctx);
 				return { content: [{ type: "text", text: result }], details: { params } };
 			} catch (e) {
 				if (e instanceof WorkerError) throw new Error(e.message);
@@ -85,104 +83,143 @@ export function registerPiWorkerTool(pi: ExtensionAPI, manager: WorkerManager): 
 	});
 }
 
-async function dispatch(manager: WorkerManager, p: PiWorkerParams, cwd: string, pi: Pick<ExtensionAPI, "appendEntry">, ctx: { sessionManager?: { getBranch?: () => unknown[] } }): Promise<string> {
+async function dispatch(manager: WorkerManager, p: PiWorkerParams, cwd: string, ctx: { sessionManager?: { getBranch?: () => unknown[]; getSessionFile?: () => string | null | undefined } }): Promise<string> {
 	switch (p.action) {
 		case "run": {
-			const { id, pid } = manager.run(
+			const { id } = manager.run(
 				{
 					name: p.name ?? "",
-					prompt: p.prompt ?? "",
+					prompt: p.text ?? "",
 					model: p.model,
 					thinking: p.thinking,
 					tools: p.tools,
 				},
 				cwd,
+				// O4 授权链:父 session 文件写入 worker jsonl header(parentSession),
+				// 恢复归属变数据;ephemeral 父(print 无文件)为 null,走 legacy 恢复
+				{ parentSessionFile: ctx.sessionManager?.getSessionFile?.() ?? undefined },
 			);
-			// transcript 生命周期 block:显示态 entry(TUI-only);RPC 父只持久化不渲染,无害
-			appendLifecycleEntry(pi, manager.status(id) as WorkerRecord, p.prompt ?? "");
-			return `run 已接受:name=${p.name!.trim()} id=${id}(后续操作一律用此 id) pid=${pid ?? "?"};完成/提问/崩溃将以回调消息送达。`;
+			return `accepted: name=${p.name!.trim()} id=${id} (use this id for all later actions); completion/questions/crash arrive as callback messages.`;
 		}
-		case "message": {
-			requireField(p, "id", "message");
-			requireField(p, "prompt", "message");
-			const result = await manager.bus.post("parent", p.id!, p.prompt!);
-			if (!result.ok) throw new WorkerError(`message 失败: ${result.reason}`);
+		case "send": {
+			requireField(p, "id", "send");
+			requireField(p, "text", "send");
+			// exited 直调 manager(bus resolve 只含 running/idle——peer 不得复活死 worker;
+			// 冷恢复是父独占的生命周期动作)。status 抛错即「id 不存在 + 存活列表」
+			const target = manager.status(p.id!) as WorkerRecord;
+			if (target.state === "exited") {
+				await manager.message(p.id!, p.text!);
+				return `cold-resume started: ${p.id} (--session same file, full history); the text triggers a new turn; results arrive as callbacks.`;
+			}
+			const result = await manager.bus.post("parent", p.id!, p.text!);
+			if (!result.ok) throw new WorkerError(`send failed: ${result.reason}`);
 			return result.via === "steer"
-				? `message 已注入:${p.id};当前 turn 工具执行完毕后生效。`
-				: `message 已投递:${p.id};worker 触发新轮。`;
+				? `steer injected: ${p.id}; effective after current tool call.`
+				: `delivered: ${p.id}; worker starts a new turn.`;
 		}
 		case "stop": {
 			requireField(p, "id", "stop");
 			await manager.stop(p.id!);
-			return `stop 已发送:${p.id};worker 将只收尾呈报,settled 后并入 idle。`;
+			return `stop sent: ${p.id}; worker finishes its report and settles (→ idle).`;
 		}
 		case "collect": {
 			requireField(p, "id", "collect");
 			manager.collect(p.id!, p.verdict);
 			return p.verdict
-				? `已收尾:${p.id} → done,verdict=${p.verdict};deliverable frontmatter 由验收方同步落笔。`
-				: `已收尾:${p.id} → done。`;
+				? `collected: ${p.id} → done, verdict=${p.verdict}; deliverable frontmatter is written by the accepting side.`
+				: `collected: ${p.id} → done.`;
 		}
 		case "kill": {
 			requireField(p, "id", "kill");
 			await manager.kill(p.id!);
-			return `kill 已执行:${p.id};进程退出后 → done。`;
+			return `kill executed: ${p.id}; → done after process exit.`;
 		}
 		case "status": {
 			const records = manager.status(p.id);
 			return formatStatus(records);
 		}
-		case "recover": {
-			const branchText = JSON.stringify(ctx.sessionManager?.getBranch?.() ?? []);
-			const res = await manager.recoverFromDisk(cwd, { claim: (id) => branchText.includes(id) });
-			const parts = [`认领 ${res.recovered} 个本会话遗留 worker`];
-			if (res.foreign.length > 0) {
-				parts.push(
-					`非本会话遗留 ${res.foreign.length} 个(不建记录;直接新会话查看): ` +
-						res.foreign.map((s) => `${s.id} → pi --session ${s.sessionFile}(查看/续接) 或 pi --fork ${s.sessionFile}(新会话)`).join("; "),
-				);
-			}
-			if (res.skippedFiles.length > 0) parts.push(`跳过不可解析: ${res.skippedFiles.join(", ")}`);
-			if (res.heldElsewhere.length > 0) parts.push(`其他活窗口持有: ${res.heldElsewhere.join(", ")}`);
-			parts.push(res.recovered > 0 ? "status 审计,collect 清理" : "无需认领");
-			return parts.join(";");
-		}
 		default:
-			throw new WorkerError(`未知 action: ${String(p.action)}`);
+			throw new WorkerError(`unknown action: ${String(p.action)}`);
 	}
 }
 
-function requireField(p: PiWorkerParams, field: "id" | "prompt", action: string): void {
+function requireField(p: PiWorkerParams, field: "id" | "text", action: string): void {
 	if (!p[field]?.trim()) {
-		throw new WorkerError(`缺 ${field} 参数;action=${action} 需要 ${field}。`);
+		throw new WorkerError(`missing ${field}; action=${action} requires ${field}.`);
+	}
+}
+
+/** status 列表排序:决策优先(failed/idle/exited 需父行动)> 工作态 > 终态(done 是噪音居尾)。
+ * 与 overlay formatOverlayRows 的 decision 区同语义,但本地映射——markOf 对 done 抛错,不可复用。 */
+const STATUS_RANK: Record<string, number> = {
+	failed: 0,
+	idle: 1,
+	exited: 2,
+	starting: 3,
+	running: 3,
+	stopping: 3,
+	done: 4,
+	killing: 4,
+};
+
+/** status 的合法动作面:工具枚举 + 参数提示(能力同构抽象)——RPC 父拿到即可直接
+ * 调用工具,零 label→action 映射。治理语义(判决/归因)就事论事落在可执行面:
+ * collect 带 verdict 枚举、failed 提示清账后重派。与 pane 的 UI 文案(actionsFor)
+ * 分离:前者是机器契约,后者是显示层。 */
+export function statusActionsFor(r: WorkerRecord): string {
+	switch (r.state) {
+		case "idle":
+			return "send|collect(verdict=通过|丢弃|强制放行)";
+		case "failed":
+			return "collect(clear, then redispatch per attribution)";
+		case "running":
+			return "send|stop|kill";
+		case "starting":
+		case "stopping":
+			return "kill";
+		case "exited":
+			return "send(cold-resume)|collect";
+		default:
+			return "";
 	}
 }
 
 function formatStatus(records: WorkerRecord | WorkerRecord[]): string {
 	const list = Array.isArray(records) ? records : [records];
-	if (list.length === 0) return "无worker 记录。";
-	return list
+	if (list.length === 0) return "No worker records.";
+	const sorted = [...list].sort(
+		(a, b) => (STATUS_RANK[a.state] ?? 9) - (STATUS_RANK[b.state] ?? 9) || a.createdAt - b.createdAt,
+	);
+	// 多条时给一行汇总头:父 LLM 扫读不用自数;决策态在前(与行序一致)
+	let header = "";
+	if (sorted.length > 1) {
+		const counts = new Map<string, number>();
+		for (const r of sorted) counts.set(r.state, (counts.get(r.state) ?? 0) + 1);
+		const summary = [...counts.entries()]
+			.sort((a, b) => (STATUS_RANK[a[0]] ?? 9) - (STATUS_RANK[b[0]] ?? 9))
+			.map(([s, n]) => `${s}×${n}`)
+			.join(" · ");
+		header = `${sorted.length} workers: ${summary}\n`;
+	}
+	const body = sorted
 		.map((r) => {
 			const bits = [`id=${r.id}`, `state=${r.state}`];
-			if (r.recovered) bits.push("recovered");
-			if (r.pid) bits.push(`pid=${r.pid}`);
-			if (r.modelInfo) bits.push(`model=${r.modelInfo.provider}/${r.modelInfo.id}`);
+			// 非正常收尾(length 截断/aborted 中断)是验收信号,RPC 父只看本输出,必须带出
+			if (r.stopReason && r.stopReason !== "stop") bits.push(`stopReason=${r.stopReason}`);
+			bits.push(`turns=${r.turns}`);
 			if (r.processExited) bits.push(`exit=${r.exitCode ?? r.exitSignal ?? "?"}`);
 			// 失败诊断:exit=? 时 stderrTail 是唯一原因(spawn 失败等),状态行带出
 			if (r.stderrTail) bits.push(`stderr="${r.stderrTail.slice(0, 120)}"`);
+			// 呈报获取/deliver 失败诊断(pane 之外的唯一可见面)
+			if (r.reportError) bits.push(`reportError="${r.reportError.slice(0, 120)}"`);
 			if (r.verdict) bits.push(`verdict=${r.verdict}`);
-			if (r.tools) bits.push(`tools=${r.tools}`);
-			// 遗留记录:jsonl 是唯一事实源,审计指针带出
-			if (r.recovered && r.sessionFile) bits.push(`session=${r.sessionFile}`);
-			// G4:合法动作列表复用 actionsFor(与 overlay 同一事实源),rpc 父的决策队列
-			const actions = actionsFor(r);
-			if (actions.length > 0) bits.push(`actions=${actions.map((a) => a.label).join("|")}`);
+			// 合法动作列表:工具面直出(statusActionsFor),决策队列
+			const actions = statusActionsFor(r);
+			if (actions) bits.push(`actions=${actions}`);
 			const cost = extractCost(latestStats(r));
-			if (cost !== undefined) bits.push(`cost=${cost}`);
-			const recentLines = r.recent.slice(-6).map((e) => `  ${formatRecentEntry(e)}`);
-			if (r.recent.length > 6) recentLines.push(`  … +${r.recent.length - 6} more`);
-			const recent = recentLines.length > 0 ? `\n${recentLines.join("\n")}` : "";
-			return `- ${bits.join(" ")}${recent}`;
+			if (cost !== undefined) bits.push(`cost=${cost.toFixed(4)}`);
+			return `- ${bits.join(" ")}`;
 		})
 		.join("\n");
+	return header + body;
 }

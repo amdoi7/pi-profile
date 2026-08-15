@@ -11,6 +11,8 @@ export type CallbackEvent =
 			name: string;
 			report: string;
 			reportError?: string;
+			/** 末条 assistant 的 stopReason(stop|length|toolUse|error|aborted;length 即截断) */
+			stopReason?: string;
 			stats?: unknown;
 			/** 完成轮数(摘要行 ⎿ N turns) */
 			turns?: number;
@@ -35,6 +37,10 @@ export interface CallbackMessage {
 
 export const CALLBACK_TYPE = "pi-worker";
 
+/** settled 报告注入父上下文(LLM 面)的长度上限;超限截断并标注,全文在
+ * details.report(渲染层)与 session jsonl。无上限时失控长报告烧父上下文。 */
+const SETTLED_REPORT_MAX = 8000;
+
 /** XML 文本转义:report/name 是自由文本(用户与 LLM 可输入),防模板破坏。 */
 function xmlEscape(s: string): string {
 	return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -54,11 +60,16 @@ function num(v: unknown): number | undefined {
 function formatSettledContent(ev: Extract<CallbackEvent, { type: "settled" }>): string {
 	const id = xmlEscape(ev.id);
 	const name = xmlEscape(ev.name);
-	const report =
-		ev.report || (ev.reportError ? `(呈报获取失败: ${ev.reportError})` : "(无呈报)");
+	let report =
+		ev.report || (ev.reportError ? `(report unavailable: ${ev.reportError})` : "(no report)");
+	if (report.length > SETTLED_REPORT_MAX) {
+		report = `${report.slice(0, SETTLED_REPORT_MAX)}\n…(truncated ${report.length - SETTLED_REPORT_MAX} chars; full text in session jsonl and render layer)`;
+	}
 	const lines = [`settled id=${ev.id} name=${ev.name}${ev.sessionFile ? ` session=${ev.sessionFile}` : ""}`, "<worker-settled>"];
 	lines.push(`<id>${id}</id>`, `<name>${name}</name>`);
 	lines.push("<status>settled</status>");
+	// 非正常收尾才输出:length(截断)/aborted/error 是父需要知道的诊断信号
+	if (ev.stopReason && ev.stopReason !== "stop") lines.push(`<stop_reason>${xmlEscape(ev.stopReason)}</stop_reason>`);
 	if (typeof ev.turns === "number") lines.push(`<turns>${ev.turns}</turns>`);
 	const stats = (ev.stats ?? {}) as {
 		tokens?: Record<string, unknown>;
@@ -93,6 +104,7 @@ export function formatCallback(ev: CallbackEvent): CallbackMessage {
 				name: ev.name,
 				report: ev.report,
 				reportError: ev.reportError,
+				...(ev.stopReason !== undefined ? { stopReason: ev.stopReason } : {}),
 				stats: ev.stats,
 				turns: ev.turns,
 				...(ev.sessionFile !== undefined ? { sessionFile: ev.sessionFile } : {}),
