@@ -4,8 +4,7 @@ import { mkdirSync, mkdtempSync, writeFileSync, appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { COLLECTED_MARKER, appendLedgerEntry, dispositionsFromLedger, hasCollectedMarker, readLedger, scanLeftoverSessions } from "../src/recovery.ts";
-import { workerLedgerFile } from "../src/contract.ts";
+import { COLLECTED_MARKER, hasCollectedMarker, scanLeftoverSessions } from "../src/recovery.ts";
 
 /**
  * 重启认领扫描:父重启后子进程随父死(stdin EOF 自退),worker jsonl 留在
@@ -118,33 +117,3 @@ describe("scanLeftoverSessions(重启认领:磁盘 jsonl → 遗留 worker 身�
 	});
 });
 
-describe("worker-ledger(父侧台账:决策即落盘,重启重放;子 session 降为纯审计)", () => {
-	// 命名回归:marker 写失败的降级窗口由台账终态否决补网;同 id 多代次由 bind 指针消歧
-	test("appendLedgerEntry/readLedger 往返;坏行与未知类型跳过(前向兼容/截断写)", () => {
-		const cwd = mkdtempSync(join(tmpdir(), "piw-ledger-"));
-		appendLedgerEntry(cwd, { type: "bind", id: "pi-worker-a#aaaaaaaaaaaa", sessionFile: join(cwd, ".pi", "worker-sessions", "f.jsonl"), cwd, ts: 1 });
-		appendFileSync(workerLedgerFile(cwd), "{bad json\n");
-		appendFileSync(workerLedgerFile(cwd), JSON.stringify({ type: "future-type", id: "pi-worker-z#zzzzzzzzzzzz", ts: 9 }) + "\n");
-		appendLedgerEntry(cwd, { type: "collect", id: "pi-worker-a#aaaaaaaaaaaa", verdict: "通过", ts: 2 });
-		const entries = readLedger(cwd);
-		assert.equal(entries.length, 2, "坏行/未知类型跳过");
-		assert.equal(entries[1].type, "collect");
-		assert.equal(readLedger(join(tmpdir(), `piw-none-${Date.now()}`)).length, 0, "无台账文件 → 空(legacy 扫描接管)");
-	});
-
-	test("dispositions:bind 开(新代次证据)、collect/kill 终态;同 id 多代次取最新 bind 指针", () => {
-		const id = "pi-worker-a#aaaaaaaaaaaa";
-		const settled = dispositionsFromLedger([
-			{ type: "bind", id, sessionFile: "/old.jsonl", cwd: "/c", ts: 1 },
-			{ type: "collect", id, verdict: "丢弃", ts: 2 },
-		]);
-		assert.equal(settled.get(id)?.settled, true, "collect 终态");
-		const rerun = dispositionsFromLedger([
-			{ type: "bind", id, sessionFile: "/old.jsonl", cwd: "/c", ts: 1 },
-			{ type: "kill", id, ts: 2 },
-			{ type: "bind", id, sessionFile: "/new.jsonl", cwd: "/c", ts: 3 },
-		]);
-		assert.equal(rerun.get(id)?.settled, false, "新代次 bind 重开");
-		assert.equal(rerun.get(id)?.sessionFile, "/new.jsonl", "指针取最新 bind(消歧多代次)");
-	});
-});

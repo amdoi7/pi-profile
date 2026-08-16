@@ -6,7 +6,7 @@ import { join } from "node:path";
 
 import { WorkerManager, applyHandshakeState } from "../src/manager.ts";
 import { workerSessionDir } from "../src/contract.ts";
-import { COLLECTED_MARKER, appendLedgerEntry, readLedger } from "../src/recovery.ts";
+import { COLLECTED_MARKER } from "../src/recovery.ts";
 
 /** 反应器单测:句柄用假 rpc 注入(不起进程);terminate 对 exitCode 非 null 无操作。 */
 describe("workerSessionDir", () => {
@@ -903,91 +903,33 @@ describe("claimLeftovers(父重启认领:磁盘遗留 → exited 记录,send/col
 		assert.equal(rec.sessionFile, file);
 	});
 
-	test("台账终态否决认领:marker 缺失(写失败降级)也不复活(补网)", async () => {
+	test("旧代次已收起(marker)、新代次同 id 无标记 → 认领新代次(评审 Finding 1 场景)", async () => {
+		// 契约:重派同 id 的活代次永不被旧代次的终态压住——否决只看文件自身 marker
 		const cwd = mkdtempSync(join(tmpdir(), "piw-clm-"));
 		const id = "pi-worker-hank#0123456789ab";
-		leftoverFixture(cwd, id); // 无 marker——模拟 marker 写失败的降级窗口
-		appendLedgerEntry(cwd, { type: "collect", id, verdict: "通过", ts: 1 });
+		leftoverFixture(cwd, id, { collected: true, timestamp: "2026-08-12T09:00:00.000Z" }); // gen1 已收起
+		writeFileSync(join(workerSessionDir(cwd), "gen2.jsonl"), [
+			{ type: "session", version: 3, id: "u2", timestamp: "2026-08-12T12:00:00.000Z", cwd },
+			{ type: "session_info", id: "k2", parentId: null, timestamp: "2026-08-12T12:00:01.000Z", name: id },
+		].map((l) => JSON.stringify(l)).join("\n") + "\n");
 		const { manager } = setup();
-		assert.equal(await manager.claimLeftovers(cwd), 0, "台账 settled → 否决,不认领");
+		assert.equal(await manager.claimLeftovers(cwd), 1, "gen2 无 marker,必须认领");
+		assert.ok(manager.status(id).sessionFile.endsWith("gen2.jsonl"), "指向新代次");
 	});
 
-	test("同 id 多代次:无台账取最新 createdAt;有台账 bind 指针优先(消歧,不接旧代次)", async () => {
+	test("同 id 多代次:取最新 createdAt(旧实现先到先得,readdir 序不定 → 可能接旧代次)", async () => {
 		const id = "pi-worker-hank#0123456789ab";
-		const write2 = (cwd) => {
-			const dir = workerSessionDir(cwd);
-			mkdirSync(dir, { recursive: true });
-			for (const [f, ts] of [["gen1.jsonl", "2026-08-12T09:00:00.000Z"], ["gen2.jsonl", "2026-08-12T12:00:00.000Z"]]) {
-				writeFileSync(join(dir, f), [
-					{ type: "session", version: 3, id: "u", timestamp: ts, cwd },
-					{ type: "session_info", id: "k1", parentId: null, timestamp: ts, name: id },
-				].map((l) => JSON.stringify(l)).join("\n") + "\n");
-			}
-		};
-		// 无台账:取最新代次(旧实现先到先得,readdir 序不定 → 可能接旧代次)
-		const cwd1 = mkdtempSync(join(tmpdir(), "piw-clm-"));
-		write2(cwd1);
-		const { manager } = setup();
-		assert.equal(await manager.claimLeftovers(cwd1), 1);
-		assert.ok(manager.status(id).sessionFile.endsWith("gen2.jsonl"), "无台账取最新代次");
-		// 有台账:bind 指针精确认领
-		const cwd2 = mkdtempSync(join(tmpdir(), "piw-clm-"));
-		write2(cwd2);
-		const bound = join(workerSessionDir(cwd2), "gen2.jsonl");
-		appendLedgerEntry(cwd2, { type: "bind", id, sessionFile: bound, cwd: cwd2, ts: 1 });
-		const { manager: m2 } = setup();
-		assert.equal(await m2.claimLeftovers(cwd2), 1);
-		assert.equal(m2.status(id).sessionFile, bound, "台账 bind 指针优先");
-	});
-});
-
-describe("worker-ledger 决策点落账(决策即持久化,与事件时序解耦)", () => {
-	// 命名回归:killAll 若落账,正常退出后 G1 认领全灭(见 memory killAll×marker 碰撞)
-	const anchorFile = (cwd) => {
+		const cwd = mkdtempSync(join(tmpdir(), "piw-clm-"));
 		const dir = workerSessionDir(cwd);
 		mkdirSync(dir, { recursive: true });
-		const file = join(dir, "s.jsonl");
-		writeFileSync(file, JSON.stringify({ type: "session", version: 3, id: "x", timestamp: "t", cwd }) + "\n");
-		return file;
-	};
-
-	test("kill/collect 决策点落账;killAll(shutdown 连带)不落账", async () => {
-		const cwd = mkdtempSync(join(tmpdir(), "piw-led-"));
-		const file = anchorFile(cwd);
-		const { manager, add } = setup();
-		const id1 = "pi-worker-hank#aaaaaa";
-		add(id1, "hank", "running");
-		manager.sm.records.get(id1).sessionFile = file;
-		await manager.kill(id1); // 决策时落账(先于 exit 事件)
-		assert.deepEqual(readLedger(cwd).map((e) => e.type), ["kill"], "kill 落账");
-		const id2 = "pi-worker-hank#bbbbbb";
-		add(id2, "hank", "running");
-		manager.sm.records.get(id2).sessionFile = file;
-		manager.killAll();
-		assert.deepEqual(readLedger(cwd).map((e) => e.type), ["kill"], "killAll 不落账");
-		const id3 = "pi-worker-hank#cccccc";
-		add(id3, "hank", "idle");
-		manager.sm.records.get(id3).sessionFile = file;
-		manager.collect(id3, "通过");
-		const entries = readLedger(cwd);
-		assert.deepEqual(entries.map((e) => e.type), ["kill", "collect"], "collect 落账");
-		assert.equal(entries[1].verdict, "通过", "verdict 入账(终审留痕)");
-	});
-
-	test("握手锚定 sessionFile → bind 落账;同文件二次握手(cold-resume)不重复", async () => {
-		const cwd = mkdtempSync(join(tmpdir(), "piw-led-"));
+		for (const [f, ts] of [["gen1.jsonl", "2026-08-12T09:00:00.000Z"], ["gen2.jsonl", "2026-08-12T12:00:00.000Z"]]) {
+			writeFileSync(join(dir, f), [
+				{ type: "session", version: 3, id: "u", timestamp: ts, cwd },
+				{ type: "session_info", id: "k1", parentId: null, timestamp: ts, name: id },
+			].map((l) => JSON.stringify(l)).join("\n") + "\n");
+		}
 		const { manager } = setup();
-		const id = "pi-worker-hank#aaaaaa";
-		manager.sm.run({ id, name: "hank" });
-		manager.sm.records.get(id).cwd = cwd;
-		const file = join(workerSessionDir(cwd), "s.jsonl");
-		const rpc = { sent: [], send: async (cmd) => (cmd.type === "get_state" ? { sessionFile: file } : { ok: true }), writeRaw: () => {} };
-		const handle = { rpc, proc: { exitCode: null, signalCode: null, kill() {} }, sessionDir: "/tmp", watcher: { dispose: () => {} } };
-		await manager.handshake(handle, id, "任务");
-		const entries = readLedger(cwd);
-		assert.deepEqual(entries.map((e) => e.type), ["bind"], "sessionFile 首锚 → bind");
-		assert.equal(entries[0].sessionFile, file);
-		await manager.handshake(handle, id, "任务2");
-		assert.equal(readLedger(cwd).length, 1, "同文件不重复 bind");
+		assert.equal(await manager.claimLeftovers(cwd), 1);
+		assert.ok(manager.status(id).sessionFile.endsWith("gen2.jsonl"), "认领最新代次,不接旧代次");
 	});
 });

@@ -1,7 +1,7 @@
 import { formatCallback, CALLBACK_TYPE, type CallbackMessage } from "./bridge.ts";
 import { existsSync, readFileSync } from "node:fs";
 import { buildInitialPrompt, cwdFromWorkerSessionFile, makeWorkerId, normalizeTools, summarizeTask, validateRunInput, workerSessionDir, HANDSHAKE_TIMEOUT_MS, STOP_GRACE_MS, STOP_ABORT_WINDOW_MS } from "./contract.ts";
-import { COLLECTED_MARKER, appendLedgerEntry, appendSessionLine, dispositionsFromLedger, readLedger, scanLeftoverSessions, type LedgerEntry, type LeftoverSession } from "./recovery.ts";
+import { COLLECTED_MARKER, appendSessionLine, scanLeftoverSessions, type LeftoverSession } from "./recovery.ts";
 import { RoomBus, type SendMode } from "./room-bus.ts";
 import { displayNameOf } from "./present.ts";
 import { RpcClient } from "./rpc-client.ts";
@@ -179,12 +179,11 @@ export class WorkerManager {
 	}
 
 	/** 启动认领:父重启后从磁盘重建遗留 worker 记录(进程随父死,jsonl 在;
-	 * send 冷恢复 / collect 清账是记录的合法出路)。幂等:已存在 id 跳过。
-	 * 双源否决:台账终态(collect/kill 落账)或文件 marker 任一成立即不认领;
-	 * 同 id 多代次由台账 bind 指针消歧,无台账取最新 createdAt。返回新认领数。 */
+	 * send 冷恢复 / collect 清账是记录的合法出路)。幂等:已存在 id 跳过;
+	 * 唯一否决源 = 文件尾部 COLLECTED_MARKER;同 id 多代次取最新 createdAt。 */
 	async claimLeftovers(cwd: string): Promise<number> {
 		const { sessions } = await scanLeftoverSessions(cwd);
-		const dispositions = dispositionsFromLedger(readLedger(cwd));
+		// 同 id 多文件 = 多代次遗留:取最新代次(旧实现先到先得,readdir 序不定)
 		const byId = new Map<string, LeftoverSession[]>();
 		for (const s of sessions) {
 			const g = byId.get(s.id);
@@ -192,14 +191,9 @@ export class WorkerManager {
 			else byId.set(s.id, [s]);
 		}
 		let n = 0;
-		for (const [id, group] of byId) {
-			if (this.sm.records.has(id)) continue;
-			const d = dispositions.get(id);
-			if (d?.settled) continue; // 台账终态否决(marker 写失败的降级窗口由此补网)
-			const chosen = d?.sessionFile
-				? group.find((s) => s.sessionFile === d.sessionFile) // bind 文件已没:不复活旧代次
-				: group.sort((a, b) => b.createdAt - a.createdAt)[0]; // 无台账:最新代次
-			if (!chosen) continue;
+		for (const [, group] of byId) {
+			const chosen = group.sort((a, b) => b.createdAt - a.createdAt)[0];
+			if (this.sm.records.has(chosen.id)) continue;
 			this.sm.claimLeftover(chosen);
 			n++;
 		}
@@ -247,7 +241,6 @@ export class WorkerManager {
 	 * new_session 后 sessionFile 变更,必须重取 get_state 覆写审计指针;cancelled(理论不可达:
 	 * 子进程仅加载自身扩展,无 session_before_switch 钩子)回退无链启动,legacy 恢复路径接管。 */
 	private async handshake(handle: Handle, id: string, prompt: string, parentSessionFile?: string): Promise<void> {
-		const prevFile = this.sm.records.get(id)?.sessionFile;
 		const state = await handle.rpc.send({ type: "get_state" }, { timeoutMs: HANDSHAKE_TIMEOUT_MS });
 		// 握手顺带取实际生效模型/档位 + 原生 sessionFile(审计指针)
 		const live = this.sm.records.get(id);
@@ -259,11 +252,6 @@ export class WorkerManager {
 				const live2 = this.sm.records.get(id);
 				if (live2) applyHandshakeState(live2, state2 as { model?: { provider?: string; id?: string } | null; thinkingLevel?: string; sessionFile?: string });
 			}
-		}
-		// 审计指针锚定即落账(bind = 新代次证据,重放时重开);同文件(cold-resume)不重复
-		const bound = this.sm.records.get(id);
-		if (bound?.sessionFile && bound.sessionFile !== prevFile) {
-			this.ledgerWrite({ type: "bind", id, sessionFile: bound.sessionFile, ts: Date.now() });
 		}
 		await handle.rpc.send({ type: "prompt", message: prompt });
 		// 仅 starting→running 一次转移;若期间已被 kill(→killing)则忽略
@@ -524,31 +512,18 @@ export class WorkerManager {
 		}
 	}
 
-	/** 台账落账(决策点同步;cwd 取记录或锚点反解)。写失败降级:marker/扫描 fallback
-	 * 仍在,台账是补网不是单点;无锚点(纯内存记录)同样跳过。 */
-	private ledgerWrite(entry: { type: "bind"; id: string; sessionFile: string; ts: number } | { type: "collect"; id: string; verdict?: string; ts: number } | { type: "kill"; id: string; ts: number }): void {
-		const rec = this.sm.records.get(entry.id);
-		const cwd = rec?.cwd ?? (rec?.sessionFile ? cwdFromWorkerSessionFile(rec.sessionFile) : undefined);
-		if (!cwd) return;
-		try {
-			appendLedgerEntry(cwd, { ...entry, cwd } as LedgerEntry);
-		} catch {
-			// 见上注释:去重降级,不 fail 主路径
-		}
-	}
-
-	/** collect:父验收后收尾,终止进程并释放。verdict = 终审结论(工具参数面,
-	 * 落记录供 status 审计);非法状态抛错(fail fast),不落 verdict。 */
+	/** collect:父验收后收尾。verdict = 终审结论(工具参数面,落记录供 status 审计);
+	 * 非法状态抛错(fail fast),不落 verdict。marker 先于 terminate 落盘(决策即持久化,
+	 * 与 kill 同款:终止前崩溃不丢决策)。 */
 	collect(id: string, verdict?: CollectVerdict): void {
 		this.sm.collect(id);
 		this.pendingFollowUps.delete(id); // 验收收尾:排队作废
 		this.transcripts.delete(id);
 		const rec = this.sm.records.get(id);
 		if (rec && verdict) rec.verdict = verdict;
+		this.writeCollectedMarker(id, verdict); // 决策即落盘,先于进程终止(终止前崩溃不丢决策)
 		const handle = this.handles.get(id);
 		if (handle) terminate(handle.proc);
-		this.writeCollectedMarker(id, verdict);
-		this.ledgerWrite({ type: "collect", id, verdict, ts: Date.now() }); // 台账终态:marker 降级的补网
 		this.deps.onChange?.();
 	}
 
@@ -593,7 +568,6 @@ export class WorkerManager {
 			throw new WorkerError(`kill failed: ${id} in legal state but missing process handle (invariant broken); rerun`);
 		}
 		this.writeCollectedMarker(id); // 决策时持久化(先于进程终止,与事件时序解耦)
-		this.ledgerWrite({ type: "kill", id, ts: Date.now() }); // 台账终态:marker 降级的补网
 		await this.escalate(id, KILL_ESCALATION);
 		this.deps.onChange?.();
 	}

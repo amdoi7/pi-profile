@@ -63,12 +63,6 @@ export function workerSessionDir(cwd: string): string {
 	return join(cwd, ".pi", "worker-sessions");
 }
 
-/** 父侧台账(append-only):<cwd>/.pi/worker-ledger.jsonl。决策即落盘(run 之外的
- * bind/collect/kill),重启重放为认领真源;子 session 文件降为纯审计/历史。 */
-export function workerLedgerFile(cwd: string): string {
-	return join(cwd, ".pi", "worker-ledger.jsonl");
-}
-
 /** O3 冷恢复:从 worker jsonl 绝对路径反解父 cwd(锚点 = worker-sessions 目录约定)。
  * 锚点缺失 = 非本扩展产物,返回 undefined 由调用方拒绝。 */
 export function cwdFromWorkerSessionFile(sessionFile: string): string | undefined {

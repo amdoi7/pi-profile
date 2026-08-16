@@ -3,20 +3,19 @@
 子 agent worker 编排:父会话经 `pi_worker` 工具(run/send/stop/collect/kill/status)
 派生、干预、验收、撤换独立 pi 进程;`/pi-worker` 面板提供决策队列视图与动作面;
 RoomBus + `send_message` 工具构成 parent/worker 的 room 消息平面。worker session
-jsonl 落 `<cwd>/.pi/worker-sessions`(审计与冷恢复历史),父侧台账落
-`<cwd>/.pi/worker-ledger.jsonl`(认领真源)。
+jsonl 落 `<cwd>/.pi/worker-sessions`(审计、冷恢复历史与重启认领的唯一否决源)。
 
 ## 模块地图(src/)
 
 - `index.ts` — 生命周期接线:startup `claimLeftovers`、`session_shutdown → killAll`、快捷键与 footer。
 - `tool.ts` — `pi_worker` 工具 schema 与执行;status 输出是 RPC 父的机器契约(合法动作面直出)。
-- `manager.ts` — 唯一反应者:副作用(spawn/handshake/terminate)、事件政策、升级引擎 `escalate`、决策落账 `ledgerWrite`。watcher 事件全经 `onWorkerEvent` 落实。
+- `manager.ts` — 唯一反应者:副作用(spawn/handshake/terminate)、事件政策、升级引擎 `escalate`、决策落标。watcher 事件全经 `onWorkerEvent` 落实。
 - `state-machine.ts` — 纯 FSM(8 态),`requireState` 守合法集,`WorkerError` 提示真实出路;无副作用,可单测。
 - `types.ts` — `WorkerState`/`WorkerRecord` 词汇与 `TERMINAL_STATES`。
 - `watcher.ts` — 子进程事件流 → 领域事件翻译,零政策(不迁移状态、不投递)。
 - `rpc-client.ts` — newline-JSON RPC:id 关联请求/响应 + 事件流。
 - `spawner.ts` — `spawnChild`;`terminate` = SIGTERM → 2s 宽限 → SIGKILL。
-- `recovery.ts` — G1 重启认领:目录扫描(身份判定委托 pi 原生 `SessionManager.listAll`)、worker-ledger 读写与重放折叠、marker 尾窗精确匹配。
+- `recovery.ts` — G1 重启认领:目录扫描(身份判定委托 pi 原生 `SessionManager.listAll`)、marker 尾窗精确匹配与残行安全写入。
 - `present.ts` — UI 投影纯函数;`STATE_FACETS` 是状态面单一来源(rank/decision/mark/toolActions/paneActions),footer/overlay/status 共读。
 - `pane.ts` — `/pi-worker` overlay:decision 区(failed/idle/exited)优先,exited >2 折叠,动作执行经 `opFor`。
 - `transcript.ts` — transcript 投影(`SessionEntry` 平铺;live = 事件流增量 + `get_messages` 回填,dead = 文件解析)。
@@ -48,13 +47,11 @@ jsonl 落 `<cwd>/.pi/worker-sessions`(审计与冷恢复历史),父侧台账落
 落盘(先于进程终止,与 watcher 事件时序解耦);`killAll()`(session_shutdown)零持久化
 副作用——shutdown 不是对 deliverable 的决策,重启认领因此存活。
 
-认领 = 双源否决(任一源持有终态决策即不复活):
-
-1. **worker-ledger**(真源):`bind`(握手锚定 sessionFile,新代次证据)/`collect`(带
-   verdict)/`kill` 决策即落账;重启重放折叠出每 id 末态。bind 指针消歧同 id 多代次
-   (无台账时取最新 createdAt);写失败降级为仅靠 marker。
-2. **COLLECTED_MARKER**(per-file 否决):追加在子 session 尾部,尾窗 64KB 逐行解析
-   `customType` 精确匹配(呈报文本含字面量不误判);审计保留,不删文件。
+认领的否决源只有一个:**COLLECTED_MARKER**(per-file)——`collect`/`kill` 决策即在
+session 尾部落标(`appendSessionLine` 残行补换行,marker 恒独占完整一行),扫描时尾窗
+64KB 逐行解析 `customType` 精确排除(呈报文本含字面量不误判);审计保留,不删文件。
+同 id 多代次遗留按最新 createdAt 认领。无 marker 即活代次:重派后的新文件不会被
+旧代次的终态压住(否决只看文件自身,不看任何旁路记录)。
 
 冷恢复(O3):exited 记录 `send` 即 `--session` 同文件续接,历史完整;授权链(O4):
 `new_session(parentSession)` 原生写入子 jsonl header,恢复时归属是数据不是启发式。
@@ -73,7 +70,7 @@ npx vitest run                              # 全部(含 substrate live)
 npx vitest run --exclude tests/substrate/** # 仅单测(假句柄,不起进程)
 ```
 
-- 单测(15 文件):fake handle 注入 rpc/proc/watcher;升级链用 fake timers;认领/台账
+- 单测(15 文件):fake handle 注入 rpc/proc/watcher;升级链用 fake timers;认领
   用临时目录真文件。
 - `tests/substrate/`:真进程真 LLM 端到端(默认 `opencode-go/deepseek-v4-flash`,
   `PI_WORKER_TEST_MODEL` 覆盖;单条约 15-35s)。覆盖 run→settled→collect 全链路、O3 冷
@@ -83,5 +80,5 @@ npx vitest run --exclude tests/substrate/** # 仅单测(假句柄,不起进程)
 
 - 同 cwd 多 TUI 窗口:活他窗口的 worker 文件也会被认领(exited 记录,无 pid 归属
   可判——平铺布局固有限制);危险动作(resume 再 spawn)仅发生在父显式 send 时。
-- 终态记录会话内保留(live verdict 展示与重跑诊断继承);重启即清,审计在台账与
-  子 session 文件。
+- 终态记录会话内保留(live verdict 展示与重跑诊断继承);重启即清,审计在
+  子 session 文件(marker 与全文)。
