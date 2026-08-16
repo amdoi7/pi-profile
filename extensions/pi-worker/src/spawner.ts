@@ -70,7 +70,7 @@ function preambleOverride(fallback: () => string): string {
 	return f ? readFileSync(f, "utf8").trim() : fallback();
 }
 
-/** SIGTERM,宽限期后 SIGKILL。对已退出进程无操作。 */
+/** SIGTERM,宽限期后 SIGKILL。对已退出进程无操作;宽限期内退出即清定时器(不挂 2s 闭包)。 */
 export function terminate(proc: ChildProcess): void {
 	if (proc.exitCode !== null || proc.signalCode !== null) return;
 	proc.kill("SIGTERM");
@@ -78,4 +78,6 @@ export function terminate(proc: ChildProcess): void {
 		if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL");
 	}, TERMINATE_GRACE_MS);
 	timer.unref();
+	// 单测假句柄是鸭子类型(无 EventEmitter 面),真进程才挂监听
+	proc.once?.("exit", () => clearTimeout(timer));
 }
