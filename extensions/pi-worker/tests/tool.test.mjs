@@ -185,7 +185,10 @@ describe("pi_worker status(formatStatus)", () => {
 		manager.sm.onExit("pi-worker-x#333333", { code: 1, signal: null, stderrTail: "" }); // idle 后崩 → exited
 		const text = (await exec({ action: "status" })).content[0].text;
 		assert.ok(text.includes("state=exited"), "exited 状态显式");
-		assert.ok(text.includes("actions=send(cold-resume)|collect"), "exited 动作 = 冷恢复续接 + collect 清理");
+		assert.ok(
+			text.includes("actions=send(cold-resume)|collect(verdict=通过|丢弃|强制放行)"),
+			"exited 动作 = 冷恢复续接 + 判决收尾(报告已交,判决不因进程死失效)",
+		);
 
 		manager.sm.run({ id: "pi-worker-d#444444", name: "d" });
 		manager.sm.onStarted("pi-worker-d#444444");

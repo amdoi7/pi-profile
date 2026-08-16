@@ -13,6 +13,10 @@ export interface WorkerRecord {
 	state: WorkerState;
 	/** 最近一轮的呈报全文(get_messages 末条 assistant text) */
 	report?: string;
+	/** 任务摘要(run 时快照:prompt 首个非空行;队列行扫读,不选中可见) */
+	taskSummary?: string;
+	/** stop 发起时间(面板倒计时起点;成功 stop 后落,回滚清除) */
+	stopStartedAt?: number;
 	/** 末条 assistant stopReason(stop|length|toolUse|error|aborted) */
 	stopReason?: string;
 	/** 呈报获取/deliver 失败诊断(status 可见,不静默) */

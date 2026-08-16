@@ -8,6 +8,20 @@ export const NAME_RE = /^[a-zA-Z0-9_-]{1,32}$/;
 export const ID_RE = /^pi-worker-[a-zA-Z0-9_-]{1,32}#[0-9a-f]{12}$/;
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
+/** stop 硬兑底时限(manager 计时器与面板倒计时的单一事实源,不漂移)。 */
+export const STOP_GRACE_MS = 30_000;
+export const STOP_ABORT_WINDOW_MS = 15_000;
+export const STOP_DEADLINE_MS = STOP_GRACE_MS + STOP_ABORT_WINDOW_MS;
+/** 握手超时(启动 30s 静默窗上限;超时走 failed 带诊断)。 */
+export const HANDSHAKE_TIMEOUT_MS = 30_000;
+
+/** 任务摘要:prompt 首个非空行,空白折叠,60 字符封顶(run 时快照,队列行扫读用)。 */
+export function summarizeTask(prompt: string): string {
+	const first = prompt.split("\n").map((l) => l.trim()).find((l) => l.length > 0) ?? "";
+	const collapsed = first.replace(/\s+/g, " ").trim();
+	return collapsed.length > 60 ? `${collapsed.slice(0, 59)}…` : collapsed;
+}
+
 /** worker 可声明的工具全集 = pi 内建 7 + 自身 send_message;tools 参数只准在此集合内
  * 收缩,无扩权面(缺省白名单已含 bash 全功率,收缩即隔离)。 */
 export const KNOWN_WORKER_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls", "send_message"] as const;

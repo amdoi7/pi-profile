@@ -6,6 +6,7 @@ import { join } from "node:path";
 
 import { WorkerManager, applyHandshakeState } from "../src/manager.ts";
 import { workerSessionDir } from "../src/contract.ts";
+import { COLLECTED_MARKER } from "../src/recovery.ts";
 
 /** 反应器单测:句柄用假 rpc 注入(不起进程);terminate 对 exitCode 非 null 无操作。 */
 describe("workerSessionDir", () => {
@@ -118,6 +119,78 @@ describe("message(父→子统一通道:同一功能,FSM 按状态选投递语�
 	});
 });
 
+describe("send mode=followUp(running → 排队,settled 后 flush 新轮)", () => {
+	const ID = "pi-worker-hank#aaaaaa";
+
+	test("running + followUp → 返回 queued,不发 RPC(排队不打断当前轮)", async () => {
+		const { manager, add } = setup();
+		const rpc = add(ID, "hank", "running");
+		const via = await manager.message(ID, "改需求:用 B 方案", "followUp");
+		assert.equal(via, "queued");
+		assert.deepEqual(rpc.sent, [], "排队不产生 RPC");
+		assert.equal(manager.sm.records.get(ID).state, "running", "状态不动");
+	});
+
+	test("settled 后 flush:报告先送达,随后 prompt 新轮(排队文本合并为一条)", async () => {
+		const { manager, delivered, add } = setup();
+		const rpc = add(ID, "hank", "running");
+		await manager.message(ID, "改需求:用 B 方案", "followUp");
+		await manager.message(ID, "再加证据 C", "followUp");
+		const cmds = [];
+		const orig = rpc.send.bind(rpc);
+		rpc.send = async (cmd) => {
+			cmds.push(cmd);
+			return orig(cmd);
+		};
+		manager.onWorkerEvent(ID, { type: "settled" });
+		await new Promise((r) => setTimeout(r, 20));
+		assert.equal(delivered[0].details.type, "settled", "报告先送达");
+		assert.equal(manager.sm.records.get(ID).state, "running", "flush 开新轮");
+		const promptCmd = cmds.find((c) => c.type === "prompt");
+		assert.ok(promptCmd, cmds.map((c) => c.type).join(","));
+		assert.ok(
+			promptCmd.message.includes("改需求:用 B 方案") && promptCmd.message.includes("再加证据 C"),
+			"排队文本合并入新轮",
+		);
+	});
+
+	test("stop 清队列:settle 后不 flush(停止语义 = 不追加新轮)", async () => {
+		const { manager, add } = setup();
+		const rpc = add(ID, "hank", "running");
+		await manager.message(ID, "改需求", "followUp");
+		await manager.stop(ID); // → stopping,队列清除
+		const cmds = [];
+		const orig = rpc.send.bind(rpc);
+		rpc.send = async (cmd) => {
+			cmds.push(cmd);
+			return orig(cmd);
+		};
+		manager.onWorkerEvent(ID, { type: "settled" }); // stopping → idle
+		await new Promise((r) => setTimeout(r, 20));
+		assert.equal(manager.sm.records.get(ID).state, "idle");
+		assert.ok(!cmds.some((c) => c.type === "prompt"), "stop 后不 flush");
+	});
+
+	test("代次隔离:旧代次排队不泄入新代次(exit 清队列)", async () => {
+		const { manager, add } = setup();
+		const rpc1 = add(ID, "hank", "running");
+		await manager.message(ID, "旧代次的需求", "followUp");
+		// gen1 崩溃:running → failed,句柄回收(dropHandle 清队列)
+		manager.onWorkerEvent(ID, { type: "exited", code: 1, signal: null, stderrTail: "boom" });
+		// gen2:同 id 重跑(终端记录被替换)
+		const rpc2 = add(ID, "hank", "running");
+		const cmds = [];
+		const orig = rpc2.send.bind(rpc2);
+		rpc2.send = async (cmd) => {
+			cmds.push(cmd);
+			return orig(cmd);
+		};
+		manager.onWorkerEvent(ID, { type: "settled" });
+		await new Promise((r) => setTimeout(r, 20));
+		assert.ok(!cmds.some((c) => c.type === "prompt"), "旧代次队列不泄入新代次");
+	});
+});
+
 describe("bus resolve(name 或完整 id)", () => {
 	test("完整 id 定向(name 可重名)→ 解析到唯一活记录并投递", async () => {
 		const { manager, add } = setup();
@@ -129,6 +202,16 @@ describe("bus resolve(name 或完整 id)", () => {
 });
 
 describe("stop 硬兑底", () => {
+	test("stop 落 stopStartedAt(面板倒计时数据源)", async () => {
+		const { manager, add } = setup();
+		add("pi-worker-hank#aaaaaa", "hank", "running");
+		const p = manager.stop("pi-worker-hank#aaaaaa"); // sm.stop 同步生效,无需 fake timers
+		const rec = manager.sm.records.get("pi-worker-hank#aaaaaa");
+		assert.equal(rec.state, "stopping");
+		assert.ok(typeof rec.stopStartedAt === "number", "倒计时起点落记录");
+		await p;
+	});
+
 	test("宽限期未 settled → abort 硬中止(settled 必达)", async () => {
 		vi.useFakeTimers();
 		try {
@@ -440,6 +523,60 @@ describe("collect 落收起标记(审计留痕)", () => {
 		assert.ok(tail.includes('"pi-worker-collected"'), "标记落盘");
 		assert.ok(tail.includes('"通过"'), "verdict 入标记(终审留痕)");
 	});
+
+	test("kill 落收起标记:终态决策持久化,重启不复活(kill 与 collect 同款)", async () => {
+		const { manager, add } = setup();
+		const dir = mkdtempSync(join(tmpdir(), "piw-killmark-"));
+		const file = join(dir, "s.jsonl");
+		writeFileSync(file, JSON.stringify({ type: "session", version: 3, id: "x", timestamp: "t", cwd: "/r" }) + "\n");
+		const id = "pi-worker-hank#aaaaaa";
+		add(id, "hank", "running");
+		manager.sm.records.get(id).sessionFile = file;
+		await manager.kill(id); // → killing
+		manager.onWorkerEvent(id, { type: "exited", code: 0, signal: null, stderrTail: "" }); // killing → done
+		assert.equal(manager.sm.records.get(id).state, "done");
+		const tail = readFileSync(file, "utf8");
+		assert.ok(tail.includes('"pi-worker-collected"'), "kill 后落收起标记(重启不复活)");
+	});
+
+	test("killAll 不落收起标记(shutdown 非决策):G1 重启认领保留", async () => {
+		const { manager, add } = setup();
+		const cwd = mkdtempSync(join(tmpdir(), "piw-killall-"));
+		const dir = workerSessionDir(cwd);
+		mkdirSync(dir, { recursive: true });
+		const id = "pi-worker-hank#0123456789ab";
+		const file = join(dir, "s.jsonl");
+		writeFileSync(
+			file,
+			[
+				JSON.stringify({ type: "session", version: 3, id: "uuid-1", timestamp: "2026-08-12T10:00:00.000Z", cwd }),
+				JSON.stringify({ type: "session_info", id: "k1", parentId: null, timestamp: "2026-08-12T10:00:01.000Z", name: id }),
+			].join("\n") + "\n",
+		);
+		add(id, "hank", "running");
+		manager.sm.records.get(id).sessionFile = file;
+		manager.killAll(); // session_shutdown:连带 kill,不是对 deliverable 的决策
+		manager.onWorkerEvent(id, { type: "exited", code: 0, signal: null, stderrTail: "" }); // killing → done
+		assert.equal(manager.sm.records.get(id).state, "done");
+		assert.ok(!readFileSync(file, "utf8").includes(COLLECTED_MARKER), "shutdown 连带 kill 不落标(重启认领存活)");
+		const manager2 = new WorkerManager({ deliver: () => {}, onChange: () => {} });
+		assert.equal(await manager2.claimLeftovers(cwd), 1, "新实例重启认领遗留 worker");
+	});
+
+	test("killAll 不落标记:shutdown 不是终态决策,重启认领(G1)保留", async () => {
+		const { manager, add } = setup();
+		const dir = mkdtempSync(join(tmpdir(), "piw-killallmark-"));
+		const file = join(dir, "s.jsonl");
+		writeFileSync(file, JSON.stringify({ type: "session", version: 3, id: "x", timestamp: "t", cwd: "/r" }) + "\n");
+		const id = "pi-worker-hank#aaaaaa";
+		add(id, "hank", "running");
+		manager.sm.records.get(id).sessionFile = file;
+		manager.killAll(); // session_shutdown 连带终止(直调 sm.kill,不经 kill())
+		manager.onWorkerEvent(id, { type: "exited", code: 0, signal: null, stderrTail: "" }); // killing → done
+		assert.equal(manager.sm.records.get(id).state, "done");
+		const tail = readFileSync(file, "utf8");
+		assert.ok(!tail.includes('"pi-worker-collected"'), "killAll 不落标(重启可认领冷恢复)");
+	});
 });
 
 describe("O4 握手授权链(handshake:new_session parentSession → 重取 get_state)", () => {
@@ -557,6 +694,7 @@ describe("乐观迁移失败回滚(效果未落地 ⇒ 状态不留在意图上)
 		};
 		await assert.rejects(() => manager.stop(ID), /stop send failed/);
 		assert.equal(manager.sm.records.get(ID).state, "running");
+		assert.equal(manager.sm.records.get(ID).stopStartedAt, undefined, "回滚后倒计时起点清除");
 	});
 
 	test("回滚期间进程已死 → CAS 让位 failed(异步事实优先于补偿)", async () => {
@@ -679,5 +817,73 @@ describe("transcriptView(live 事件流+回填 / dead 文件解析;视图零 IO)
 		manager.transcriptView("pi-worker-hank#aaaaaa");
 		manager.collect("pi-worker-hank#aaaaaa", "通过");
 		assert.equal(manager.transcripts.has("pi-worker-hank#aaaaaa"), false);
+	});
+});
+
+describe("claimLeftovers(父重启认领:磁盘遗留 → exited 记录,send/collect 恢复出路)", () => {
+	function leftoverFixture(cwd, name, { collected = false, timestamp = "2026-08-12T10:00:00.000Z" } = {}) {
+		const dir = workerSessionDir(cwd);
+		mkdirSync(dir, { recursive: true });
+		const lines = [
+			{ type: "session", version: 3, id: "uuid-1", timestamp, cwd },
+			{ type: "session_info", id: "k1", parentId: null, timestamp: "2026-08-12T10:00:01.000Z", name },
+		];
+		if (collected) {
+			lines.push({ type: "custom", customType: COLLECTED_MARKER, id: "wc", parentId: null, timestamp: "2026-08-12T10:00:03.000Z", data: {} });
+		}
+		const file = join(dir, `${name}.jsonl`);
+		writeFileSync(file, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+		return file;
+	}
+
+	test("认领:exited 记录带 sessionFile/cwd/createdAt,name 取显示名", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "piw-clm-"));
+		const file = leftoverFixture(cwd, "pi-worker-hank#0123456789ab");
+		const { manager } = setup();
+		assert.equal(await manager.claimLeftovers(cwd), 1);
+		const rec = manager.status("pi-worker-hank#0123456789ab");
+		assert.equal(rec.state, "exited");
+		assert.equal(rec.processExited, true);
+		assert.equal(rec.sessionFile, file);
+		assert.equal(rec.cwd, cwd);
+		assert.equal(rec.name, "hank");
+		assert.equal(rec.createdAt, Date.parse("2026-08-12T10:00:00.000Z"));
+	});
+
+	test("幂等:重复认领不重复建记录(session_start 重复触发安全)", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "piw-clm-"));
+		leftoverFixture(cwd, "pi-worker-hank#0123456789ab");
+		const { manager } = setup();
+		assert.equal(await manager.claimLeftovers(cwd), 1);
+		assert.equal(await manager.claimLeftovers(cwd), 0);
+		assert.equal(manager.status().length, 1);
+	});
+
+	test("已 collect 的文件不认领(不复活);collect 认领记录后落 marker,新实例扫描排除", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "piw-clm-"));
+		leftoverFixture(cwd, "pi-worker-done#0123456789ab", { collected: true });
+		const { manager } = setup();
+		assert.equal(await manager.claimLeftovers(cwd), 0, "已收起不认领");
+
+		// collect 认领过的记录 → 文件落 marker → 下一次启动(新实例)扫描排除
+		const file = leftoverFixture(cwd, "pi-worker-hank#0123456789ab");
+		const { manager: m2 } = setup();
+		assert.equal(await m2.claimLeftovers(cwd), 1);
+		m2.collect("pi-worker-hank#0123456789ab");
+		assert.ok(readFileSync(file, "utf8").includes(COLLECTED_MARKER), "collect 落收起标记");
+		const { manager: m3 } = setup();
+		assert.equal(await m3.claimLeftovers(cwd), 0, "marker 后新实例不再认领");
+	});
+
+	test("认领记录可冷恢复寻址:message 走 exited → resume 分支(不抛 'not found')", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "piw-clm-"));
+		const file = leftoverFixture(cwd, "pi-worker-hank#0123456789ab");
+		const { manager } = setup();
+		await manager.claimLeftovers(cwd);
+		// 认领记录 resume 需要 sessionFile + cwd(spawn 用);resume 本身 spawn 真实进程,
+		// 单测只验证寻址与前置条件成立(状态机 exited 分支由 substrate 端到端覆盖)
+		const rec = manager.status("pi-worker-hank#0123456789ab");
+		assert.ok(rec.sessionFile && rec.cwd, "resume 前置:sessionFile 与 cwd 齐备");
+		assert.equal(rec.sessionFile, file);
 	});
 });

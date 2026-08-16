@@ -111,6 +111,12 @@ describe("formatFooter", () => {
 		assert.ok(colored.includes("<dim>/pi-worker</>"));
 	});
 
+	test("入口复用:openHint 给快捷键提示(/pi-worker · alt+w),纯函数不写死键", () => {
+		const records = [rec({ id: "pi-worker-a#111111111111", name: "a", state: "idle" })];
+		assert.equal(formatFooter(records, { now: F0, openHint: "alt+w" }), "✓ 1 idle · /pi-worker · alt+w");
+		assert.equal(formatFooter(records, { now: F0 }), "✓ 1 idle · /pi-worker", "无 openHint 保持原样(测试/其他宿主)");
+	});
+
 	test("无 failed:idle 待验收同样给行动入口(判决也是决策)", () => {
 		const records = [rec({ id: "pi-worker-a#111111111111", name: "a", state: "idle" })];
 		assert.equal(formatFooter(records, { now: F0 }), "✓ 1 idle · /pi-worker");
@@ -373,7 +379,7 @@ describe("formatOverlayRows", () => {
 		assert.equal(dark.find((r) => r.value.includes("r#")).main.color, "dim");
 	});
 
-	test("行单行化:details 只载判决证据——模型/cost 徽章上移 transcript 标题,活动进主行(grok 行不重复徽章)", () => {
+	test("行单行化:模型/think 徽章进主行(不选中可扫读),活动进主行,cost 徽章仍在 transcript 标题", () => {
 		const records = [
 			rec({
 				id: "pi-worker-zhizao#a1b2c3d4e5f6",
@@ -388,10 +394,50 @@ describe("formatOverlayRows", () => {
 		];
 		const rows = formatOverlayRows(records, 1_000_045_000);
 		assert.equal(rows.length, 1);
-		// 主行:working 态带活动短摘要(剥 tool: 前缀);details 无模型/cost 重复
+		// 主行:working 态带活动短摘要(剥 tool: 前缀)+ 模型/think 徽章;details 只载判决证据
 		assert.match(rows[0].main.text, /^● zhizao 45s t3 · bash /);
 		assert.ok(rows[0].main.text.includes("npm test"), "活动带参数摘要");
-		assert.equal(rows[0].details.length, 0, "模型/活动/cost 不再进 details");
+		assert.ok(rows[0].main.text.includes("opencode-go/deepseek-v4-flash · think:max"), "模型/think 进主行(新契约)");
+		assert.equal(rows[0].details.length, 0, "details 不重复模型/活动/cost");
+	});
+
+	test("主行带任务摘要(taskSummary):不选中即可扫读任务是什么", () => {
+		const rows = formatOverlayRows(
+			[rec({ id: "pi-worker-m#111111111111", name: "m", state: "idle", createdAt: 1_000_000_000, taskSummary: "修复 bug 根因" })],
+			1_000_000,
+		);
+		assert.ok(rows[0].main.text.includes("修复 bug 根因"), "任务摘要进主行");
+	});
+
+	test("模型/think 徽章进主行;providerName 显示名经 opts.providerNameFor 生效", () => {
+		const mk = (opts) =>
+			formatOverlayRows(
+				[rec({ id: "pi-worker-m#111111111111", name: "m", state: "idle", createdAt: 1_000_000, modelInfo: { provider: "opencode-go", id: "deepseek-v4-flash", thinkingLevel: "max" } })],
+				1_000_000,
+				opts,
+			);
+		assert.ok(mk()[0].main.text.includes("opencode-go/deepseek-v4-flash · think:max"), "原始 provider id");
+		assert.ok(mk({ providerNameFor: () => "OpenCode Go" })[0].main.text.includes("OpenCode Go/deepseek-v4-flash"), "显示名优先");
+	});
+
+	test("无 taskSummary/无模型 → 主行不加料(旧记录兼容)", () => {
+		const rows = formatOverlayRows([rec({ id: "pi-worker-y#222222222222", name: "y", state: "idle", createdAt: 1_000_000 })], 1_000_000);
+		assert.match(rows[0].main.text, /^✓ y\s+0s t0$/);
+	});
+
+	test("starting 显示握手中;stopping 带倒计时上限(数据源 stopStartedAt,钳制 0)", () => {
+		const start = formatOverlayRows([rec({ id: "pi-worker-s#111111111111", name: "s", state: "starting", createdAt: 1_000_000 })], 1_000_000);
+		assert.ok(start[0].main.text.includes("握手中"), "握手期有状态提示(30s 静默窗可读)");
+		const stop = formatOverlayRows(
+			[rec({ id: "pi-worker-p#222222222222", name: "p", state: "stopping", createdAt: 1_000_000, stopStartedAt: 1_000_000 + 10_000 })],
+			1_000_000 + 10_000,
+		);
+		assert.ok(stop[0].main.text.includes("收尾中≤45s"), "倒计时 = 硬兑底上限减已等待");
+		const over = formatOverlayRows(
+			[rec({ id: "pi-worker-q#333333333333", name: "q", state: "stopping", createdAt: 1_000_000, stopStartedAt: 1_000_000 - 60_000 })],
+			1_000_000,
+		);
+		assert.ok(over[0].main.text.includes("收尾中≤0s"), "超时钳制为 0");
 	});
 
 	test("主行活动摘要:仅 working 态(running/starting/stopping)且 30 字符截断;idle/failed 不带", () => {
@@ -499,20 +545,24 @@ describe("formatOverlayRows", () => {
 	});
 });
 
-describe("opFor(动作 → 执行操作:判决注入父 session(落 verdict 需 agent 判断),机械直调 manager)", () => {
+describe("opFor(动作 → 执行操作:判决 = 机械收尾 + 注入指引,机械直调 manager)", () => {
 	const A = (value, extra = {}) => ({ value, label: value, ...extra });
 	const ID = "pi-worker-hank#a1b2c3d4e5f6";
 
-	test("通过/强制放行/丢弃 → inject 准指令:verdict 落 deliverable frontmatter 是审查闭环事实源,需父 agent 落笔", () => {
+	test("通过/丢弃/强制放行 → verdict:collect 已机械执行,注入文本只留 frontmatter 落笔指引", () => {
 		const pass = opFor(A("通过"), ID);
-		assert.equal(pass.kind, "inject");
-		assert.ok(pass.text.includes(ID) && pass.text.includes("verdict=通过") && pass.text.includes(`pi_worker collect id=${ID} verdict=通过`), pass.text);
+		assert.equal(pass.kind, "verdict");
+		assert.equal(pass.verdict, "通过");
+		assert.ok(pass.text.includes(ID) && pass.text.includes("verdict=通过") && pass.text.includes("frontmatter"), pass.text);
+		assert.ok(!pass.text.includes("pi_worker collect"), "collect 已由面板机械执行,指引不再重复指令");
 		const force = opFor(A("强制放行"), ID, "证据已核");
-		assert.equal(force.kind, "inject");
-		assert.ok(force.text.includes(`pi_worker collect id=${ID} verdict=强制放行`) && force.text.includes("证据已核"), force.text);
+		assert.equal(force.kind, "verdict");
+		assert.equal(force.verdict, "强制放行");
+		assert.ok(force.text.includes("证据已核") && force.text.includes("status=closed"), force.text);
 		const discard = opFor(A("丢弃"), ID);
-		assert.equal(discard.kind, "inject");
-		assert.ok(discard.text.includes(`pi_worker collect id=${ID} verdict=丢弃`) && discard.text.includes("status=rejected") && !discard.text.includes("kill"), discard.text);
+		assert.equal(discard.kind, "verdict");
+		assert.equal(discard.verdict, "丢弃");
+		assert.ok(discard.text.includes("status=rejected") && !discard.text.includes("kill"), discard.text);
 	});
 
 	test("消息 → manager.message,message 即输入原文(btw 式自由文本)", () => {
@@ -525,14 +575,10 @@ describe("opFor(动作 → 执行操作:判决注入父 session(落 verdict 需 
 		assert.deepEqual(opFor(A("collect"), ID), { kind: "collect", audit: `已对 ${ID} 执行 collect` });
 	});
 
-	test("撤换 → inject:归因分流处置(collect 清账 + 重派/收尾,分类归父 agent)", () => {
+	test("撤换 → replacement:collect 清账已机械执行,注入只留归因分流指引", () => {
 		const op = opFor(A("撤换"), ID);
-		assert.equal(op.kind, "inject");
-		assert.ok(op.text.includes(ID) && op.text.includes("归因分流") && op.text.includes(`pi_worker collect id=${ID}`), op.text);
-	});
-
-	test("撤换归因四路:collect 清理 + 重派引导", () => {
-		assert.ok(true, "占位");
+		assert.equal(op.kind, "replacement");
+		assert.ok(op.text.includes("归因分流") && !op.text.includes("pi_worker collect"), op.text);
 	});
 });
 
@@ -547,8 +593,8 @@ describe("actionsFor(与状态机合法集一致)", () => {
 	function r(state, extra = {}) {
 		return rec({ id: "pi-worker-x#111111111111", name: "x", state, ...extra });
 	}
-	test("exited:消息(冷恢复续接)+ collect", () => {
-		assert.deepEqual(actionsFor(r("exited")).map((a) => a.value), ["消息", "collect"]);
+	test("exited:判决面同 idle(通过/丢弃/强制放行),消息为冷恢复续接", () => {
+		assert.deepEqual(actionsFor(r("exited")).map((a) => a.value), ["通过", "消息", "丢弃", "强制放行"]);
 	});
 	test("stopping 只给 kill", () => {
 		assert.deepEqual(actionsFor(r("stopping")).map((a) => a.value), ["kill"]);

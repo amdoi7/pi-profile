@@ -21,8 +21,8 @@ describe("projectTranscript", () => {
 		const content = jsonl([msg({ role: "user", content: "fix\nauth" })]);
 		const lines = projectTranscript(content);
 		assert.deepEqual(lines, [
-			{ text: "❯ fix", color: "accent", anchor: true },
-			{ text: "  auth", color: "accent" },
+			{ text: "❯ fix", color: "accent", anchor: true, indent: 2 },
+			{ text: "  auth", color: "accent", indent: 2 },
 		]);
 	});
 
@@ -53,7 +53,7 @@ describe("projectTranscript", () => {
 			}),
 		]);
 		const lines = projectTranscript(content);
-		assert.deepEqual(lines[0], { text: "⚒ bash: pnpm test", color: "dim", anchor: true });
+		assert.deepEqual(lines[0], { text: "⚒ bash: pnpm test", color: "dim", anchor: true, indent: 2 });
 		assert.ok(lines[1].text.startsWith("⚒ edit: /a.ts"), lines[1].text);
 		assert.ok(lines[1].text.includes("oldText=old") && lines[1].text.includes("newText=new"), "多参 key=value");
 	});
@@ -79,9 +79,23 @@ describe("projectTranscript", () => {
 		assert.equal(lines[0].anchor, true, "折叠行是浏览锚点");
 	});
 
-	test("toolResult 不投影(只有 text 与 toolCall;成败信号由 pane 诊断/回调承担)", () => {
+	test("toolResult 投影:⤷ 首行摘要 + 超行计数;isError 升 warning ✗;非锚点", () => {
 		const content = jsonl([
-			msg({ role: "toolResult", toolCallId: "c1", toolName: "bash", content: [{ type: "text", text: "ok" }], isError: false }),
+			msg({ role: "assistant", content: [{ type: "toolCall", id: "c1", name: "bash", arguments: { command: "ls" } }] }),
+			msg({ role: "toolResult", toolCallId: "c1", toolName: "bash", content: [{ type: "text", text: "a.txt\nb.txt\nc.txt" }], isError: false }),
+			msg({ role: "toolResult", toolCallId: "c2", toolName: "read", content: "ERR: no such file", isError: true }),
+		]);
+		const lines = projectTranscript(content);
+		assert.equal(lines.length, 3, "toolCall + 2 条结果摘要");
+		assert.deepEqual(lines[1], { text: "⤷ a.txt …(+2 行)", color: "dim" }, "成功:⤷ 首行 + 超行计数");
+		assert.deepEqual(lines[2], { text: "✗ ERR: no such file", color: "warning" }, "失败:✗ 升 warning");
+		assert.ok(!lines[1].anchor && !lines[2].anchor, "结果行不是消息锚点(依附 toolCall)");
+	});
+
+	test("toolResult 空内容/无 text 块不投影", () => {
+		const content = jsonl([
+			msg({ role: "toolResult", toolCallId: "c1", toolName: "bash", content: [], isError: false }),
+			msg({ role: "toolResult", toolCallId: "c2", toolName: "read", content: [{ type: "image", mediaType: "png", data: "x" }], isError: false }),
 		]);
 		assert.deepEqual(projectTranscript(content), []);
 	});

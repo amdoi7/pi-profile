@@ -14,14 +14,18 @@ export interface RoomBusDeps {
 	deliver: (msg: CallbackMessage, opts?: { quiet?: boolean }) => void;
 	/** name/id → live worker id;未命中(不存在或歧义)undefined。 */
 	resolve: (to: string) => string | undefined;
-	/** worker delivery primitive:FSM 按状态选 steer(running)/ prompt(idle);非法状态抛错。 */
-	transport: (id: string, text: string) => Promise<"steer" | "prompt">;
+	/** worker delivery primitive:FSM 按状态选 steer(running)/prompt(idle);mode=followUp 时 running 排队。 */
+	transport: (id: string, text: string, mode: SendMode) => Promise<"steer" | "prompt" | "queued">;
 	/** id → 显示名(审计文本用)。 */
 	displayNameOf: (id: string) => string;
 }
 
+/** parent→worker 投递模式(与 pi 内核 deliverAs 同词汇的 FSM 面):steer = running 中 turn 间隙
+ * 生效;followUp = running 中排队,settled 后新轮生效(manager 持有队列,FSM 不加状态)。 */
+export type SendMode = "steer" | "followUp";
+
 export type PostResult =
-	| { ok: true; via: "steer" | "prompt" | "display" }
+	| { ok: true; via: "steer" | "prompt" | "display" | "queued" }
 	| { ok: false; reason: string };
 
 const PARENT = "parent";
@@ -47,7 +51,7 @@ export class RoomBus {
 	constructor(private readonly deps: RoomBusDeps) {}
 
 	/** 唯一入口:任何节点 → 任何节点的异步消息。quiet 仅 parent 目标生效(安静留痕,不烧父轮次)。 */
-	async post(from: string, to: string, text: string, quiet = false): Promise<PostResult> {
+	async post(from: string, to: string, text: string, quiet = false, mode: SendMode = "steer"): Promise<PostResult> {
 		if (to === PARENT) {
 			if (from === PARENT) return { ok: false, reason: "parent cannot message itself" };
 			let effectiveQuiet = quiet;
@@ -78,6 +82,8 @@ export class RoomBus {
 				},
 				{ quiet: effectiveQuiet },
 			);
+			// 真正唤醒(非 quiet 且未被降级)才记账;quiet/降级/丢弃不烧配额
+			if (!quiet && !effectiveQuiet) this.wakeQuota.commit(from, text, Date.now());
 			return { ok: true, via: "display" };
 		}
 		const target = this.deps.resolve(to);
@@ -88,9 +94,10 @@ export class RoomBus {
 		}
 		const fromName = from === PARENT ? "parent" : this.deps.displayNameOf(from);
 		try {
-			const via = await this.deps.transport(target, `message from “${fromName}”: ${text}`);
+			const via = await this.deps.transport(target, `message from “${fromName}”: ${text}`, mode);
 			if (from !== PARENT) {
-				// peer 流量 audit fan-out:父 session 安静留痕(不烧父轮次),世界模型不瞎
+				// peer 流量 audit fan-out:父 session 安静留痕(不烧父轮次)——父转录与真实执行
+				// 保持一致(父 LLM 对团队状态的唯一视图是它的上下文,脱节即失真决策)
 				this.deps.deliver(
 					{
 						customType: CALLBACK_TYPE,
@@ -113,7 +120,7 @@ export class RoomBus {
 	private async notifySender(from: string, notice: string): Promise<void> {
 		if (from === PARENT) return;
 		try {
-			await this.deps.transport(from, notice);
+			await this.deps.transport(from, notice, "steer");
 		} catch {
 			this.deps.deliver(
 				{ customType: CALLBACK_TYPE, content: notice, details: { type: "action-done", id: from } },

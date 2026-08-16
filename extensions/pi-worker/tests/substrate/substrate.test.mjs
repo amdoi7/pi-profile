@@ -97,8 +97,42 @@ test(
 		await waitFor(() => manager.status(id).state === "idle", "续接后轮 settled");
 		const rec = manager.status(id);
 		assert.ok(rec.report?.includes("蓝鲸742"), `续接后应记得暗号(历史完整): ${rec.report}`);
-		assert.equal(rec.recovered, undefined, "复活后不再是遗留记录");
+		assert.equal(rec.processExited, false, "复活后新进程接管(onResumed 重置),不再是死进程记录");
 		manager.collect(id);
+	},
+	LONG,
+);
+
+test(
+	"重启认领回归(用户 bug):父重启 → 新 manager 认领磁盘遗留 → message 冷恢复续接 → settled → collect",
+	async () => {
+		// 独立 cwd:只含本用例的 worker 文件,认领计数确定
+		const cwd2 = mkdtempSync(join(tmpdir(), "pi-worker-claim-"));
+		const { id } = manager.run({ name: "t7claim", prompt: "只回复两个字:完成" }, cwd2);
+		await waitFor(() => findCallback("settled", id), "首轮 settled");
+		// 模拟父进程死亡:killAll 终止全部子进程(旧 manager 记录随父失效;jsonl 无 collect 标记)
+		manager.killAll();
+		await waitFor(() => manager.status(id).state === "done", "旧子进程退出完成(reap)");
+		const sessionFile = manager.status(id).sessionFile;
+		assert.match(sessionFile ?? "", /\.jsonl$/, "审计指针");
+
+		// 新父实例:启动认领 → exited 记录(send/collect 恢复出路)
+		const delivered2 = [];
+		const manager2 = new WorkerManager({ deliver: (m) => delivered2.push(m) });
+		assert.equal(await manager2.claimLeftovers(cwd2), 1, "认领遗留 worker");
+		const rec = manager2.status(id);
+		assert.equal(rec.state, "exited");
+		assert.equal(rec.sessionFile, sessionFile, "审计指针同文件(--session 续接)");
+
+		// 唤醒:message → exited 分支冷恢复,同文件历史完整
+		const via = await manager2.message(id, "父指令:请回复:确认开工");
+		assert.equal(via, "prompt");
+		await waitFor(
+			() => manager2.status(id).state === "idle" && String(manager2.status(id).report ?? "").includes("确认开工"),
+			`冷恢复续接 settled(state=${manager2.status(id).state})`,
+		);
+		manager2.collect(id);
+		assert.equal(manager2.status(id).state, "done");
 	},
 	LONG,
 );

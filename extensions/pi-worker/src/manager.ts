@@ -1,10 +1,8 @@
-import { formatCallback, type CallbackMessage } from "./bridge.ts";
+import { formatCallback, CALLBACK_TYPE, type CallbackMessage } from "./bridge.ts";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
-import { buildInitialPrompt, cwdFromWorkerSessionFile, makeWorkerId, normalizeTools, validateRunInput, workerSessionDir } from "./contract.ts";
-
-/** collect 在 session 尾部落的收起标记(customType,审计留痕)。 */
-const COLLECTED_MARKER = "pi-worker-collected";
-import { RoomBus } from "./room-bus.ts";
+import { buildInitialPrompt, cwdFromWorkerSessionFile, makeWorkerId, normalizeTools, summarizeTask, validateRunInput, workerSessionDir, HANDSHAKE_TIMEOUT_MS, STOP_GRACE_MS, STOP_ABORT_WINDOW_MS } from "./contract.ts";
+import { COLLECTED_MARKER, scanLeftoverSessions } from "./recovery.ts";
+import { RoomBus, type SendMode } from "./room-bus.ts";
 import { displayNameOf } from "./present.ts";
 import { RpcClient } from "./rpc-client.ts";
 import { spawnChild, terminate } from "./spawner.ts";
@@ -27,7 +25,6 @@ interface TranscriptBuffer {
 	queue: SessionEntry[];
 }
 
-const HANDSHAKE_TIMEOUT_MS = 30000;
 const ABORT_TIMEOUT_MS = 5000;
 
 /** 握手 get_state → 记录映射(纯函数,可单测)。sessionFile 是 pi 原生会话 jsonl
@@ -47,10 +44,8 @@ export function applyHandshakeState(
 	if (state.sessionFile) rec.sessionFile = state.sessionFile;
 }
 
-/** stop 软指令的宽限期:STOP 依赖子 LLM 自愿服从(live 实测 20-60s 不等),超时后 abort */
-const STOP_GRACE_MS = 30000;
-/** abort 后等待 settled 的窗口;仍不 settled → terminate(SIGTERM→SIGKILL),worst case 有界 */
-const STOP_ABORT_WINDOW_MS = 15000;
+/* 时限常量单一事实源在 contract.ts:STOP_GRACE_MS/STOP_ABORT_WINDOW_MS/STOP_DEADLINE_MS
+ * (面板倒计时同源,不漂移);软指令宽限期依赖子 LLM 自愿服从(live 实测 20-60s 不等)。 */
 
 /** stop 的线上传输:一条 canonical steer 收尾指令;意图记录在状态机(stopping)。 */
 export const STOP_MESSAGE = "STOP: no new work; finish current and report the current result per the four elements.";
@@ -81,6 +76,8 @@ export class WorkerManager {
 	private readonly handles = new Map<string, Handle>();
 	/** transcript buffer:与记录同寿(run/resume 重置,collect 清),不进 WorkerRecord(status 面不背大数组) */
 	private readonly transcripts = new Map<string, TranscriptBuffer>();
+	/** followUp 排队(mode=followUp,running 中):settled 报告送达后 flush 成新轮;stop/kill/collect/dropHandle 清 */
+	private readonly pendingFollowUps = new Map<string, string[]>();
 
 	constructor(private readonly deps: ManagerDeps) {
 		this.bus = new RoomBus({
@@ -92,7 +89,7 @@ export class WorkerManager {
 				);
 				return t.length === 1 ? t[0].id : undefined;
 			},
-			transport: (id, text) => this.message(id, text),
+			transport: (id, text, mode) => this.message(id, text, mode),
 			displayNameOf: (id) => this.sm.records.get(id)?.name ?? displayNameOf(id),
 		});
 	}
@@ -105,7 +102,7 @@ export class WorkerManager {
 		}
 
 		const id = makeWorkerId(input);
-		const rec = this.sm.run({ id, name: input.name.trim() });
+		const rec = this.sm.run({ id, name: input.name.trim(), taskSummary: summarizeTask(input.prompt) });
 		const sessionDir = workerSessionDir(cwd); // 审计目录(内置约定)
 		const tools = normalizeTools(input.tools);
 
@@ -159,6 +156,21 @@ export class WorkerManager {
 		);
 		this.dropHandle(id);
 		terminate(proc);
+	}
+
+	/** 启动认领:父重启后从磁盘重建遗留 worker 记录(进程随父死,jsonl 在;
+	 * send 冷恢复 / collect 清账是记录的合法出路)。幂等:已存在 id 跳过;
+	 * collect 过的文件由扫描排除(COLLECTED_MARKER)。返回新认领数。 */
+	async claimLeftovers(cwd: string): Promise<number> {
+		const { sessions } = await scanLeftoverSessions(cwd);
+		let n = 0;
+		for (const s of sessions) {
+			if (this.sm.records.has(s.id)) continue;
+			this.sm.claimLeftover(s);
+			n++;
+		}
+		if (n > 0) this.deps.onChange?.();
+		return n;
 	}
 
 	/** O3 冷恢复:exited 记录 --session 同文件续接(历史完整),text 即新轮指令。
@@ -218,13 +230,35 @@ export class WorkerManager {
 		this.sm.onStarted(id);
 	}
 
-	/** 句柄回收:先解除 watcher 订阅(流监听不泄漏),再删句柄。 */
+	/** 句柄回收:先解除 watcher 订阅(流监听不泄漏),再删句柄;followUp 队列随代次作废(防跨代泄入)。 */
 	private dropHandle(id: string): void {
 		const h = this.handles.get(id);
 		if (h) {
 			h.watcher.dispose();
 			this.handles.delete(id);
 		}
+		this.pendingFollowUps.delete(id);
+	}
+
+	/** followUp 队列排空:settled 报告已送达之后(先给父报告,再开新轮)。
+	 * 合并为一条 prompt(一次一轮;多条需求同轮可见,优先级由 worker 自己判);
+	 * 已被 stop/kill/collect 清的队列为空;flush 失败(子已死等)以安静诊断卡显形。 */
+	private flushPendingFollowUps(id: string): void {
+		const queue = this.pendingFollowUps.get(id);
+		if (!queue || queue.length === 0) return;
+		this.pendingFollowUps.delete(id);
+		const rec = this.sm.records.get(id);
+		if (!rec || rec.state !== "idle") return; // 已被 collect/kill:队列作废,不复活
+		void this.followUp(id, queue.join("\n\n")).catch((e: unknown) => {
+			this.deps.deliver(
+				{
+					customType: CALLBACK_TYPE,
+					content: `queued follow-up delivery failed: ${e instanceof Error ? e.message : String(e)}`,
+					details: { type: "action-done", id },
+				},
+				{ quiet: true },
+			);
+		});
 	}
 
 	/** 同 turn 并发拉取合并(settled 复用 turn_end 在途快照,每 turn 至多一次 RPC)。 */
@@ -267,15 +301,20 @@ export class WorkerManager {
 	 * 正常路径不受影响:timer fire 时已 settled/kill → 状态守卫跳过。 */
 	async stop(id: string): Promise<void> {
 		this.sm.stop(id);
+		this.pendingFollowUps.delete(id); // 停止语义 = 不追加新轮
 		// 代次令牌:同合约原样重跑复用同 id(终端记录被替换,新句柄),本代次的兑底
 		// 计时器 fire 时按 id 查到的已是新代次——句柄比对不一致即失效,不串扰。
 		const generation = this.handles.get(id);
+		const stopRec = this.sm.records.get(id);
+		if (stopRec) stopRec.stopStartedAt = Date.now(); // 面板倒计时起点(成功进入 stopping)
 		try {
 			await this.sendCmd(id, { type: "steer", message: STOP_MESSAGE }, "stop");
 		} catch (e) {
 			// 停止指令没落地 ⇒ 子仍在跑本轮:回退 running 才是真相。此处 return 前
 			// 兑底计时器尚未 armed,stopping 不会无兑底悬挂;调用方按错误重试或 kill。
 			this.sm.rollback(id, "stopping", "running");
+			const rb = this.sm.records.get(id);
+			if (rb) rb.stopStartedAt = undefined; // 倒计时不残留(未真正进入 stopping)
 			this.deps.onChange?.();
 			throw e;
 		}
@@ -286,9 +325,7 @@ export class WorkerManager {
 			if (!rec || rec.state !== "stopping") return;
 			const handle = this.handles.get(id);
 			if (!handle) return;
-			handle.rpc.send({ type: "abort" }, { timeoutMs: ABORT_TIMEOUT_MS }).catch(() => {
-				// abort 失败(管道断/进程死):状态机已由 watcher 转移到 failed/exited,无需动作
-			});
+			void this.bestEffortAbort(handle);
 			setTimeout(() => {
 				if (this.handles.get(id) !== generation) return;
 				const rec2 = this.sm.records.get(id);
@@ -301,13 +338,21 @@ export class WorkerManager {
 	}
 
 	/** message:父→子统一通道(同一功能,按接收方状态选投递语义)。
-	 * running → steer(当前 turn 工具执行完毕后生效);idle → prompt(触发新轮)。 */
-	async message(id: string, text: string): Promise<"steer" | "prompt"> {
+	 * running → steer(当前 turn 工具执行完毕后生效)或 mode=followUp(排队,settled 后新轮);
+	 * idle → prompt(触发新轮);exited → 冷恢复(--session 同文件续接)。 */
+	async message(id: string, text: string, mode: SendMode = "steer"): Promise<"steer" | "prompt" | "queued"> {
 		const rec = this.sm.records.get(id);
 		if (!rec) {
 			throw new WorkerError(`send failed: ${id} not found; alive: ${this.sm.liveIds().join(", ") || "(none)"}`);
 		}
 		if (rec.state === "running") {
+			if (mode === "followUp") {
+				// 排队不打断当前轮:settled 报告送达后 flush(flushPendingFollowUps)
+				const q = this.pendingFollowUps.get(id) ?? [];
+				q.push(text);
+				this.pendingFollowUps.set(id, q);
+				return "queued";
+			}
 			await this.steer(id, text);
 			return "steer";
 		}
@@ -321,7 +366,7 @@ export class WorkerManager {
 			return "prompt";
 		}
 		throw new WorkerError(
-			`send failed: ${id} is ${rec.state}; deliverable states: running (effective at turn boundary) / idle (triggers a new turn) / exited (cold-resume)`,
+			`send failed: ${id} is ${rec.state}; deliverable states: running (steer at turn boundary, or mode=followUp queued) / idle (triggers a new turn) / exited (cold-resume)`,
 		);
 	}
 
@@ -422,49 +467,65 @@ export class WorkerManager {
 			buf.hydrating = false;
 		}
 	}
+	/** 收起标记落 session 尾部:恢复去重(不复活),审计保留(不删文件)。
+	 * 决策 API 落标(collect / 显式 kill)——决策时持久化,与事件时序解耦;
+	 * killAll(session_shutdown)不落:shutdown 不是对 deliverable 的决策,重启认领保留。
+	 * 标记失败仅影响去重——下次重启重新浮现,可再 collect,不阻塞收尾。 */
+	private writeCollectedMarker(id: string, verdict?: CollectVerdict): void {
+		const rec = this.sm.records.get(id);
+		if (!rec?.sessionFile || !existsSync(rec.sessionFile)) return;
+		try {
+			appendFileSync(
+				rec.sessionFile,
+				JSON.stringify({
+					type: "custom",
+					customType: COLLECTED_MARKER,
+					id: "worker-collect",
+					parentId: null,
+					timestamp: new Date().toISOString(),
+					data: verdict ? { verdict } : {},
+				}) + "\n",
+			);
+		} catch {
+			// 见上注释:去重降级,不 fail 收尾
+		}
+	}
+
+	/** abort 尽力而为(管道断/进程死 → 状态机已由 watcher 转移,无需动作;terminate 兜底)。 */
+	private async bestEffortAbort(handle: Handle, timeoutMs = ABORT_TIMEOUT_MS): Promise<void> {
+		try {
+			await handle.rpc.send({ type: "abort" }, { timeoutMs });
+		} catch {
+			// abort 失败:进程已死/管道断;terminate 对已退出进程无操作,兑底链不缺环
+		}
+	}
+
 	/** collect:父验收后收尾,终止进程并释放。verdict = 终审结论(工具参数面,
 	 * 落记录供 status 审计);非法状态抛错(fail fast),不落 verdict。 */
 	collect(id: string, verdict?: CollectVerdict): void {
 		this.sm.collect(id);
+		this.pendingFollowUps.delete(id); // 验收收尾:排队作废
 		this.transcripts.delete(id);
 		const rec = this.sm.records.get(id);
 		if (rec && verdict) rec.verdict = verdict;
 		const handle = this.handles.get(id);
 		if (handle) terminate(handle.proc);
-		// 收起标记落 session 尾部:恢复去重(不复活),审计保留(不删文件);
-		// 标记失败仅影响去重——下次重启重新浮现,可再 collect,不阻塞收尾
-		if (rec?.sessionFile && existsSync(rec.sessionFile)) {
-			try {
-				appendFileSync(
-					rec.sessionFile,
-					JSON.stringify({
-						type: "custom",
-						customType: COLLECTED_MARKER,
-						id: "worker-collect",
-						parentId: null,
-						timestamp: new Date().toISOString(),
-						data: verdict ? { verdict } : {},
-					}) + "\n",
-				);
-			} catch {
-				// 见上注释:去重降级,不 fail 收尾
-			}
-		}
+		this.writeCollectedMarker(id, verdict);
 		this.deps.onChange?.();
 	}
 
-	/** kill:撤换。abort(停止当前 turn)+ 终止进程;进程退出后状态 → done。 */
+	/** kill:撤换。abort(停止当前 turn)+ 终止进程;进程退出后状态 → done。
+	 * marker 在决策时落盘(显式 kill = 终态决策,重启不复活);killAll(session_shutdown)
+	 * 直调 sm.kill 不经本方法,不落标——重启认领(G1 恢复)保留。 */
 	async kill(id: string): Promise<void> {
 		this.sm.kill(id);
+		this.pendingFollowUps.delete(id); // 撤换:排队作废
 		const handle = this.handles.get(id);
 		if (!handle) {
 			throw new WorkerError(`kill failed: ${id} in legal state but missing process handle (invariant broken); rerun`);
 		}
-		try {
-			await handle.rpc.send({ type: "abort" }, { timeoutMs: ABORT_TIMEOUT_MS });
-		} catch {
-			// abort 尽力而为;SIGTERM/SIGKILL 兜底
-		}
+		this.writeCollectedMarker(id); // 决策时持久化(先于进程终止,与事件时序解耦)
+		await this.bestEffortAbort(handle);
 		terminate(handle.proc);
 		this.deps.onChange?.();
 	}
@@ -520,6 +581,7 @@ export class WorkerManager {
 					this.dropHandle(id);
 				} else if (rec.state === "done" || rec.state === "exited") {
 					// done:正常收尾/kill 后 reap;exited:idle 后进程崩了,记录留 last known
+					// (marker 由决策 API kill()/collect() 落,事件反应器零政策)
 					this.dropHandle(id);
 				}
 				return;
@@ -649,6 +711,8 @@ export class WorkerManager {
 			rec.reportError = (rec.reportError ? rec.reportError + "; " : "") + `deliver failed: ${e instanceof Error ? e.message : String(e)}`;
 			this.deps.onChange?.();
 		}
+		// followUp 队列:settled 报告送达后才排空(先给父报告,再开新轮);被 stop/kill/collect 清的队列作废
+		this.flushPendingFollowUps(id);
 	}
 
 	status(id?: string): WorkerRecord | WorkerRecord[] {
@@ -697,11 +761,7 @@ export class WorkerManager {
 			} catch {
 				// 已终态,忽略
 			}
-			try {
-				handle.rpc.send({ type: "abort" }, { timeoutMs: ABORT_TIMEOUT_MS }).catch(() => {});
-			} catch {
-				// 忽略
-			}
+			void this.bestEffortAbort(handle);
 			terminate(handle.proc);
 		}
 	}

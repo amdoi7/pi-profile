@@ -30,6 +30,17 @@ const piWorkerParams = Type.Object({
 			description: "required for run: self-contained task brief; for send: the message text",
 		}),
 	),
+	// 投递模式(仅 send 用):running 时 steer(缺省,当前轮边界生效)或 followUp(排队,settled 后新轮);
+	// idle/exited 忽略 mode(prompt/冷恢复语义不变)。枚举值即语义,与 pi 内核 deliverAs 同词汇。
+	mode: Type.Optional(
+		Type.Union(
+			[Type.Literal("steer"), Type.Literal("followUp")],
+			{
+				description:
+					"for send: delivery to a running worker — steer (default) = effective at the current turn boundary; followUp = queued until the current turn settles, then a new turn starts with this text (idle/exited ignore mode)",
+			},
+		),
+	),
 	model: Type.Optional(Type.String({ description: "for run: worker model as provider/id; omit = default model" })),
 	// CLI 对非法档位只警告并丢弃(静默降级);枚举在 schema 层 fail fast,THINKING_LEVELS 为单一事实源
 	thinking: Type.Optional(StringEnum(THINKING_LEVELS, { description: "for run: thinking level; omit = default level" })),
@@ -61,7 +72,7 @@ Use when a task is self-contained, needs an independent context, or parallelizes
 
 Actions:
 - run: spawn a worker session → returns {id} (the address for all later actions)
-- send: deliver text; running → steer (effective after current tool call), idle → triggers a new turn, exited → cold-resume via --session with full history; other terminal states reject
+- send: deliver text; running → steer (effective after current tool call) or mode=followUp (queued until the current turn settles, then starts a new turn); idle → triggers a new turn; exited → cold-resume via --session with full history; other terminal states reject
 - stop: stop new work; the worker only finishes its report and settles
 - collect: mark done and clear the record; optional verdict = final review conclusion
 - status: worker records (state, usage, legal actions); omit id to list all; exited records can be cold-resumed via send, cleared via collect`,
@@ -111,11 +122,15 @@ async function dispatch(manager: WorkerManager, p: PiWorkerParams, cwd: string, 
 				await manager.message(p.id!, p.text!);
 				return `cold-resume started: ${p.id} (--session same file, full history); the text triggers a new turn; results arrive as callbacks.`;
 			}
-			const result = await manager.bus.post("parent", p.id!, p.text!);
+			const result = await manager.bus.post("parent", p.id!, p.text!, false, p.mode === "followUp" ? "followUp" : "steer");
 			if (!result.ok) throw new WorkerError(`send failed: ${result.reason}`);
-			return result.via === "steer"
-				? `steer injected: ${p.id}; effective after current tool call.`
-				: `delivered: ${p.id}; worker starts a new turn.`;
+			if (result.via === "steer") {
+				return `steer injected: ${p.id}; effective after current tool call.`;
+			}
+			if (result.via === "queued") {
+				return `follow-up queued: ${p.id}; a new turn starts after the current one settles.`;
+			}
+			return `delivered: ${p.id}; worker starts a new turn.`;
 		}
 		case "stop": {
 			requireField(p, "id", "stop");
@@ -178,7 +193,8 @@ export function statusActionsFor(r: WorkerRecord): string {
 		case "stopping":
 			return "kill";
 		case "exited":
-			return "send(cold-resume)|collect";
+			// 报告已交(报告先于进程死),判决不因进程死失效——与 idle 同款判决集
+			return "send(cold-resume)|collect(verdict=通过|丢弃|强制放行)";
 		default:
 			return "";
 	}

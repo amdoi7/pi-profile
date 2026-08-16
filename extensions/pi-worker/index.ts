@@ -5,7 +5,7 @@ import {
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { registerWorkerMessagingTool } from "./src/messaging.ts";
 import { WorkerManager } from "./src/manager.ts";
-import { registerWorkerPaneCommand } from "./src/pane.ts";
+import { openWorkerPane, registerWorkerPaneCommand } from "./src/pane.ts";
 import { formatCallbackView, formatFooter, toastFor } from "./src/present.ts";
 import { registerPiWorkerTool } from "./src/tool.ts";
 import type { WorkerRecord } from "./src/types.ts";
@@ -39,7 +39,7 @@ export default function (pi: ExtensionAPI): void {
 		const records = manager.status() as WorkerRecord[];
 		ui.setStatus(
 			"pi-worker",
-			formatFooter(records, { now: Date.now(), fg: (c, t) => (theme ? theme.fg(c, t) : t) }),
+			formatFooter(records, { now: Date.now(), fg: (c, t) => (theme ? theme.fg(c, t) : t), openHint: "alt+w" }),
 		);
 		const anyWorking = records.some(
 			(r) => r.state === "starting" || r.state === "running" || r.state === "stopping",
@@ -68,6 +68,12 @@ export default function (pi: ExtensionAPI): void {
 	});
 	registerPiWorkerTool(pi, manager);
 	registerWorkerPaneCommand(pi, manager);
+	// 入口复用:footer 的 /pi-worker 是纯文本,alt+w 是唯一可交互通道(peer chat 入口)。
+	// alt+w 未被 pi 默认/编辑器占用(ctrl+w 被编辑器删词占用);键冲突由 runner 诊断。
+	pi.registerShortcut("alt+w", {
+		description: "打开 worker 决策队列/聊天窗口(与 /pi-worker 命令同路)",
+		handler: (ctx) => openWorkerPane(pi, manager, ctx),
+	});
 
 	// 回调 renderer:呈报即验收界面。settled 报告全文(核验证据段)不折叠;
 	// failed 诊断 + stderr 尾;action 审计(路由/机械动作)dim。
@@ -91,6 +97,10 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("session_start", async (_event, ctx) => {
 		ui = ctx.ui;
 		theme = ctx.ui.theme as unknown as ThemeLike;
+		// 重启认领:父重启后子进程随父死(stdin EOF 自退),session jsonl 在磁盘——
+		// 重建 exited 记录,send 唤醒(--session 同文件冷恢复)或 collect 清账,审计不丢。
+		const n = await manager.claimLeftovers(ctx.cwd);
+		if (n > 0 && ui) ui.notify(`${n} leftover worker session(s) recovered from disk: send to wake (cold-resume) or collect to clear`, "info");
 		refreshFooter();
 	});
 	pi.on("session_shutdown", () => {

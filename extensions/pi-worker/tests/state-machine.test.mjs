@@ -38,6 +38,14 @@ test("run: ∅→starting,记录字段齐全", () => {
 	assert.ok(rec.createdAt > 0);
 });
 
+test("run: taskSummary(队列行扫读数据)透传落记录", () => {
+	const sm = new WorkerStateMachine();
+	const rec = sm.run({ id: ID, name: "hank", taskSummary: "修复 bug 根因" });
+	assert.equal(rec.taskSummary, "修复 bug 根因");
+	const plain = sm.run({ id: "pi-worker-b#222222222222", name: "b" });
+	assert.equal(plain.taskSummary, undefined, "未给不落(旧调用兼容)");
+});
+
 test("onStarted: starting→running;非 starting 忽略", () => {
 	const sm = new WorkerStateMachine();
 	sm.run({ id: ID, name: "hank" });
@@ -450,4 +458,43 @@ test("onResumed:exited→starting,processExited 复位;非 exited 不动", () =>
 	// 非 exited 不动
 	sm.onResumed(ID);
 	assert.equal(sm.status(ID).state, "starting", "starting 状态重复调用不动");
+});
+
+// ---------- 启动认领(父重启后磁盘遗留 → exited) ----------
+test("claimLeftover:创建 exited 记录(processExited,审计指针与 cwd 落记录)", () => {
+	const sm = new WorkerStateMachine();
+	const rec = sm.claimLeftover({ id: "pi-worker-hank#0123456789ab", name: "hank", sessionFile: "/repo/.pi/worker-sessions/a.jsonl", cwd: "/repo", createdAt: 1000 });
+	assert.equal(rec.state, "exited");
+	assert.equal(rec.processExited, true);
+	assert.equal(rec.sessionFile, "/repo/.pi/worker-sessions/a.jsonl");
+	assert.equal(rec.cwd, "/repo");
+	assert.equal(rec.createdAt, 1000);
+	assert.equal(rec.turns, 0);
+});
+
+test("claimLeftover:非终态已存在 → 抛错(与 run 同规则,防双活同 id)", () => {
+	const sm = new WorkerStateMachine();
+	sm.run({ id: "pi-worker-hank#0123456789ab", name: "hank" });
+	expectWorkerError(
+		() => sm.claimLeftover({ id: "pi-worker-hank#0123456789ab", name: "hank", sessionFile: "f", cwd: "/repo", createdAt: 1 }),
+		"id exists and not terminal",
+	);
+});
+
+test("claimLeftover:替换终态(done)记录 → exited(重派同合约的合法续写)", () => {
+	const sm = new WorkerStateMachine();
+	sm.run({ id: "pi-worker-hank#0123456789ab", name: "hank" });
+	sm.onStarted("pi-worker-hank#0123456789ab");
+	sm.onSettled("pi-worker-hank#0123456789ab");
+	sm.collect("pi-worker-hank#0123456789ab"); // done
+	const rec = sm.claimLeftover({ id: "pi-worker-hank#0123456789ab", name: "hank", sessionFile: "f", cwd: "/repo", createdAt: 5 });
+	assert.equal(rec.state, "exited");
+	assert.equal(rec.createdAt, 5);
+});
+
+test("claimLeftover 后合法出路:collect 直接可用(exited → done)", () => {
+	const sm = new WorkerStateMachine();
+	sm.claimLeftover({ id: "pi-worker-hank#0123456789ab", name: "hank", sessionFile: "f", cwd: "/repo", createdAt: 1 });
+	sm.collect("pi-worker-hank#0123456789ab");
+	assert.equal(sm.status("pi-worker-hank#0123456789ab").state, "done");
 });

@@ -36,7 +36,7 @@ export class WorkerStateMachine {
 	/** run:∅→starting。id 未终结时拒绝(同合约同 id 的并发分发是调用方 bug)。
 	 * 替换 terminal(failed/done)记录时继承上次失败诊断——status 可回溯;
 	 * 回调已送达父、磁盘 jsonl 在,内存只留 last-known。 */
-	run(input: { id: string; name: string }): WorkerRecord {
+	run(input: { id: string; name: string; taskSummary?: string }): WorkerRecord {
 		const existing = this.records.get(input.id);
 		if (existing && !TERMINAL_STATES.includes(existing.state)) {
 			// exited 上 kill 非法,通用「先 collect 或 kill」会指到死路;按状态给真实出路
@@ -54,6 +54,38 @@ export class WorkerStateMachine {
 			createdAt: now,
 			updatedAt: now,
 			turns: 0,
+		};
+		if (input.taskSummary !== undefined) rec.taskSummary = input.taskSummary;
+		if (existing && (existing.exitCode != null || existing.stderrTail)) {
+			rec.stderrTail = existing.stderrTail;
+			rec.exitCode = existing.exitCode;
+			rec.exitSignal = existing.exitSignal;
+		}
+		this.records.set(input.id, rec);
+		return rec;
+	}
+
+	/** 启动认领:磁盘遗留 worker session → exited 记录(进程已死;冷恢复/collect 合法入口)。
+	 * 与 run 同规则:替换终态记录时继承失败诊断;非终态存在 = 调用方 bug(防双活同 id)。 */
+	claimLeftover(input: { id: string; name: string; sessionFile: string; cwd: string; createdAt: number }): WorkerRecord {
+		const existing = this.records.get(input.id);
+		if (existing && !TERMINAL_STATES.includes(existing.state)) {
+			const way = existing.state === "exited" ? EXITED_HINT : "collect or kill first";
+			throw new WorkerError(
+				`id exists and not terminal: ${input.id};${way}, or change the contract to get a new id`,
+			);
+		}
+		const now = Date.now();
+		const rec: WorkerRecord = {
+			id: input.id,
+			name: input.name,
+			state: "exited",
+			processExited: true,
+			createdAt: input.createdAt,
+			updatedAt: now,
+			turns: 0,
+			sessionFile: input.sessionFile,
+			cwd: input.cwd,
 		};
 		if (existing && (existing.exitCode != null || existing.stderrTail)) {
 			rec.stderrTail = existing.stderrTail;

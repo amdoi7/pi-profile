@@ -1,7 +1,7 @@
-import { test } from "vitest";
+import { describe, test } from "vitest";
 import assert from "node:assert/strict";
 
-import { makeWorkerId, validateRunInput, normalizeTools, buildInitialPrompt, buildWorkerPreamble, cwdFromWorkerSessionFile, workerSessionDir, NAME_RE, ID_RE } from "../src/contract.ts";
+import { makeWorkerId, validateRunInput, normalizeTools, buildInitialPrompt, buildWorkerPreamble, cwdFromWorkerSessionFile, workerSessionDir, summarizeTask, STOP_DEADLINE_MS, HANDSHAKE_TIMEOUT_MS, NAME_RE, ID_RE } from "../src/contract.ts";
 
 const base = {
 	name: "hank",
@@ -32,6 +32,28 @@ test("makeWorkerId: 合约字段任一变化 → 新 id", () => {
 test("makeWorkerId: model/thinking 变化 → 新 id(升档=新分发)", () => {
 	assert.notEqual(makeWorkerId({ ...base, model: "other/model" }), makeWorkerId(base));
 	assert.notEqual(makeWorkerId({ ...base, thinking: "high" }), makeWorkerId(base));
+});
+
+describe("summarizeTask(run 时快照:队列行扫读用)", () => {
+	test("首个非空行,空白折叠", () => {
+		assert.equal(summarizeTask("修复 bug 根因\n并补测试"), "修复 bug 根因");
+		assert.equal(summarizeTask("\n\n  多   空格 折叠\n第二行"), "多 空格 折叠");
+	});
+
+	test("60 字符封顶带省略号;空 → 空串", () => {
+		assert.equal(summarizeTask("x".repeat(100)).length, 60);
+		assert.ok(summarizeTask("x".repeat(100)).endsWith("…"));
+		assert.equal(summarizeTask("   \n"), "");
+	});
+});
+
+describe("stop/握手时限常量(面板倒计时与 manager 计时器同源,不漂移)", () => {
+	test("STOP_DEADLINE = 宽限 + abort 窗口(45s 硬兑底上限)", () => {
+		assert.equal(STOP_DEADLINE_MS, 45_000);
+	});
+	test("握手超时 30s(启动静默窗上限)", () => {
+		assert.equal(HANDSHAKE_TIMEOUT_MS, 30_000);
+	});
 });
 
 test("makeWorkerId: 字段顺序无关(canonical)", () => {

@@ -1,5 +1,6 @@
 import type { CallbackMessage } from "./bridge.ts";
-import { WorkerError, type WorkerRecord } from "./types.ts";
+import { STOP_DEADLINE_MS } from "./contract.ts";
+import { WorkerError, type CollectVerdict, type WorkerRecord } from "./types.ts";
 
 /**
  * UI 投影纯函数(主权界面:决策点显式化优先于进度投影)。无副作用,可单测。
@@ -41,6 +42,8 @@ export interface FooterOptions {
 	now: number;
 	/** 语义色注入(默认无色,测试友好) */
 	fg?: Fg;
+	/** 决策区入口的快捷键提示(如 "alt+w");缺省只给 /pi-worker 命令 */
+	openHint?: string;
 }
 
 /**
@@ -139,8 +142,11 @@ export function formatFooter(records: WorkerRecord[], opts: FooterOptions): stri
 		decisionParts.push(fg(idleAbnormal.length > 0 ? "warning" : "dim", `✓ ${idle} idle${tag}`));
 	}
 	if (exited > 0) decisionParts.push(fg("warning", `⏾ ${exited} exited`));
-	// 任一决策待办(失败归因/ idle 验收/ exited 清理)即给行动入口
-	if (failed + idle + exited > 0) decisionParts.push(fg("dim", "/pi-worker"));
+	// 任一决策待办(失败归因/ idle 验收/ exited 清理)即给行动入口:命令 + 快捷键提示
+	// (入口复用:footer 是纯文本,键绑定是唯一可交互通道,见 index.ts registerShortcut)
+	if (failed + idle + exited > 0) {
+		decisionParts.push(fg("dim", opts.openHint ? `/pi-worker · ${opts.openHint}` : "/pi-worker"));
+	}
 	const decisionZone = decisionParts.join(" · ");
 
 	if (!workZone && !decisionZone) return undefined;
@@ -175,6 +181,22 @@ export function extractTokens(stats: unknown): number | undefined {
 		if (typeof total === "number" && Number.isFinite(total)) return total;
 	}
 	return undefined;
+}
+
+/** 标题聚合统计(与 footer 同词汇同色:✗failed > ✓idle > ⏾exited > ●工作中);
+ * 全终态 → undefined(统计行省略)。 */
+export function formatPaneStats(records: WorkerRecord[], fg: Fg = plainFg): string | undefined {
+	const count = (states: readonly string[]) => records.filter((r) => states.includes(r.state)).length;
+	const failed = count(["failed"]);
+	const idle = count(["idle"]);
+	const exited = count(["exited"]);
+	const working = count(["starting", "running", "stopping"]);
+	const parts: string[] = [];
+	if (failed > 0) parts.push(fg("error", `✗ ${failed} failed`));
+	if (idle > 0) parts.push(fg("dim", `✓ ${idle} idle`));
+	if (exited > 0) parts.push(fg("warning", `⏾ ${exited} exited`));
+	if (working > 0) parts.push(fg("accent", `● ${working} 工作中`));
+	return parts.length > 0 ? parts.join(" · ") : undefined;
 }
 
 /** 最近用量快照(turn_end 覆写,投影层唯一读入口)。 */
@@ -374,10 +396,15 @@ function activityShort(activity: string): string {
 	return s.length > 30 ? `${s.slice(0, 30)}…` : s;
 }
 
+/** 主行任务摘要短形式:40 字符截断(全文在 transcript 区)。 */
+function taskShort(s: string): string {
+	return s.length > 40 ? `${s.slice(0, 39)}…` : s;
+}
+
 export function formatOverlayRows(
 	records: WorkerRecord[],
 	now: number,
-	opts?: { expandExited?: boolean },
+	opts?: { expandExited?: boolean; providerNameFor?: (id: string) => string | undefined },
 ): OverlayRow[] {
 	const live = records.filter((r) => r.state !== "done" && r.state !== "killing");
 	const sorted = [...live].sort((a, b) => {
@@ -400,9 +427,23 @@ export function formatOverlayRows(
 		if (r.state === "stopping") color = "warning";
 		else if (r.state === "running" || r.state === "starting") color = pulseBright(now) ? "accent" : "dim";
 		const cols = [padCol(r.name, nameW), padStartCol(formatRuntime(r, now), timeW), `t${r.turns}`];
-		// 行单行化:working 态主行带活动短摘要;模型/cost 徽章在 transcript 标题栏
+		// 行=任务卡:任务摘要进主行(不选中可扫读);旧记录无摘要不加料
 		const working = r.state === "running" || r.state === "starting" || r.state === "stopping";
-		const main = `${mark.icon} ${cols.join(" ")}${working && r.currentActivity ? ` · ${activityShort(r.currentActivity)}` : ""}`;
+		const bits = [cols.join(" ")];
+		if (r.taskSummary) bits.push(taskShort(r.taskSummary));
+		if (working) {
+			if (r.currentActivity) bits.push(activityShort(r.currentActivity));
+			// 瞬态提示:starting 握手期(30s 静默窗可读);stopping 倒计时上限(硬兑底时限,数据源 stopStartedAt)
+			if (r.state === "starting") bits.push("握手中");
+			else if (r.state === "stopping" && r.stopStartedAt !== undefined) {
+				const remain = Math.max(0, Math.ceil((r.stopStartedAt + STOP_DEADLINE_MS - now) / 1000));
+				bits.push(`收尾中≤${remain}s`);
+			}
+		}
+		// 模型/think 徽章进主行(不选中可扫读;选中的 transcript 标题栏仍有完整徽章)
+		const model = formatModelInfo(r, opts?.providerNameFor?.(r.id));
+		if (model) bits.push(model);
+		const main = `${mark.icon} ${bits.join(" · ")}`;
 		// 非正常收尾诊断:length(截断)/aborted(中断)进主行,父一眼可见
 		const mainDiag = !working && r.stopReason && r.stopReason !== "stop" ? ` · stop:${r.stopReason}` : "";
 		const details: OverlayLine[] = [];
@@ -490,39 +531,49 @@ export function actionsFor(rec: WorkerRecord): WorkerAction[] {
 		return [{ value: "kill", label: "kill", description: "撤换", irreversible: true }];
 	}
 	if (rec.state === "exited") {
+		// 报告已交(报告先于进程死),判决面同 idle;消息 = 冷恢复续接
 		return [
+			{ value: "通过", label: "通过", description: "验收通过,收尾" },
 			{ value: "消息", label: "消息", description: "冷恢复续接(--session 同文件,历史完整;消息即新轮指令)", needsInput: true, inputPrompt: "消息内容:" },
-			{ value: "collect", label: "collect", description: "收尾清理" },
+			{ value: "丢弃", label: "丢弃" },
+			{ value: "强制放行", label: "强制放行", needsInput: true, inputPrompt: "放行理由:" },
 		];
 	}
 	return [];
 }
 
-/** overlay 动作 → 执行操作:判决与归因注入父 session(落 verdict frontmatter/修合约
- * 是 agent 判断);消息与机械动作直调 manager。audit 为直调动作的陈述式留痕
- * (落 session display,不唤醒父)。 */
+/** overlay 动作 → 执行操作:判决/撤换 = 机械收尾(collect 落记录+verdict)+ 注入指引
+ * (frontmatter 落笔/归因分流归父 agent 判断);消息与机械动作直调 manager。
+ * audit 为直调动作的陈述式留痕(落 session display,不唤醒父)。 */
 export type ActionOp =
 	| { kind: "stop" | "kill" | "collect"; audit: string }
 	| { kind: "message"; message: string; audit: string }
-	| { kind: "inject"; text: string };
+	| { kind: "verdict"; verdict: CollectVerdict; audit: string; text: string }
+	| { kind: "replacement"; audit: string; text: string };
 
 export function opFor(action: WorkerAction, id: string, input?: string): ActionOp {
 	switch (action.value) {
 		case "通过":
-			// 判决注入父 session:verdict 落 deliverable frontmatter 是审查闭环事实源,需 agent 判断与落笔
+			// collect 由面板机械执行(反馈即实际状态);frontmatter 落笔仍归父 agent(审查闭环事实源)
 			return {
-				kind: "inject",
-				text: `对 ${id} 判决「通过」:按 Deliverable 契约将 verdict=通过、status=closed 落相关 deliverable frontmatter(无对应 issue 豁免),然后 pi_worker collect id=${id} verdict=通过`,
+				kind: "verdict",
+				verdict: "通过",
+				audit: `已对 ${id} 判决「通过」并收尾`,
+				text: `对 ${id} 的「通过」判决已执行(collect 完成,verdict=通过 已落记录)。请按 Deliverable 契约将 verdict=通过、status=closed 落相关 deliverable frontmatter(无对应 issue 豁免)`,
 			};
 		case "强制放行":
 			return {
-				kind: "inject",
-				text: `对 ${id} 判决「强制放行」${input ? `(理由:${input})` : ""}:将 verdict=强制放行、status=closed 连同理由落相关 deliverable frontmatter,然后 pi_worker collect id=${id} verdict=强制放行`,
+				kind: "verdict",
+				verdict: "强制放行",
+				audit: `已对 ${id} 判决「强制放行」并收尾`,
+				text: `对 ${id} 的「强制放行」判决已执行(collect 完成,verdict=强制放行 已落记录)${input ? `(理由:${input})` : ""}。请将 verdict=强制放行、status=closed 连同理由落相关 deliverable frontmatter`,
 			};
 		case "丢弃":
 			return {
-				kind: "inject",
-				text: `对 ${id} 判决「丢弃」:将 verdict=丢弃、status=rejected 落相关 deliverable frontmatter,然后 pi_worker collect id=${id} verdict=丢弃`,
+				kind: "verdict",
+				verdict: "丢弃",
+				audit: `已对 ${id} 判决「丢弃」并收尾`,
+				text: `对 ${id} 的「丢弃」判决已执行(collect 完成,verdict=丢弃 已落记录)。请将 verdict=丢弃、status=rejected 落相关 deliverable frontmatter`,
 			};
 		case "消息":
 			return { kind: "message", message: input ?? "", audit: `已对 ${id} 发送 message:${input ?? ""}` };
@@ -531,10 +582,11 @@ export function opFor(action: WorkerAction, id: string, input?: string): ActionO
 		case "collect":
 			return { kind: action.value, audit: formatActionMessage(id, action.value) };
 		case "撤换":
-			// 归因分类是父 agent 判断(AGENTS.md 归因分流),菜单不替父分类
+			// 清账 collect 由面板机械执行;归因分类是父 agent 判断(AGENTS.md 归因分流),菜单不替父分类
 			return {
-				kind: "inject",
-				text: `对 ${id} 撤换:请执行 pi_worker collect id=${id} 清账,按归因分流处置`,
+				kind: "replacement",
+				audit: `已对 ${id} 撤换并清账`,
+				text: `对 ${id} 已执行撤换并清账(collect 完成)。请按归因分流处置:重派或收尾`,
 			};
 		default:
 			throw new WorkerError(`未知动作: ${action.value}`);

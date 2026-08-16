@@ -17,9 +17,10 @@ function setup({ resolveAmbiguous = [] } = {}) {
 			if (resolveAmbiguous.includes(to)) return undefined; // 歧义与不存在的区分归 manager,bus 只见未命中
 			return live.get(to) ?? (live.has(to) ? undefined : undefined);
 		},
-		transport: async (id, text) => {
-			transports.push({ id, text });
+		transport: async (id, text, mode) => {
+			transports.push({ id, text, mode });
 			if (text.includes("BOOM")) throw new Error("目标已退出");
+			if (mode === "followUp" && id.includes("running")) return "queued";
 			return id.includes("running") ? "steer" : "prompt";
 		},
 		displayNameOf: (id) => id.match(/^pi-worker-(.+)#[0-9a-f]{6}$/)?.[1] ?? id,
@@ -48,19 +49,26 @@ describe("post:resolve 与 deliver", () => {
 		assert.equal(delivered[0].msg.details.type, "message");
 	});
 
-	test("parent → worker:走 FSM 投递原语,信封带 parent", async () => {
+	test("parent → worker:走 FSM 投递原语,信封带 parent;mode 缺省 steer", async () => {
 		const { bus, transports, delivered } = setup();
 		const r = await bus.post("parent", "seal", "先修断言");
 		assert.deepEqual(r, { ok: true, via: "prompt" });
-		assert.deepEqual(transports, [{ id: "pi-worker-seal#bbbbbb", text: "message from “parent”: 先修断言" }]);
+		assert.deepEqual(transports, [{ id: "pi-worker-seal#bbbbbb", text: "message from “parent”: 先修断言", mode: "steer" }]);
 		assert.equal(delivered.length, 0); // parent 发的不需要向 parent 审计
 	});
 
-	test("worker → worker:FSM 投递 + 父 session 安静audit fan-out(世界模型不瞎)", async () => {
+	test("post mode=followUp:透传 delivery primitive(running 排队语义归 manager),via 由原语决定", async () => {
+		const { bus, transports } = setup();
+		const r = await bus.post("parent", "hank", "改需求", false, "followUp");
+		assert.deepEqual(transports, [{ id: "pi-worker-hank#aaaaaa", text: "message from “parent”: 改需求", mode: "followUp" }]);
+		assert.equal(r.ok, true);
+	});
+
+	test("worker → worker:FSM 投递 + 父 session 安静audit fan-out(父转录与真实执行一致)", async () => {
 		const { bus, transports, delivered } = setup();
 		const r = await bus.post("pi-worker-hank#aaaaaa", "seal", "证据已齐");
 		assert.deepEqual(r, { ok: true, via: "prompt" });
-		assert.deepEqual(transports, [{ id: "pi-worker-seal#bbbbbb", text: "message from “hank”: 证据已齐" }]);
+		assert.deepEqual(transports, [{ id: "pi-worker-seal#bbbbbb", text: "message from “hank”: 证据已齐", mode: "steer" }]);
 		assert.equal(delivered.length, 1);
 		assert.equal(delivered[0].quiet, true); // peer 流量安静留痕,不烧父轮次
 		assert.equal(delivered[0].msg.details.type, "action-done");
