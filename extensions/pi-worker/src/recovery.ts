@@ -30,6 +30,38 @@ export const COLLECTED_MARKER = "pi-worker-collected";
 /** 标记尾查窗口:64KB 足够覆盖尾部标记(collect 后子进程不再写入)。 */
 const TAIL_SCAN_BYTES = 65536;
 
+/** 解析为收起标记条目? */
+function isMarkerEntry(s: string): boolean {
+	try {
+		const e = JSON.parse(s);
+		return e?.type === "custom" && e?.customType === COLLECTED_MARKER;
+	} catch {
+		return false;
+	}
+}
+
+/** 追加一行到 session 尾部。末行无换行(进程写一半被杀)时先补换行——
+ * marker 必须独占完整一行,读侧逐行解析 customType;粘连会导致整行 parse 失败。 */
+export function appendSessionLine(path: string, line: string): void {
+	let needsNewline = false;
+	try {
+		const fd = openSync(path, "r");
+		try {
+			const size = fstatSync(fd).size;
+			if (size > 0) {
+				const b = Buffer.alloc(1);
+				readSync(fd, b, 0, 1, size - 1);
+				needsNewline = b[0] !== 0x0a;
+			}
+		} finally {
+			closeSync(fd);
+		}
+	} catch {
+		// 读失败按直接追加(写侧错误由 appendFileSync 抛出,调用方已 catch)
+	}
+	appendFileSync(path, (needsNewline ? "\n" : "") + line);
+}
+
 /** session 尾部是否带收起标记。读取失败按未标记(宁可恢复,不静默丢审计)。 */
 export function hasCollectedMarker(path: string): boolean {
 	try {
@@ -43,12 +75,9 @@ export function hasCollectedMarker(path: string): boolean {
 			// 字面量(如让 worker 修改本扩展)误判为已收起,拒绝认领
 			for (const line of buf.toString("utf8").split("\n")) {
 				if (!line.includes(COLLECTED_MARKER)) continue; // 快速预筛
-				try {
-					const e = JSON.parse(line);
-					if (e?.type === "custom" && e?.customType === COLLECTED_MARKER) return true;
-				} catch {
-					// 截断行/非 JSON 跳过,继续扫
-				}
+				if (isMarkerEntry(line)) return true;
+				// 截断行/非 JSON 跳过。写侧保证 marker 独占完整一行(appendSessionLine
+				// 残行补换行);不为旧写入的粘连文件做恢复(不做向后兼容)。
 			}
 			return false;
 		} finally {

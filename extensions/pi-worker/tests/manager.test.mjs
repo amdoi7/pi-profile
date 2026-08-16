@@ -539,6 +539,22 @@ describe("collect 落收起标记(审计留痕)", () => {
 		assert.ok(tail.includes('"pi-worker-collected"'), "kill 后落收起标记(重启不复活)");
 	});
 
+	test("marker 写入遇残行先补换行:进程写一半被杀时 marker 仍独占完整一行(读侧逐行解析)", async () => {
+		// 命名回归:评审 Finding 1 的写侧根治——残行 + 粘连 = 整行 parse 失败,marker 失效
+		const { manager, add } = setup();
+		const dir = mkdtempSync(join(tmpdir(), "piw-killmark-"));
+		const file = join(dir, "s.jsonl");
+		writeFileSync(file, JSON.stringify({ type: "session", version: 3, id: "x", timestamp: "t", cwd: "/r" }) + "\n" + '{"type":"messag'); // 无换行残行
+		const id = "pi-worker-hank#aaaaaa";
+		add(id, "hank", "running");
+		manager.sm.records.get(id).sessionFile = file;
+		await manager.kill(id);
+		const lines = readFileSync(file, "utf8").split("\n");
+		const markerLine = lines.find((l) => l.includes(COLLECTED_MARKER));
+		assert.ok(markerLine, "marker 已写入");
+		assert.equal(JSON.parse(markerLine).customType, COLLECTED_MARKER, "marker 独占完整一行,可独立解析");
+	});
+
 	test("killAll 不落收起标记(shutdown 非决策):G1 重启认领保留", async () => {
 		const { manager, add } = setup();
 		const cwd = mkdtempSync(join(tmpdir(), "piw-killall-"));

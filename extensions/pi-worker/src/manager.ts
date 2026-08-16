@@ -1,7 +1,7 @@
 import { formatCallback, CALLBACK_TYPE, type CallbackMessage } from "./bridge.ts";
-import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { buildInitialPrompt, cwdFromWorkerSessionFile, makeWorkerId, normalizeTools, summarizeTask, validateRunInput, workerSessionDir, HANDSHAKE_TIMEOUT_MS, STOP_GRACE_MS, STOP_ABORT_WINDOW_MS } from "./contract.ts";
-import { COLLECTED_MARKER, appendLedgerEntry, dispositionsFromLedger, readLedger, scanLeftoverSessions, type LedgerEntry, type LeftoverSession } from "./recovery.ts";
+import { COLLECTED_MARKER, appendLedgerEntry, appendSessionLine, dispositionsFromLedger, readLedger, scanLeftoverSessions, type LedgerEntry, type LeftoverSession } from "./recovery.ts";
 import { RoomBus, type SendMode } from "./room-bus.ts";
 import { displayNameOf } from "./present.ts";
 import { RpcClient } from "./rpc-client.ts";
@@ -498,7 +498,8 @@ export class WorkerManager {
 		const rec = this.sm.records.get(id);
 		if (!rec?.sessionFile || !existsSync(rec.sessionFile)) return;
 		try {
-			appendFileSync(
+			// appendSessionLine:残行(进程写一半被杀)先补换行,marker 独占完整一行
+			appendSessionLine(
 				rec.sessionFile,
 				JSON.stringify({
 					type: "custom",
