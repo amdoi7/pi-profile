@@ -4,7 +4,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { ID_RE, NAME_RE, THINKING_LEVELS } from "./contract.ts";
 import type { WorkerManager } from "./manager.ts";
-import { extractCost, formatToolCallLine, latestStats } from "./present.ts";
+import { STATE_FACETS, extractCost, formatToolCallLine, latestStats } from "./present.ts";
 import { WorkerError } from "./state-machine.ts";
 import { COLLECT_VERDICTS, type WorkerRecord } from "./types.ts";
 
@@ -164,47 +164,20 @@ function requireField(p: PiWorkerParams, field: "id" | "text", action: string): 
 	}
 }
 
-/** status 列表排序:决策优先(failed/idle/exited 需父行动)> 工作态 > 终态(done 是噪音居尾)。
- * 与 overlay formatOverlayRows 的 decision 区同语义,但本地映射——markOf 对 done 抛错,不可复用。 */
-const STATUS_RANK: Record<string, number> = {
-	failed: 0,
-	idle: 1,
-	exited: 2,
-	starting: 3,
-	running: 3,
-	stopping: 3,
-	done: 4,
-	killing: 4,
-};
-
 /** status 的合法动作面:工具枚举 + 参数提示(能力同构抽象)——RPC 父拿到即可直接
  * 调用工具,零 label→action 映射。治理语义(判决/归因)就事论事落在可执行面:
- * collect 带 verdict 枚举、failed 提示清账后重派。与 pane 的 UI 文案(actionsFor)
- * 分离:前者是机器契约,后者是显示层。 */
+ * collect 带 verdict 枚举、failed 提示清账后重派。
+ * 单一事实源 = STATE_FACETS.toolActions(pane 的 UI 文案同窗登记,一致性测试守门)。 */
 export function statusActionsFor(r: WorkerRecord): string {
-	switch (r.state) {
-		case "idle":
-			return "send|collect(verdict=通过|丢弃|强制放行)";
-		case "failed":
-			return "collect(clear, then redispatch per attribution)";
-		case "running":
-			return "send|stop|kill";
-		case "starting":
-		case "stopping":
-			return "kill";
-		case "exited":
-			// 报告已交(报告先于进程死),判决不因进程死失效——与 idle 同款判决集
-			return "send(cold-resume)|collect(verdict=通过|丢弃|强制放行)";
-		default:
-			return "";
-	}
+	return STATE_FACETS[r.state].toolActions;
 }
 
 function formatStatus(records: WorkerRecord | WorkerRecord[]): string {
 	const list = Array.isArray(records) ? records : [records];
 	if (list.length === 0) return "No worker records.";
+	const rankOf = (s: string) => STATE_FACETS[s as keyof typeof STATE_FACETS]?.rank ?? 9;
 	const sorted = [...list].sort(
-		(a, b) => (STATUS_RANK[a.state] ?? 9) - (STATUS_RANK[b.state] ?? 9) || a.createdAt - b.createdAt,
+		(a, b) => rankOf(a.state) - rankOf(b.state) || a.createdAt - b.createdAt,
 	);
 	// 多条时给一行汇总头:父 LLM 扫读不用自数;决策态在前(与行序一致)
 	let header = "";
@@ -212,7 +185,7 @@ function formatStatus(records: WorkerRecord | WorkerRecord[]): string {
 		const counts = new Map<string, number>();
 		for (const r of sorted) counts.set(r.state, (counts.get(r.state) ?? 0) + 1);
 		const summary = [...counts.entries()]
-			.sort((a, b) => (STATUS_RANK[a[0]] ?? 9) - (STATUS_RANK[b[0]] ?? 9))
+			.sort((a, b) => rankOf(a[0]) - rankOf(b[0]))
 			.map(([s, n]) => `${s}×${n}`)
 			.join(" · ");
 		header = `${sorted.length} workers: ${summary}\n`;

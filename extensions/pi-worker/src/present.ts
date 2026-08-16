@@ -1,10 +1,10 @@
 import type { CallbackMessage } from "./bridge.ts";
 import { STOP_DEADLINE_MS } from "./contract.ts";
-import { WorkerError, type CollectVerdict, type WorkerRecord } from "./types.ts";
+import { WorkerError, type CollectVerdict, type WorkerRecord, type WorkerState } from "./types.ts";
 
 /**
  * UI 投影纯函数(主权界面:决策点显式化优先于进度投影)。无副作用,可单测。
- * 设计语言:静态状态词汇(✓✗⏾●,与 overlay STATE_MARKS 同表)、⏺ 动作、⎿ 续行;
+ * 设计语言:静态状态词汇(✓✗⏾●,STATE_FACETS 单一来源)、⏺ 动作、⎿ 续行;
  * 语义靠颜色(accent/warning/error/dim),不靠生造字形;
  * footer 双区(工作区 │ 决策区)。
  */
@@ -99,7 +99,7 @@ export function formatFooter(records: WorkerRecord[], opts: FooterOptions): stri
 	let workZone = "";
 	if (working.length === 1) {
 		const r = working[0];
-		// 图标与 overlay STATE_MARKS 同词汇(静态);stopping 警示色(告警面)
+		// 图标与 STATE_FACETS 同词汇(静态);stopping 警示色(告警面)
 		const icon = fg(r.state === "stopping" ? "warning" : "accent", markOf(r).icon);
 		const parts = [icon, r.name];
 		const activity = footerActivity(r.currentActivity);
@@ -120,31 +120,38 @@ export function formatFooter(records: WorkerRecord[], opts: FooterOptions): stri
 		workZone = parts.join(" · ");
 	}
 
-	let failed = 0;
-	let idle = 0;
-	let exited = 0;
+	// 决策区:STATE_FACETS 的 decision 成员按 rank 序(failed→idle→exited),图标同表。
+	// footer 色是告警语义本地政策(与 overlay 行色不同源):failed=error、exited=warning、
+	// idle=dim,非正常收尾(length 截断/aborted 中断)升 warning 并带标记——需复核的验收对象。
+	const counts = new Map<WorkerState, number>();
 	for (const r of records) {
-		if (r.state === "failed") failed++;
-		else if (r.state === "idle") idle++;
-		else if (r.state === "exited") exited++;
+		if (STATE_FACETS[r.state].decision) counts.set(r.state, (counts.get(r.state) ?? 0) + 1);
 	}
-	const decisionParts: string[] = [];
-	if (failed > 0) decisionParts.push(fg("error", `✗ ${failed} failed`));
-	// 非正常收尾(length 截断/aborted 中断)的 idle 是需复核的验收对象：标记 + 升 warning 色
 	const idleAbnormal = records.filter((r) => r.state === "idle" && r.stopReason && r.stopReason !== "stop");
-	if (idle > 0) {
+	const footerColor = (s: WorkerState): FooterColor =>
+		s === "failed" ? "error" : s === "exited" ? "warning" : idleAbnormal.length > 0 ? "warning" : "dim";
+	const decisionParts: string[] = [];
+	let decisionTotal = 0;
+	const decisionStates = (Object.keys(STATE_FACETS) as WorkerState[])
+		.filter((s) => STATE_FACETS[s].decision)
+		.sort((a, b) => STATE_FACETS[a].rank - STATE_FACETS[b].rank);
+	for (const s of decisionStates) {
+		const n = counts.get(s) ?? 0;
+		if (n === 0) continue;
+		decisionTotal += n;
 		const tag =
-			idleAbnormal.length === 1
-				? ` stop:${idleAbnormal[0].stopReason}`
-				: idleAbnormal.length > 1
-					? ` ${idleAbnormal.length} 异常收尾`
-					: "";
-		decisionParts.push(fg(idleAbnormal.length > 0 ? "warning" : "dim", `✓ ${idle} idle${tag}`));
+			s === "idle"
+				? idleAbnormal.length === 1
+					? ` stop:${idleAbnormal[0].stopReason}`
+					: idleAbnormal.length > 1
+						? ` ${idleAbnormal.length} 异常收尾`
+						: ""
+				: "";
+		decisionParts.push(fg(footerColor(s), `${STATE_FACETS[s].mark?.icon} ${n} ${s}${tag}`));
 	}
-	if (exited > 0) decisionParts.push(fg("warning", `⏾ ${exited} exited`));
 	// 任一决策待办(失败归因/ idle 验收/ exited 清理)即给行动入口:命令 + 快捷键提示
 	// (入口复用:footer 是纯文本,键绑定是唯一可交互通道,见 index.ts registerShortcut)
-	if (failed + idle + exited > 0) {
+	if (decisionTotal > 0) {
 		decisionParts.push(fg("dim", opts.openHint ? `/pi-worker · ${opts.openHint}` : "/pi-worker"));
 	}
 	const decisionZone = decisionParts.join(" · ");
@@ -349,20 +356,89 @@ function padStartCol(s: string, width: number): string {
 }
 
 /** 状态 → 主行图标与语义色(图标家族与 footer/callback 同源)。 */
-const STATE_MARKS: Record<string, { icon: string; color: LineColor; section: Section; order: number }> = {
-	failed: { icon: "✗", color: "error", section: "decision", order: 0 },
-	idle: { icon: "✓", color: "success", section: "decision", order: 1 },
-	exited: { icon: "⏾", color: "warning", section: "decision", order: 2 },
-	running: { icon: "●", color: "dim", section: "working", order: 3 },
-	starting: { icon: "●", color: "dim", section: "working", order: 3 },
-	stopping: { icon: "●", color: "dim", section: "working", order: 3 },
+/** 状态面单一来源:每态一行——rank(status/overlay 排序)、decision(决策区成员)、
+ * mark(图标/行色)、两个动作投影(toolActions=RPC 机器契约;paneActions=overlay UI 文案)。
+ * 合法性以状态机 requireState 为准,本表是投影不是政策;漂移由 present.test 的
+ * 「facet 与 FSM 合法集一致」红测试守门(非法提供与合法遗漏双向,即 #2 类 bug)。
+ * 政策注记:idle 的 kill 虽 FSM 合法,两个投影都不推——idle 终局动作是带判决的
+ * collect,无判决撤换不占用父的注意力;终态 done/killing 无投影(调用方过滤)。 */
+export interface StateFacet {
+	rank: number;
+	decision: boolean;
+	mark?: { icon: string; color: LineColor };
+	toolActions: string;
+	paneActions: WorkerAction[];
+}
+
+export const STATE_FACETS: Record<WorkerState, StateFacet> = {
+	failed: {
+		rank: 0,
+		decision: true,
+		mark: { icon: "✗", color: "error" },
+		toolActions: "collect(clear, then redispatch per attribution)",
+		paneActions: [
+			{ value: "撤换", label: "撤换", description: "归因分流处置(collect 清账后重派或收尾),注入父 session 执行" },
+		],
+	},
+	idle: {
+		rank: 1,
+		decision: true,
+		mark: { icon: "✓", color: "success" },
+		toolActions: "send|collect(verdict=通过|丢弃|强制放行)",
+		paneActions: [
+			{ value: "通过", label: "通过", description: "验收通过,收尾" },
+			{ value: "消息", label: "消息", description: "发消息触发新轮(打回/追加轮次)", needsInput: true, inputPrompt: "消息内容:" },
+			{ value: "丢弃", label: "丢弃" },
+			{ value: "强制放行", label: "强制放行", needsInput: true, inputPrompt: "放行理由:" },
+		],
+	},
+	exited: {
+		rank: 2,
+		decision: true,
+		mark: { icon: "⏾", color: "warning" },
+		// 报告已交(报告先于进程死),判决不因进程死失效——与 idle 同款判决集
+		toolActions: "send(cold-resume)|collect(verdict=通过|丢弃|强制放行)",
+		paneActions: [
+			{ value: "通过", label: "通过", description: "验收通过,收尾" },
+			{ value: "消息", label: "消息", description: "冷恢复续接(--session 同文件,历史完整;消息即新轮指令)", needsInput: true, inputPrompt: "消息内容:" },
+			{ value: "丢弃", label: "丢弃" },
+			{ value: "强制放行", label: "强制放行", needsInput: true, inputPrompt: "放行理由:" },
+		],
+	},
+	running: {
+		rank: 3,
+		decision: false,
+		mark: { icon: "●", color: "dim" },
+		toolActions: "send|stop|kill",
+		paneActions: [
+			{ value: "消息", label: "消息", description: "注入干预,turn 边界生效", needsInput: true, inputPrompt: "消息内容:" },
+			{ value: "stop", label: "stop", description: "立即停止新工作,只收尾呈报" },
+			{ value: "kill", label: "kill", description: "撤换", irreversible: true },
+		],
+	},
+	starting: {
+		rank: 3,
+		decision: false,
+		mark: { icon: "●", color: "dim" },
+		toolActions: "kill",
+		paneActions: [{ value: "kill", label: "kill", description: "撤换", irreversible: true }],
+	},
+	stopping: {
+		rank: 3,
+		decision: false,
+		mark: { icon: "●", color: "dim" },
+		toolActions: "kill",
+		paneActions: [{ value: "kill", label: "kill", description: "撤换", irreversible: true }],
+	},
+	done: { rank: 4, decision: false, toolActions: "", paneActions: [] },
+	killing: { rank: 4, decision: false, toolActions: "", paneActions: [] },
 };
 
 function markOf(r: WorkerRecord): { icon: string; color: LineColor; section: Section; order: number } {
-	const m = STATE_MARKS[r.state];
-	// fail fast:新增状态须在 STATE_MARKS 登记(调用方过滤保证 done/killing 不可达)
-	if (!m) throw new WorkerError(`overlay 未投影的状态: ${r.state};在 STATE_MARKS 登记或加入过滤`);
-	return m;
+	const f = STATE_FACETS[r.state];
+	// fail fast:新增状态须在 STATE_FACETS 登记(调用方过滤保证 done/killing 不可达)
+	if (!f?.mark) throw new WorkerError(`overlay 未投影的状态: ${r.state};在 STATE_FACETS 登记或加入过滤`);
+	return { ...f.mark, section: f.decision ? "decision" : "working", order: f.rank };
 }
 
 /**
@@ -502,44 +578,10 @@ export interface WorkerAction {
 	irreversible?: boolean;
 }
 
-/** 每子状态 → 合法动作集(与状态机合法集一致,不给非法 action)。 */
+/** 每子状态 → 合法动作集:STATE_FACETS 直读(与 FSM 合法集一致性由一致性测试守门)。
+ * 返回共享表行,调用方不得改(pane 只读)。 */
 export function actionsFor(rec: WorkerRecord): WorkerAction[] {
-	if (rec.state === "idle") {
-		return [
-			{ value: "通过", label: "通过", description: "验收通过,收尾" },
-			{ value: "消息", label: "消息", description: "发消息触发新轮(打回/追加轮次)", needsInput: true, inputPrompt: "消息内容:" },
-			{ value: "丢弃", label: "丢弃" },
-			{ value: "强制放行", label: "强制放行", needsInput: true, inputPrompt: "放行理由:" },
-		];
-	}
-	if (rec.state === "failed") {
-		return [
-			{ value: "撤换", label: "撤换", description: "归因分流处置(collect 清账后重派或收尾),注入父 session 执行" },
-		];
-	}
-	if (rec.state === "running") {
-		return [
-			{ value: "消息", label: "消息", description: "注入干预,turn 边界生效", needsInput: true, inputPrompt: "消息内容:" },
-			{ value: "stop", label: "stop", description: "立即停止新工作,只收尾呈报" },
-			{ value: "kill", label: "kill", description: "撤换", irreversible: true },
-		];
-	}
-	if (rec.state === "stopping") {
-		return [{ value: "kill", label: "kill", description: "撤换", irreversible: true }];
-	}
-	if (rec.state === "starting") {
-		return [{ value: "kill", label: "kill", description: "撤换", irreversible: true }];
-	}
-	if (rec.state === "exited") {
-		// 报告已交(报告先于进程死),判决面同 idle;消息 = 冷恢复续接
-		return [
-			{ value: "通过", label: "通过", description: "验收通过,收尾" },
-			{ value: "消息", label: "消息", description: "冷恢复续接(--session 同文件,历史完整;消息即新轮指令)", needsInput: true, inputPrompt: "消息内容:" },
-			{ value: "丢弃", label: "丢弃" },
-			{ value: "强制放行", label: "强制放行", needsInput: true, inputPrompt: "放行理由:" },
-		];
-	}
-	return [];
+	return STATE_FACETS[rec.state].paneActions;
 }
 
 /** overlay 动作 → 执行操作:判决/撤换 = 机械收尾(collect 落记录+verdict)+ 注入指引

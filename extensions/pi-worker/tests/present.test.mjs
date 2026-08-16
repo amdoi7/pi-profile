@@ -14,9 +14,10 @@ import {
 	actionsFor,
 	formatRecentEntry,
 	formatActionMessage,
+	STATE_FACETS,
 	opFor,
 } from "../src/present.ts";
-import { WorkerError } from "../src/state-machine.ts";
+import { WorkerError, WorkerStateMachine } from "../src/state-machine.ts";
 
 function rec(partial) {
 	return {
@@ -626,3 +627,87 @@ describe("actionsFor(与状态机合法集一致)", () => {
 	});
 });
 
+
+describe("STATE_FACETS × FSM 一致性(投影漂移 = 红测试)", () => {
+	// 经验法探针:每态起新机逐个方法试调,WorkerError = 非法。能力语义:
+	// send = steer(running)|followUp(idle)|onResumed(exited) 任一合法。
+	// 命名回归:#2(exited 判决面被投影层藏了)——「提供非法」与「遗漏合法主路」双向守门。
+	const id = "pi-worker-x#aaaaaaaaaaaa";
+	const machineIn = (state) => {
+		const sm = new WorkerStateMachine();
+		if (state === "exited") {
+			sm.claimLeftover({ id, name: "x", sessionFile: "/s/x.jsonl", cwd: "/c", createdAt: 1 });
+			return sm;
+		}
+		sm.run({ id, name: "x" });
+		if (state === "starting") return sm;
+		sm.onStarted(id);
+		if (state === "running") return sm;
+		if (state === "stopping") {
+			sm.stop(id);
+			return sm;
+		}
+		if (state === "idle") {
+			sm.onSettled(id);
+			return sm;
+		}
+		if (state === "killing") {
+			sm.kill(id);
+			return sm;
+		}
+		if (state === "done") {
+			sm.kill(id);
+			sm.onExit(id, { code: 0, signal: null, stderrTail: "" });
+			return sm;
+		}
+		// failed
+		sm.onExit(id, { code: 1, signal: null, stderrTail: "" });
+		return sm;
+	};
+	const legal = (state, fn) => {
+		try {
+			fn(machineIn(state));
+			return true;
+		} catch (e) {
+			assert.ok(e instanceof WorkerError, `${state}: 探针抛了非 WorkerError: ${e}`);
+			return false;
+		}
+	};
+	// onResumed 是事件式静默守卫(非 exited 直接 return,不抛)——按效果判定:
+	// 仅当调用导致 非starting→starting 迁移才算合法(starting 态本就在 starting,需排除)
+	const resumed = (state) => {
+		const sm = machineIn(state);
+		const before = sm.records.get(id)?.state;
+		sm.onResumed(id);
+		return before !== "starting" && sm.records.get(id)?.state === "starting";
+	};
+	const capsOf = (state) => ({
+		send: legal(state, (sm) => sm.steer(id)) || legal(state, (sm) => sm.followUp(id)) || resumed(state),
+		stop: legal(state, (sm) => sm.stop(id)),
+		kill: legal(state, (sm) => sm.kill(id)),
+		collect: legal(state, (sm) => sm.collect(id)),
+	});
+	// pane 动作值 → 能力;未登记的值直接红(新动作必须登记映射)
+	const ACTION_CAP = { 消息: "send", stop: "stop", kill: "kill", 通过: "collect", 丢弃: "collect", 强制放行: "collect", collect: "collect", 撤换: "collect" };
+
+	test("facet 与 FSM 合法集一致:不提供非法动作,不遗漏合法主路", () => {
+		for (const state of Object.keys(STATE_FACETS)) {
+			const caps = capsOf(state);
+			const facet = STATE_FACETS[state];
+			for (const a of facet.paneActions) {
+				const cap = ACTION_CAP[a.value];
+				assert.ok(cap, `${state}: 未登记的动作映射 ${a.value}`);
+				assert.ok(caps[cap], `${state}: 提供了 FSM 非法的动作 ${a.value}`);
+			}
+			const values = facet.paneActions.map((a) => a.value);
+			if (caps.stop) assert.ok(values.includes("stop"), `${state}: stop 合法但投影缺失`);
+			// idle 的 kill 是登记的例外(见 STATE_FACETS 政策注记):有 collect 时 kill 不推
+			if (caps.kill && !caps.collect) assert.ok(values.includes("kill"), `${state}: kill 是唯一终局但投影缺失`);
+			if (caps.collect) assert.ok(values.some((v) => ACTION_CAP[v] === "collect"), `${state}: collect 合法但投影缺失`);
+			if (caps.send) assert.ok(values.includes("消息"), `${state}: send 合法但投影缺失`);
+			assert.equal(facet.toolActions.includes("kill"), caps.kill && !caps.collect, `${state}: toolActions 的 kill 面`);
+			assert.equal(facet.toolActions.includes("collect"), caps.collect, `${state}: toolActions 的 collect 面`);
+			assert.equal(facet.toolActions.includes("send"), caps.send, `${state}: toolActions 的 send 面`);
+		}
+	});
+});
