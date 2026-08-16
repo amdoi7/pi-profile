@@ -1,7 +1,7 @@
-import { closeSync, fstatSync, openSync, readdirSync, readSync } from "node:fs";
-import { basename } from "node:path";
+import { appendFileSync, closeSync, fstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync } from "node:fs";
+import { basename, dirname } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { cwdFromWorkerSessionFile, ID_RE, workerSessionDir } from "./contract.ts";
+import { cwdFromWorkerSessionFile, ID_RE, workerLedgerFile, workerSessionDir } from "./contract.ts";
 import { displayNameOf } from "./present.ts";
 
 /**
@@ -13,8 +13,11 @@ import { displayNameOf } from "./present.ts";
  * 身份 = session_info 条目的 name(--name 注入的 worker id);文件名为 UUID,
  * 不做身份载体。无 session_info 身份的旧文件跳过(身份不可判定,不猜)。
  *
- * 收起标记:collect 在 session 尾部追加 pi-worker-collected 条目,扫描时排除
- * (collected 显式声明)——审计留痕与恢复去重兼得,不删文件。
+ * 双源否决(认领 = 两源皆无终态决策):
+ * - 父侧台账 worker-ledger.jsonl:bind/collect/kill 决策即落盘,重放折叠出每 id
+ *   末态;终态否决认领,bind 指针消歧同 id 多代次。写失败降级为仅靠 marker。
+ * - 收起标记:collect/kill 在 session 尾部追加 pi-worker-collected 条目,扫描排除
+ *   (尾窗逐行解析 customType 精确匹配)——审计留痕与恢复去重兼得,不删文件。
  *
  * 已知边界:同 cwd 多 TUI 窗口时,活他窗口的 worker 文件也会被认领(exited 记录,
  * 无 pid 归属可判——平铺布局的固有限制)。认领只建记录,不碰进程;危险动作
@@ -36,7 +39,18 @@ export function hasCollectedMarker(path: string): boolean {
 			const start = Math.max(0, size - TAIL_SCAN_BYTES);
 			const buf = Buffer.alloc(size - start);
 			readSync(fd, buf, 0, buf.length, start);
-			return buf.toString("utf8").includes(COLLECTED_MARKER);
+			// 精确匹配:逐行解析 customType——尾窗 substring 会把呈报文本里的
+			// 字面量(如让 worker 修改本扩展)误判为已收起,拒绝认领
+			for (const line of buf.toString("utf8").split("\n")) {
+				if (!line.includes(COLLECTED_MARKER)) continue; // 快速预筛
+				try {
+					const e = JSON.parse(line);
+					if (e?.type === "custom" && e?.customType === COLLECTED_MARKER) return true;
+				} catch {
+					// 截断行/非 JSON 跳过,继续扫
+				}
+			}
+			return false;
 		} finally {
 			closeSync(fd);
 		}
@@ -106,5 +120,60 @@ export async function scanLeftoverSessions(cwd: string): Promise<LeftoverScan> {
 		});
 	}
 	out.sessions.sort((a, b) => a.createdAt - b.createdAt);
+	return out;
+}
+
+// ---------- 父侧台账(worker-ledger):决策即落盘,重启重放 ----------
+
+/** 台账条目。bind = 握手锚定 sessionFile(新代次证据,重放时重开);
+ * collect/kill = 终态决策。无 run 条目:bind 即代次起点,run 决策无持久化信息增量。 */
+export type LedgerEntry =
+	| { type: "bind"; id: string; sessionFile: string; cwd: string; ts: number }
+	| { type: "collect"; id: string; verdict?: string; ts: number }
+	| { type: "kill"; id: string; ts: number };
+
+/** 落账(同步写,决策点调用)。写失败由调用方 catch 降级:marker/扫描 fallback 仍在,
+ * 台账只是补网不是单点。 */
+export function appendLedgerEntry(cwd: string, entry: LedgerEntry): void {
+	const file = workerLedgerFile(cwd);
+	mkdirSync(dirname(file), { recursive: true });
+	appendFileSync(file, JSON.stringify(entry) + "\n");
+}
+
+/** 读台账:文件不存在 → 空(legacy 扫描接管);坏行/未知类型跳过(前向兼容/截断写)。 */
+export function readLedger(cwd: string): LedgerEntry[] {
+	let text: string;
+	try {
+		text = readFileSync(workerLedgerFile(cwd), "utf8");
+	} catch {
+		return [];
+	}
+	const out: LedgerEntry[] = [];
+	for (const line of text.split("\n")) {
+		if (!line.trim()) continue;
+		try {
+			const e = JSON.parse(line);
+			if (typeof e?.id === "string" && (e.type === "bind" || e.type === "collect" || e.type === "kill")) out.push(e);
+		} catch {
+			// 坏行跳过
+		}
+	}
+	return out;
+}
+
+export interface LedgerDisposition {
+	settled: boolean;
+	/** 最新 bind 的审计指针(认领消歧:同 id 多代次取它) */
+	sessionFile?: string;
+	cwd?: string;
+}
+
+/** 重放折叠:每 id 取末态。bind → 开(新代次);collect/kill → 终态(否决认领)。 */
+export function dispositionsFromLedger(entries: LedgerEntry[]): Map<string, LedgerDisposition> {
+	const out = new Map<string, LedgerDisposition>();
+	for (const e of entries) {
+		if (e.type === "bind") out.set(e.id, { settled: false, sessionFile: e.sessionFile, cwd: e.cwd });
+		else out.set(e.id, { ...out.get(e.id), settled: true });
+	}
 	return out;
 }
