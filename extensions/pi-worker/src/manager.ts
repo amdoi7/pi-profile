@@ -9,7 +9,7 @@ import { spawnChild, terminate } from "./spawner.ts";
 import { WorkerError, WorkerStateMachine } from "./state-machine.ts";
 import { latestStats } from "./present.ts";
 import { parseSessionEntries } from "./transcript.ts";
-import type { CollectVerdict, RunInput, SessionEntry, WorkerRecord } from "./types.ts";
+import type { CollectVerdict, RunInput, SessionEntry, WorkerRecord, WorkerState } from "./types.ts";
 import { attachWatcher, type WorkerEvent } from "./watcher.ts";
 
 /** transcript buffer 上限(message 粒度;超限丢最旧——视图是尾窗语义,不是归档) */
@@ -26,6 +26,26 @@ interface TranscriptBuffer {
 }
 
 const ABORT_TIMEOUT_MS = 5000;
+
+/** 升级政策:宽限 → abort(尽力)→ 窗口 → terminate(SIGTERM→SIGKILL,见 spawner)。
+ * 三处共用一副骨架,差异全在参数:
+ *   stop    = 软指令两段硬兑底(30s 宽限 → abort → 15s 窗 → terminate),onlyIfState 守卫
+ *   kill    = 撤换:abort 落定才 terminate(awaitAbort,让 abort 先截停 turn)
+ *   killAll = shutdown 连带:abort 即发即忘,terminate 同步不等 */
+interface EscalationPolicy {
+	/** abort 前的宽限 ms;0 = 立即 abort */
+	graceMs: number;
+	/** fire-and-forget 模式下 abort → terminate 的窗口 ms;0 = 同步 terminate */
+	abortWindowMs: number;
+	/** true = abort 落定后才 terminate(kill 的撤换语义) */
+	awaitAbort: boolean;
+	/** 每步生效守卫:记录仍处该状态才升级(stop=stopping;kill/killAll 同步完成无窗口期,无需守卫) */
+	onlyIfState?: WorkerState;
+}
+
+const STOP_ESCALATION: EscalationPolicy = { graceMs: STOP_GRACE_MS, abortWindowMs: STOP_ABORT_WINDOW_MS, awaitAbort: false, onlyIfState: "stopping" };
+const KILL_ESCALATION: EscalationPolicy = { graceMs: 0, abortWindowMs: 0, awaitAbort: true };
+const KILLALL_ESCALATION: EscalationPolicy = { graceMs: 0, abortWindowMs: 0, awaitAbort: false };
 
 /** 握手 get_state → 记录映射(纯函数,可单测)。sessionFile 是 pi 原生会话 jsonl
  * 路径(RpcSessionState.sessionFile)——回调携带后,父的事实核验第三层
@@ -302,9 +322,6 @@ export class WorkerManager {
 	async stop(id: string): Promise<void> {
 		this.sm.stop(id);
 		this.pendingFollowUps.delete(id); // 停止语义 = 不追加新轮
-		// 代次令牌:同合约原样重跑复用同 id(终端记录被替换,新句柄),本代次的兑底
-		// 计时器 fire 时按 id 查到的已是新代次——句柄比对不一致即失效,不串扰。
-		const generation = this.handles.get(id);
 		const stopRec = this.sm.records.get(id);
 		if (stopRec) stopRec.stopStartedAt = Date.now(); // 面板倒计时起点(成功进入 stopping)
 		try {
@@ -319,22 +336,8 @@ export class WorkerManager {
 			throw e;
 		}
 		this.deps.onChange?.();
-		setTimeout(() => {
-			if (this.handles.get(id) !== generation) return;
-			const rec = this.sm.records.get(id);
-			if (!rec || rec.state !== "stopping") return;
-			const handle = this.handles.get(id);
-			if (!handle) return;
-			void this.bestEffortAbort(handle);
-			setTimeout(() => {
-				if (this.handles.get(id) !== generation) return;
-				const rec2 = this.sm.records.get(id);
-				if (!rec2 || rec2.state !== "stopping") return;
-				const handle2 = this.handles.get(id);
-				if (!handle2) return;
-				terminate(handle2.proc);
-			}, STOP_ABORT_WINDOW_MS).unref();
-		}, STOP_GRACE_MS).unref();
+		// 两段硬兑底由升级引擎承载(代次令牌内聚,换代即失效)
+		void this.escalate(id, STOP_ESCALATION);
 	}
 
 	/** message:父→子统一通道(同一功能,按接收方状态选投递语义)。
@@ -514,6 +517,36 @@ export class WorkerManager {
 		this.deps.onChange?.();
 	}
 
+	/** 升级链引擎:政策参数化 + 代次令牌内聚(fire 时句柄已换代即失效,同 id 重跑不串扰)。
+	 * 返回的 promise 仅服务 awaitAbort 模式(kill 等 terminate 落地);其余模式同步 resolve。 */
+	private escalate(id: string, policy: EscalationPolicy): Promise<void> {
+		const generation = this.handles.get(id);
+		const alive = (): Handle | undefined => {
+			const h = this.handles.get(id);
+			if (!h || h !== generation) return undefined;
+			if (policy.onlyIfState && this.sm.records.get(id)?.state !== policy.onlyIfState) return undefined;
+			return h;
+		};
+		const terminateStep = (): void => {
+			const h = alive();
+			if (h) terminate(h.proc);
+		};
+		const abortStep = (): Promise<void> => {
+			const h = alive();
+			if (!h) return Promise.resolve();
+			if (policy.awaitAbort) return this.bestEffortAbort(h).then(terminateStep);
+			void this.bestEffortAbort(h);
+			if (policy.abortWindowMs > 0) setTimeout(terminateStep, policy.abortWindowMs).unref();
+			else terminateStep();
+			return Promise.resolve();
+		};
+		if (policy.graceMs > 0) {
+			setTimeout(() => void abortStep(), policy.graceMs).unref();
+			return Promise.resolve();
+		}
+		return abortStep();
+	}
+
 	/** kill:撤换。abort(停止当前 turn)+ 终止进程;进程退出后状态 → done。
 	 * marker 在决策时落盘(显式 kill = 终态决策,重启不复活);killAll(session_shutdown)
 	 * 直调 sm.kill 不经本方法,不落标——重启认领(G1 恢复)保留。 */
@@ -525,8 +558,7 @@ export class WorkerManager {
 			throw new WorkerError(`kill failed: ${id} in legal state but missing process handle (invariant broken); rerun`);
 		}
 		this.writeCollectedMarker(id); // 决策时持久化(先于进程终止,与事件时序解耦)
-		await this.bestEffortAbort(handle);
-		terminate(handle.proc);
+		await this.escalate(id, KILL_ESCALATION);
 		this.deps.onChange?.();
 	}
 
@@ -755,14 +787,13 @@ export class WorkerManager {
 
 	/** session_shutdown:杀全部活子进程(先 kill 状态,exit 后走 done,无 failed 回调)。 */
 	killAll(): void {
-		for (const [id, handle] of this.handles) {
+		for (const [id] of this.handles) {
 			try {
 				this.sm.kill(id);
 			} catch {
 				// 已终态,忽略
 			}
-			void this.bestEffortAbort(handle);
-			terminate(handle.proc);
+			void this.escalate(id, KILLALL_ESCALATION);
 		}
 	}
 }
