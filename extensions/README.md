@@ -21,6 +21,7 @@
 ### Workflow
 
 - `btw/` — side-channel assistant overlay；提供 `/btw` 侧聊与 handoff summary。提交即清空输入框（问题移入 transcript，不等回答结束）；transcript 以 ↑/↓ 行滚动、ctrl+PgUp/ctrl+PgDn 翻页（fullscreen 下裸 PgUp/PgDn 与滚轮被 alt-screen viewport listener 抢先消费，滚的是背后主 transcript，overlay 收不到）；dialog 高度按 overlay `maxHeight` 预算裁剪，避免输入行被 TUI 从底部切掉。
+- `pi-worker/` — 子 agent worker 编排：`pi_worker` 工具（run/send/stop/collect/kill/status）+ `/pi-worker` 决策面板 + room 消息平面；8 态 FSM，状态面单一来源 `STATE_FACETS`（投影漂移有一致性红测试）；终态决策在 API 边同步落盘（worker-ledger 台账 + session marker 双源否决），`killAll` 零持久化副作用，重启认领（G1）与冷恢复（O3）存活。
 - `session-breakdown/` — session/context inspection UI；统计 sessions、messages、tokens、cost 与 model/cwd/time breakdown。
 
 ### UI polish
