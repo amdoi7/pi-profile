@@ -6,7 +6,7 @@ import { join } from "node:path";
 
 import { registerSelf } from "../src/registry.ts";
 import { WindowQuota } from "../../_shared/window-quota.ts";
-import { buildInjectedContent, registerPeerTool } from "../src/tool.ts";
+import { buildInjectedContent, registerPeerTool } from "../src/peer-tool.ts";
 import { socketPathFor, startPeerServer } from "../src/transport.ts";
 
 /** 测试基建:假 pi 抓 registerTool,真 socket 服务端扮演收方(端到端走协议)。 */
@@ -84,6 +84,21 @@ describe("pi_peer 工具", () => {
 		srv.close();
 	});
 
+	test("发送失败不记账:被拒后同文重试成功(重复抑制不误伤 retry)", async () => {
+		const path = socketPathFor("target-retry-test");
+		const srv = await startPeerServer(path, async () => {
+			throw new Error("注入失败");
+		});
+		const { exec } = setup([peer({ sessionId: "t-retry", name: "audit", socketPath: path })]);
+		await assert.rejects(exec({ action: "send", to: "audit", text: "同文" }), /peer rejected/);
+		srv.close();
+		// 同一目标同一文本:修复后重试 —— 若失败计了账,60s 内必被 repeat 拦截
+		const srv2 = await startPeerServer(path, async () => {});
+		const res = await exec({ action: "send", to: "audit", text: "同文" });
+		assert.ok(res.content[0].text.includes("accepted by audit"), "重试放行,同文不重复抑制");
+		srv2.close();
+	});
+
 	test("端到端:真 socket 收方——send 成功即对方 handler 已收,注入文本带安全声明", async () => {
 		const got = [];
 		const path = socketPathFor("target-e2e-test");
@@ -93,7 +108,8 @@ describe("pi_peer 工具", () => {
 		});
 		const { exec } = setup([peer({ sessionId: "target-target-target", name: "audit", socketPath: path })]);
 		const res = await exec({ action: "send", to: "audit", text: "schema 迁移完成,tenant_id 已落" });
-		assert.ok(res.content[0].text.includes("delivered to audit") && res.content[0].text.includes("injected into its session"));
+		assert.ok(res.content[0].text.includes("accepted by audit"), res.content[0].text);
+		assert.ok(res.content[0].text.includes("injection is asynchronous"), "两阶段投递语义进文案");
 		assert.equal(got.length, 1);
 		assert.equal(got[0].text, "schema 迁移完成,tenant_id 已落");
 		assert.equal(got[0].from.name, "main");

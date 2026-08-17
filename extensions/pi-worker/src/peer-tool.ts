@@ -56,7 +56,7 @@ export function registerPeerTool(pi: ExtensionAPI, getRt: () => PeerRuntime | un
 		label: "Peer",
 		description:
 			"Message other pi sessions on this machine (Claude cross-session peers): action=list discovers online sessions (the entry point — always list first) — " +
-			"send delivers synchronously — success means it was injected into the peer's session (failures fail loudly: offline/rejected/timeout); text states who you are, what you want, relevant paths; " +
+			"send delivers asynchronously — success means the peer accepted the message for delivery into its session (injection happens there; a delivery failure returns as a peer-message receipt; failures fail loudly: offline/rejected/timeout); text states who you are, what you want, relevant paths; " +
 			"mode selects delivery (enum is semantics, same vocabulary as worker messages; default followUp). " +
 			"Quota: 10 msgs per 5min per pair; identical text within 60s is dropped; mode=quiet does not count. " +
 			"Replies (if any) return as peer messages to this session. No injected roster — action=list to discover online peers first, address by name/sessionId prefix.",
@@ -101,13 +101,17 @@ export function registerPeerTool(pi: ExtensionAPI, getRt: () => PeerRuntime | un
 				mode: p.mode ?? "followUp",
 				ts: now,
 			};
-			// 同步投递:成功返回 = 对方已注入;不可达/被拒/超时抛错显形
+			// 同步投递:成功返回 = 对方进程已接管(排队注入);不可达/被拒/超时抛错显形
 			await sendPeerMessage(target.peer.socketPath, msg);
+			if (p.mode !== "quiet") {
+				// 送达成功才记账:失败尝试不烧配额、不刷新同文基线,重试可放行
+				rt.quota.commit(`${rt.self.sessionId}→${target.peer.sessionId}`, msg.text, now);
+			}
 			return {
 				content: [
 					{
 						type: "text",
-						text: `delivered to ${target.peer.name ?? target.peer.sessionId.slice(0, 8)} and injected into its session (${p.mode === "quiet" ? "silent, no wake" : p.mode === "steer" ? "injected into current turn, no queue" : "peer woken"}); reply (if any) returns as a peer message.`,
+						text: `accepted by ${target.peer.name ?? target.peer.sessionId.slice(0, 8)} (${p.mode === "quiet" ? "silent, no wake" : p.mode === "steer" ? "injected into current turn, no queue" : "peer woken"}); injection is asynchronous — a delivery failure returns as a peer-message receipt; reply (if any) returns as a peer message.`,
 					},
 				],
 				details: { to: target.peer.sessionId, mode: p.mode ?? "followUp" },

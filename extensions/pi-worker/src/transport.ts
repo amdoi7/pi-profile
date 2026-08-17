@@ -5,10 +5,11 @@ import { join } from "node:path";
 
 /**
  * 跨进程投递:每会话一个 unix domain socket,窄协议 NDJSON(一连接一消息)。
- * 语义:同步往返——写消息 → 对方注入成功才回 ack → 连接关闭。
+ * 语义:同步往返——写消息 → 对方进程接管(排队注入)即回 ack → 连接关闭。
  * fail-fast 取代 durability(消息是摘要文本,丢失必须显形而非永生):
  * - 连接拒绝 = 对方已下线(发送方立即显式失败,无黑洞);
- * - ack 前连接断/超时 = 状态不明,发送方自查后重试(重复无害);
+ * - ack 前连接断/超时 = 状态不明,发送方自查后重试(失败不记账,重复无害);
+ * - 异步注入失败(ack 后)由接收方以回执消息回送发送方,不静默;
  * - 不暴露 pi RPC 面:本协议只有一个动词(投递文本)。
  */
 
@@ -93,7 +94,7 @@ export async function startPeerServer(
 					if (!isPeerMessage(msg)) {
 						reply = JSON.stringify({ ok: false, error: "invalid message shape (need from.sessionId + text + mode)" });
 					} else {
-						await handler(msg); // 注入成功才 ack:ack = 已送达
+						await handler(msg); // handler 返回即 ack:ack = 已接管(注入异步,失败另有回执)
 						reply = JSON.stringify({ ok: true });
 					}
 				} catch (e) {

@@ -3,11 +3,15 @@ import {
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
+import { WindowQuota } from "../_shared/window-quota.ts";
 import { registerWorkerMessagingTool } from "./src/messaging.ts";
-import { WorkerManager } from "./src/manager.ts";
+	import { WorkerManager } from "./src/manager.ts";
 import { openWorkerPane, registerWorkerPaneCommand } from "./src/pane.ts";
 import { formatCallbackView, formatFooter, toastFor } from "./src/present.ts";
+import { peersRoot, registerSelf, unregisterSelf, type PeerInfo } from "./src/registry.ts";
 import { registerPiWorkerTool } from "./src/tool.ts";
+import { sendPeerMessage, socketPathFor, startPeerServer, type PeerServer } from "./src/transport.ts";
+import { buildInjectedContent, PEER_SEND_QUOTA, registerPeerTool, type PeerRuntime } from "./src/peer-tool.ts";
 import type { WorkerRecord } from "./src/types.ts";
 
 interface UiLike {
@@ -68,6 +72,10 @@ export default function (pi: ExtensionAPI): void {
 	});
 	registerPiWorkerTool(pi, manager);
 	registerWorkerPaneCommand(pi, manager);
+	// peer:同机 session 互发消息的 socket 服务
+	const quota = new WindowQuota(PEER_SEND_QUOTA);
+	let rt: PeerRuntime | undefined;
+	let server: PeerServer | undefined;
 	// 入口复用:footer 的 /pi-worker 是纯文本,alt+w 是唯一可交互通道(peer chat 入口)。
 	// alt+w 未被 pi 默认/编辑器占用(ctrl+w 被编辑器删词占用);键冲突由 runner 诊断。
 	pi.registerShortcut("alt+w", {
@@ -97,13 +105,59 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("session_start", async (_event, ctx) => {
 		ui = ctx.ui;
 		theme = ctx.ui.theme as unknown as ThemeLike;
-		// 重启认领:父重启后子进程随父死(stdin EOF 自退),session jsonl 在磁盘——
-		// 重建 exited 记录,send 唤醒(--session 同文件冷恢复)或 collect 清账,审计不丢。
+		// worker:重启认领(父重启后子进程随父死,session jsonl 在磁盘)
 		const n = await manager.claimLeftovers(ctx.cwd);
 		if (n > 0 && ui) ui.notify(`${n} leftover worker session(s) recovered from disk: send to wake (cold-resume) or collect to clear`, "info");
 		refreshFooter();
+		// peer:注册 + socket 收信服务(吸收自原 pi-peer/index.ts)
+		const sessionId = ctx.sessionManager.getSessionId();
+		const self: PeerInfo = {
+			v: 2,
+			sessionId,
+			name: ctx.sessionManager.getSessionName() ?? undefined,
+			cwd: ctx.cwd,
+			sessionFile: ctx.sessionManager.getSessionFile() ?? undefined,
+			socketPath: socketPathFor(sessionId),
+			startedAt: Date.now(),
+		};
+		rt = { root: peersRoot(), self, quota };
+		server = await startPeerServer(self.socketPath, async (msg) => {
+			const opts:
+				| { deliverAs: "followUp" | "steer"; triggerTurn: boolean }
+				| undefined = msg.mode === "quiet" ? undefined : { deliverAs: msg.mode === "steer" ? "steer" : "followUp", triggerTurn: true };
+			void Promise.resolve(
+				pi.sendMessage(
+					{
+						customType: "pi-peer",
+						display: true,
+						content: buildInjectedContent(msg),
+						details: { from: msg.from, mode: msg.mode, ts: msg.ts },
+					},
+					opts,
+				),
+			).catch((e: unknown) => {
+				void sendPeerMessage(socketPathFor(msg.from.sessionId), {
+					from: { sessionId: self.sessionId, name: self.name, cwd: self.cwd },
+					text: `delivery failure report: ${e instanceof Error ? e.message : String(e)}; not injected: ${msg.text.slice(0, 200)}`,
+					mode: "quiet",
+					ts: Date.now(),
+				}).catch(() => {});
+			});
+		});
+		if (server.serving) {
+			registerSelf(rt.root, self);
+		} else if (ctx.hasUI) {
+			ctx.ui.notify("pi-peer: 本会话已有另一进程在线,收信已退让(发送不受影响)", "warning");
+		}
 	});
 	pi.on("session_shutdown", () => {
+		// peer:关闭 socket 服务 + 注销注册
+		const wasServing = server?.serving === true;
+		server?.close();
+		server = undefined;
+		if (rt && wasServing) unregisterSelf(rt.root, rt.self.sessionId);
+		rt = undefined;
+		// worker:清 UI + killAll
 		ui = undefined;
 		theme = undefined;
 		if (liveTick) {
@@ -112,4 +166,5 @@ export default function (pi: ExtensionAPI): void {
 		}
 		manager.killAll();
 	});
+	registerPeerTool(pi, () => rt);
 }
