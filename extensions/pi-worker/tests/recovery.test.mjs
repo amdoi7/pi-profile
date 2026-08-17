@@ -33,11 +33,9 @@ describe("scanLeftoverSessions(重启认领:磁盘 jsonl → 遗留 worker 身�
 		const cwd = mkdtempSync(join(tmpdir(), "piw-rec-"));
 		const dir = dirFor(cwd);
 		fixture(dir, "a.jsonl", [HEADER, INFO("pi-worker-hank#0123456789ab"), MSG]);
-		const { sessions, skipped, collected } = await scanLeftoverSessions(cwd);
-		assert.deepEqual(skipped, []);
-		assert.deepEqual(collected, []);
-		assert.equal(sessions.length, 1);
-		const s = sessions[0];
+		const result = await scanLeftoverSessions(cwd);
+		assert.equal(result.length, 1);
+		const s = result[0];
 		assert.equal(s.id, "pi-worker-hank#0123456789ab");
 		assert.equal(s.name, "hank");
 		assert.equal(s.sessionFile, join(dir, "a.jsonl"));
@@ -46,18 +44,16 @@ describe("scanLeftoverSessions(重启认领:磁盘 jsonl → 遗留 worker 身�
 	});
 
 	test("目录不存在 → 空结果(无遗留是合法态,不报错)", async () => {
-		const { sessions, skipped } = await scanLeftoverSessions(join(tmpdir(), `piw-rec-missing-${Date.now()}`));
-		assert.deepEqual(sessions, []);
-		assert.deepEqual(skipped, []);
+		const result = await scanLeftoverSessions(join(tmpdir(), `piw-rec-missing-${Date.now()}`));
+		assert.deepEqual(result, []);
 	});
 
 	test("已 collect 的文件排除(恢复去重,审计保留)", async () => {
 		const cwd = mkdtempSync(join(tmpdir(), "piw-rec-"));
 		const dir = dirFor(cwd);
 		fixture(dir, "a.jsonl", [HEADER, INFO("pi-worker-hank#0123456789ab"), MSG, COLLECTED]);
-		const { sessions, collected } = await scanLeftoverSessions(cwd);
-		assert.deepEqual(sessions, []);
-		assert.equal(collected.length, 1);
+		const result = await scanLeftoverSessions(cwd);
+		assert.equal(result.length, 0, "已收起文件不认领");
 	});
 
 	test("非 worker session(name 不匹配 worker id)与坏文件跳过", async () => {
@@ -65,18 +61,16 @@ describe("scanLeftoverSessions(重启认领:磁盘 jsonl → 遗留 worker 身�
 		const dir = dirFor(cwd);
 		fixture(dir, "regular.jsonl", [HEADER, INFO("regular-session"), MSG]);
 		writeFileSync(join(dir, "broken.jsonl"), "{not json\n");
-		const { sessions, skipped } = await scanLeftoverSessions(cwd);
-		assert.deepEqual(sessions, []);
-		assert.equal(skipped.length, 2);
+		const result = await scanLeftoverSessions(cwd);
+		assert.equal(result.length, 0, "非 worker/坏文件全部跳过");
 	});
 
 	test("无 session_info 身份的旧文件跳过(身份不可判定,不猜)", async () => {
 		const cwd = mkdtempSync(join(tmpdir(), "piw-rec-"));
 		const dir = dirFor(cwd);
 		fixture(dir, "old.jsonl", [HEADER, MSG]);
-		const { sessions, skipped } = await scanLeftoverSessions(cwd);
-		assert.deepEqual(sessions, []);
-		assert.equal(skipped.length, 1);
+		const result = await scanLeftoverSessions(cwd);
+		assert.equal(result.length, 0, "无身份文件跳过");
 	});
 
 	test("多文件按 createdAt 排序(认领顺序确定性)", async () => {
@@ -84,8 +78,8 @@ describe("scanLeftoverSessions(重启认领:磁盘 jsonl → 遗留 worker 身�
 		const dir = dirFor(cwd);
 		fixture(dir, "later.jsonl", [{ ...HEADER, timestamp: "2026-08-12T12:00:00.000Z" }, INFO("pi-worker-b#bbbbbbbbbbbb"), MSG]);
 		fixture(dir, "earlier.jsonl", [{ ...HEADER, timestamp: "2026-08-12T09:00:00.000Z" }, INFO("pi-worker-a#aaaaaaaaaaaa"), MSG]);
-		const { sessions } = await scanLeftoverSessions(cwd);
-		assert.deepEqual(sessions.map((s) => s.name), ["a", "b"]);
+		const result = await scanLeftoverSessions(cwd);
+		assert.deepEqual(result.map((s) => s.name), ["a", "b"]);
 	});
 
 	test("hasCollectedMarker:大文件尾部标记也能命中(64KB 尾窗)", () => {

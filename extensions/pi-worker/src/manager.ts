@@ -182,7 +182,7 @@ export class WorkerManager {
 	 * send 冷恢复 / collect 清账是记录的合法出路)。幂等:已存在 id 跳过;
 	 * 唯一否决源 = 文件尾部 COLLECTED_MARKER;同 id 多代次取最新 createdAt。 */
 	async claimLeftovers(cwd: string): Promise<number> {
-		const { sessions } = await scanLeftoverSessions(cwd);
+		const sessions = await scanLeftoverSessions(cwd);
 		// 同 id 多文件 = 多代次遗留:取最新代次(旧实现先到先得,readdir 序不定)
 		const byId = new Map<string, LeftoverSession[]>();
 		for (const s of sessions) {

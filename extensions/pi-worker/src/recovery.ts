@@ -100,46 +100,27 @@ export interface LeftoverSession {
 	createdAt: number;
 }
 
-export interface LeftoverScan {
-	sessions: LeftoverSession[];
-	/** 非 worker/无身份的 jsonl(相对基目录文件名) */
-	skipped: string[];
-	/** 已收起的文件(恢复去重,审计保留) */
-	collected: string[];
-}
-
-/**
- * 扫描 <cwd>/.pi/worker-sessions 平铺 *.jsonl,认领可恢复的遗留 worker session。
- * 目录不存在 = 无遗留(合法态,不报错)。结果按 createdAt 排序(确定性)。
- */
-export async function scanLeftoverSessions(cwd: string): Promise<LeftoverScan> {
+/** 扫描 <cwd>/.pi/worker-sessions 平铺 *.jsonl,返回可认领的遗留 worker session。
+ * 目录不存在 = 空数组(合法态,不报错)。结果按 createdAt 排序(确定性)。
+ * 跳过:非 session 文件/无身份的 session/已收起的文件(尾窗精确匹配 COLLECTED_MARKER)。 */
+export async function scanLeftoverSessions(cwd: string): Promise<LeftoverSession[]> {
 	const dir = workerSessionDir(cwd);
-	const out: LeftoverScan = { sessions: [], skipped: [], collected: [] };
 	let files: string[];
 	try {
 		files = readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
 	} catch {
-		return out;
+		return [];
 	}
-	if (files.length === 0) return out;
-	// listAll(dir):custom sessionDir 路径(worker-sessions 是专属目录,平铺)
+	if (files.length === 0) return [];
 	const infos = await SessionManager.listAll(dir);
 	const byFile = new Map(infos.map((i) => [basename(i.path), i]));
+	const sessions: LeftoverSession[] = [];
 	for (const f of files) {
 		const info = byFile.get(f);
-		if (!info || !Number.isFinite(info.created.getTime())) {
-			out.skipped.push(f); // native 判定非 session(首行非 session header / 不可解析)
-			continue;
-		}
-		if (!info.name || !ID_RE.test(info.name)) {
-			out.skipped.push(f); // 合法 session 但非 worker(无身份 / 非 worker id)
-			continue;
-		}
-		if (hasCollectedMarker(info.path)) {
-			out.collected.push(f); // 已收起:恢复去重,审计保留
-			continue;
-		}
-		out.sessions.push({
+		if (!info || !Number.isFinite(info.created.getTime())) continue;
+		if (!info.name || !ID_RE.test(info.name)) continue;
+		if (hasCollectedMarker(info.path)) continue;
+		sessions.push({
 			id: info.name,
 			name: displayNameOf(info.name),
 			sessionFile: info.path,
@@ -147,6 +128,6 @@ export async function scanLeftoverSessions(cwd: string): Promise<LeftoverScan> {
 			createdAt: info.created.getTime(),
 		});
 	}
-	out.sessions.sort((a, b) => a.createdAt - b.createdAt);
-	return out;
+	sessions.sort((a, b) => a.createdAt - b.createdAt);
+	return sessions;
 }
