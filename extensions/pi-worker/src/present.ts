@@ -593,16 +593,18 @@ export type ActionOp =
 	| { kind: "verdict"; verdict: CollectVerdict; audit: string; text: string }
 	| { kind: "replacement"; audit: string; text: string };
 
-/** 判决数据表:三个 verdict 分支结构相同,差异在此声明 */
+/** 判决/特殊动作数据表:查表即出 ActionOp,无需 switch */
 const VERDICT_TABLE: Record<string, { verdict: CollectVerdict; status: string; hint?: string }> = {
 	通过: { verdict: "通过", status: "closed", hint: "按 Deliverable 契约" },
 	丢弃: { verdict: "丢弃", status: "rejected" },
 	强制放行: { verdict: "强制放行", status: "closed" },
 };
 
+
 export function opFor(action: WorkerAction, id: string, input?: string): ActionOp {
+	// 判决:查表出 verdict + inject 文案
 	const v = VERDICT_TABLE[action.value];
-	if (v) {
+	if (v)
 		return {
 			kind: "verdict",
 			verdict: v.verdict,
@@ -614,23 +616,21 @@ export function opFor(action: WorkerAction, id: string, input?: string): ActionO
 				(action.value === "强制放行" && input ? ` 连同理由` : "") +
 				` 落相关 deliverable frontmatter${v.verdict === "通过" ? "(无对应 issue 豁免)" : ""}`,
 		};
+	// 消息:唯一需要 input 的动作
+	if (action.value === "消息") {
+		const msg = input ?? "";
+		return { kind: "message", message: msg, audit: `已对 ${id} 发送 message:${msg}` };
 	}
-	switch (action.value) {
-		case "消息":
-			return { kind: "message", message: input ?? "", audit: `已对 ${id} 发送 message:${input ?? ""}` };
-		case "stop":
-		case "kill":
-		case "collect":
-			return { kind: action.value, audit: formatActionMessage(id, action.value) };
-		case "撤换":
-			// 清账 collect 由面板机械执行;归因分类是父 agent 判断(AGENTS.md 归因分流),菜单不替父分类
-			return {
-				kind: "replacement",
-				audit: `已对 ${id} 撤换并清账`,
-				text: `对 ${id} 已执行撤换并清账(collect 完成)。请按归因分流处置:重派或收尾`,
-			};
-		default:
-			throw new WorkerError(`未知动作: ${action.value}`);
-	}
+	// 撤换:清账 collect + 归因指引注入
+	if (action.value === "撤换")
+		return {
+			kind: "replacement",
+			audit: `已对 ${id} 撤换并清账`,
+			text: `对 ${id} 已执行撤换并清账(collect 完成)。请按归因分流处置:重派或收尾`,
+		};
+	// 机械动作:stop/kill/collect → kind 与 action.value 同名
+	if (action.value === "stop" || action.value === "kill" || action.value === "collect")
+		return { kind: action.value, audit: formatActionMessage(id, action.value) };
+	throw new WorkerError(`未知动作: ${action.value}`);
 }
 
