@@ -22,6 +22,9 @@ jsonl 落 `<cwd>/.pi/worker-sessions`(审计、冷恢复历史与重启认领的
 - `room-bus.ts` — room 消息管道:一种语义(异步 fire-and-forget),地址 = name/id/"parent"。
 - `messaging.ts` — worker 侧 `send_message` 工具;父 watcher 经工具名原生识别,无信封。
 - `contract.ts` — 合约纯函数:id/name RE、时限常量单一事实源、prompt 构建、路径约定。
+- `registry.ts` — 同机会话名册(session_start 注册原子落盘、shutdown 注销;活性 = 读时探 socket)。
+- `transport.ts` — socket 窄协议:投递→接管→ack 同步往返;收信注入经 pi.sendMessage。
+- `peer-tool.ts` — `pi_peer` 工具(list 发现在线 peer / send 投递消息);配额与唤醒语义。
 
 ## 状态机(8 态,每态 = 唯一动作面 × 唯一解析事件 × 唯一父可见信号)
 
