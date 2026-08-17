@@ -593,30 +593,29 @@ export type ActionOp =
 	| { kind: "verdict"; verdict: CollectVerdict; audit: string; text: string }
 	| { kind: "replacement"; audit: string; text: string };
 
+/** 判决数据表:三个 verdict 分支结构相同,差异在此声明 */
+const VERDICT_TABLE: Record<string, { verdict: CollectVerdict; status: string; hint?: string }> = {
+	通过: { verdict: "通过", status: "closed", hint: "按 Deliverable 契约" },
+	丢弃: { verdict: "丢弃", status: "rejected" },
+	强制放行: { verdict: "强制放行", status: "closed" },
+};
+
 export function opFor(action: WorkerAction, id: string, input?: string): ActionOp {
+	const v = VERDICT_TABLE[action.value];
+	if (v) {
+		return {
+			kind: "verdict",
+			verdict: v.verdict,
+			audit: `已对 ${id} 判决「${action.value}」并收尾`,
+			text:
+				`对 ${id} 的「${action.value}」判决已执行(collect 完成,verdict=${v.verdict} 已落记录)` +
+				(action.value === "强制放行" && input ? `(理由:${input})` : "") +
+				`. ${v.hint ? v.hint + " 将" : "请将"} verdict=${v.verdict}、status=${v.status}` +
+				(action.value === "强制放行" && input ? ` 连同理由` : "") +
+				` 落相关 deliverable frontmatter${v.verdict === "通过" ? "(无对应 issue 豁免)" : ""}`,
+		};
+	}
 	switch (action.value) {
-		case "通过":
-			// collect 由面板机械执行(反馈即实际状态);frontmatter 落笔仍归父 agent(审查闭环事实源)
-			return {
-				kind: "verdict",
-				verdict: "通过",
-				audit: `已对 ${id} 判决「通过」并收尾`,
-				text: `对 ${id} 的「通过」判决已执行(collect 完成,verdict=通过 已落记录)。请按 Deliverable 契约将 verdict=通过、status=closed 落相关 deliverable frontmatter(无对应 issue 豁免)`,
-			};
-		case "强制放行":
-			return {
-				kind: "verdict",
-				verdict: "强制放行",
-				audit: `已对 ${id} 判决「强制放行」并收尾`,
-				text: `对 ${id} 的「强制放行」判决已执行(collect 完成,verdict=强制放行 已落记录)${input ? `(理由:${input})` : ""}。请将 verdict=强制放行、status=closed 连同理由落相关 deliverable frontmatter`,
-			};
-		case "丢弃":
-			return {
-				kind: "verdict",
-				verdict: "丢弃",
-				audit: `已对 ${id} 判决「丢弃」并收尾`,
-				text: `对 ${id} 的「丢弃」判决已执行(collect 完成,verdict=丢弃 已落记录)。请将 verdict=丢弃、status=rejected 落相关 deliverable frontmatter`,
-			};
 		case "消息":
 			return { kind: "message", message: input ?? "", audit: `已对 ${id} 发送 message:${input ?? ""}` };
 		case "stop":
