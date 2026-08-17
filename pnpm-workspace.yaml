@@ -9,3 +9,7 @@ allowBuilds:
   esbuild: true
   "@google/genai": true
   protobufjs: true
+
+# 强制 workspace 内所有 @earendil-works/pi-ai 解析到最新版，只保留一份。
+overrides:
+  "@earendil-works/pi-ai": "0.84.2"
