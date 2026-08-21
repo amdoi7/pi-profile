@@ -18,14 +18,14 @@
 
 // 运行时 note: pi 扩展加载器把 `@earendil-works/pi-ai` 顶层别名到 compat 入口
 // （compat 是 core 的严格超集），且没有 `./api/*` 子路径映射——所以
-// `openAICompletionsApi` 必须从顶层取。
-import { createProvider, openAICompletionsApi } from "@earendil-works/pi-ai";
-import type { ApiKeyCredential, AuthResult, Model, ProviderAuthInteraction } from "@earendil-works/pi-ai";
+// `openAICompletionsApi`/`anthropicMessagesApi` 必须从顶层取。
+import { anthropicMessagesApi, createProvider, openAICompletionsApi } from "@earendil-works/pi-ai";
+import type { ApiKeyCredential, AuthResult, Model, ProviderAuthInteraction, ThinkingLevelMap } from "@earendil-works/pi-ai";
 import { CONFIG_DIR_NAME, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
 import { chmod, readFile, rename, stat, writeFile } from "node:fs/promises";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -36,6 +36,7 @@ import { promisify } from "node:util";
 
 const SETTINGS_PATH = join(homedir(), ".mirasim", "setting.json");
 const AUTH_JSON_PATH = join(homedir(), CONFIG_DIR_NAME, "agent", "auth.json");
+const ANALYTICS_DIR = join(homedir(), ".mirasim", "analytics");
 const KEYCHAIN_SERVICE = "mirasim";
 const KEYCHAIN_ACCOUNT = "config-secret-key";
 const RELAY_BASE = "https://mirasim-relay.mirofish.ai/v1";
@@ -43,6 +44,10 @@ const ADMIN_REFRESH_URL = "https://admin.test.mirofish.ai/auth/refresh";
 const TOKEN_PREFIX = "mrs1:";
 const ACCESS_TOKEN_TTL_SEC = 3600; // 文档约定：access token 有效期 1 小时
 const REFRESH_MARGIN_MS = 5 * 60 * 1000; // 剩余不足 5 分钟即刷新，避免边界竞态
+// relay 的 /v1/messages 用 x-mirasim-client 头识别“mirasim 客户端”，缺失则直接
+// 401 client_outdated“this request must be signed”（实测：头只要存在即可，内容不校验）。
+const CLIENT_HEADER = "x-mirasim-client";
+const FALLBACK_CLIENT_VERSION = "pi-extension";
 
 const execFileAsync = promisify(execFile);
 
@@ -322,15 +327,17 @@ async function getFreshAccessToken(signal?: AbortSignal): Promise<string | null>
 // Model definitions
 // ---------------------------------------------------------------------------
 
-// 本地构造的模型形状，受 Model<"openai-completions"> 约束：若 PiModel 不满足
-// 接口，tsc 会立即报错（依赖升级时此处是最早的断点）。
-interface PiModel extends Model<"openai-completions"> {}
+// 本地构造的模型形状，各自受 Model<对应 api> 约束：若任一模型不满足接口，
+// tsc 会立即报错（依赖升级时此处是最早的断点）。
+type PiModel =
+  | (Model<"openai-completions"> & { api: "openai-completions" })
+  | (Model<"anthropic-messages"> & { api: "anthropic-messages" });
 
 // 只暴露这三个模型（实测 relay 对其余模型不兼容）
 const MIRASIM_MODEL_IDS = new Set(["gpt-5.6-sol", "claude-fable-5", "claude-opus-5"]);
 
 // 只映射 high + max 两级；其余级别隐藏（null），off 不发送参数（模型默认行为）
-const THINKING_LEVEL_MAP: PiModel["thinkingLevelMap"] = {
+const THINKING_LEVEL_MAP: ThinkingLevelMap = {
   off: null,
   minimal: null,
   low: null,
@@ -340,28 +347,57 @@ const THINKING_LEVEL_MAP: PiModel["thinkingLevelMap"] = {
   max: "max",
 };
 
+// claude 系必须走 Anthropic Messages API（relay 对 openai 端点直接 400），
+// gpt 系走 OpenAI Completions。mixed provider 由 createProvider 的 api map 分发。
+const CLAUDE_IDS = new Set(["claude-fable-5", "claude-opus-5"]);
+
 // 模型元数据全部本地构造（白名单固定），relay 的 /models 只确认兼容性，不提供新信息
 function buildLocalModels(): PiModel[] {
-  return [...MIRASIM_MODEL_IDS].map((id) => ({
-    id,
-    name: id,
-    provider: "mirasim",
-    // createProvider 的模型不会继承 provider 级 baseUrl，必须显式携带，
-    // 否则 pi 的 provider-attribution 在 model.baseUrl.includes() 处崩溃
-    baseUrl: RELAY_BASE,
-    api: "openai-completions" as const,
-    reasoning: true,
-    thinkingLevelMap: { ...THINKING_LEVEL_MAP },
-    // 实测：claude 系拒绝 reasoning_effort，接受 reasoning:{effort}（openrouter 格式）；
-    // gpt 系相反。relay 对 max_completion_tokens 全系接受，无需改 maxTokensField。
-    compat: id.startsWith("claude")
-      ? { thinkingFormat: "openrouter", supportsReasoningEffort: true }
-      : { supportsReasoningEffort: true },
-    input: ["text"] as ("text" | "image")[],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 128000,
-    maxTokens: 16384,
-  }));
+  return [...MIRASIM_MODEL_IDS].map((id) => {
+    const isClaude = CLAUDE_IDS.has(id);
+    return {
+      id,
+      name: id,
+      provider: "mirasim",
+      // createProvider 的模型不会继承 provider 级 baseUrl，必须显式携带，
+      // 否则 pi 的 provider-attribution 在 model.baseUrl.includes() 处崩溃
+      baseUrl: RELAY_BASE,
+      api: isClaude ? ("anthropic-messages" as const) : ("openai-completions" as const),
+      reasoning: true,
+      thinkingLevelMap: { ...THINKING_LEVEL_MAP },
+      // claude 系：原生 anthropic API 自带 thinking 语义，无需 thinkingFormat hack；
+      // 只关掉 temperature（opus 4.7+ 拒绝非默认值）。gpt 系：支持 reasoning_effort。
+      compat: isClaude ? { supportsTemperature: false } : { supportsReasoningEffort: true },
+      input: ["text"] as ("text" | "image")[],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 128000,
+      maxTokens: 16384,
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Client version header（relay 客户端识别）
+// ---------------------------------------------------------------------------
+
+/**
+ * 尽力读 app 心跳文件里的真实 appVersion 作为 x-mirasim-client 值；
+ * 失败回退固定标识（实测 relay 只检查头存在，不校验内容）。
+ * 同步实现：启动时一次解析，成本可忽略。
+ */
+function resolveClientVersion(): string {
+  try {
+    const entries = readdirSync(ANALYTICS_DIR);
+    for (const name of entries.sort()) {
+      const path = join(ANALYTICS_DIR, name);
+      const text = readFileSync(path, "utf8");
+      const m = text.match(/"appVersion":"([^"]+)"/);
+      if (m) return m[1];
+    }
+  } catch {
+    // 目录不存在/不可读：回退
+  }
+  return FALLBACK_CLIENT_VERSION;
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +407,8 @@ function buildLocalModels(): PiModel[] {
 export default function (pi: ExtensionAPI) {
   // 模型列表由白名单本地构造，启动零网络；凭据在每次请求时由 resolve() 实时解析
   const models = buildLocalModels();
+  // relay 的 anthropic /v1/messages 必须有 x-mirasim-client 头，缺失即 401
+  const clientHeaders = { [CLIENT_HEADER]: resolveClientVersion() };
 
   // 后台尽力把凭据写入 pi 凭据（不阻塞启动；失败下次启动重试）
   void (async () => {
@@ -389,7 +427,14 @@ export default function (pi: ExtensionAPI) {
       id: "mirasim",
       name: "Mirasim",
       baseUrl: RELAY_BASE,
-      api: openAICompletionsApi(),
+      // 每个请求带客户端标识头：anthropic 端点的身份检查（缺失 → 401 client_outdated）
+      headers: clientHeaders,
+      // mixed provider：按 model.api 分发给对应实现（mira relay 的 claude 模型
+      // 只接受 Anthropic Messages API，见 buildLocalModels 注释）
+      api: {
+        "openai-completions": openAICompletionsApi(),
+        "anthropic-messages": anthropicMessagesApi(),
+      },
       models,
       auth: {
         apiKey: {
