@@ -403,7 +403,10 @@ function resolveClientVersion(): string {
 export default function (pi: ExtensionAPI) {
   // 模型列表由白名单本地构造，启动零网络；凭据在每次请求时由 resolve() 实时解析
   const models = buildLocalModels();
-  // relay 的 anthropic /v1/messages 必须有 x-mirasim-client 头，缺失即 401
+  // relay 的 anthropic /v1/messages 必须有 x-mirasim-client 头，缺失即 401。
+  // 真实请求链路（model-runtime.prepareRequest）只合 auth.headers（resolve 的
+  // 返回值）+ 调用方 headers，不读 provider.headers——所以该头必须从 resolve
+  // 返回，provider.headers 保留仅为兼容其它可能读取它的层。
   const clientHeaders = { [CLIENT_HEADER]: resolveClientVersion() };
 
   // 后台尽力把凭据写入 pi 凭据（不阻塞启动；失败下次启动重试）
@@ -438,11 +441,12 @@ export default function (pi: ExtensionAPI) {
             return { type: "api_key", key: tokens.access };
           },
 
-          // 每次请求前调用：解密本地凭据，过期则实时刷新并写回，永远返回最新 token
+          // 每次请求前调用：解密本地凭据，过期则实时刷新并写回，永远返回最新 token。
+          // x-mirasim-client 头随 auth.headers 带出（prepareRequest 合并 auth.headers）
           async resolve({ signal }) {
             const token = await getFreshAccessToken(signal);
             if (!token) return undefined;
-            return { auth: { apiKey: token }, source: "~/.mirasim/setting.json" };
+            return { auth: { apiKey: token, headers: clientHeaders }, source: "~/.mirasim/setting.json" };
           },
         },
       },
