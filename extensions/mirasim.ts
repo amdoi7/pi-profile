@@ -362,9 +362,12 @@ function buildLocalModels(): PiModel[] {
     api: "anthropic-messages",
     reasoning: true,
     thinkingLevelMap: { ...THINKING_LEVEL_MAP },
-    // 原生 anthropic API 自带 thinking 语义；temperature 关闭避免 opus 4.7+
-    // 拒绝非默认值（relay 模型行为未逐项实测，保持最小配置）
-    compat: { supportsTemperature: false },
+    // relay 实测规则（curl 逐项验证）：
+    // - thinking:{type:"enabled"/"disabled"/off} → 400；adaptive 格式
+    //   (type:"adaptive"+output_config.effort) → 200 → forceAdaptiveThinking
+    // - temperature 字段任意值 → 400 → supportsTemperature:false 抑制发送
+    // - reasoning:{effort} → 200（openrouter 兼容）
+    compat: { supportsTemperature: false, forceAdaptiveThinking: true },
     input: ["text"] as ("text" | "image")[],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 128000,
