@@ -18,8 +18,8 @@
 
 // 运行时 note: pi 扩展加载器把 `@earendil-works/pi-ai` 顶层别名到 compat 入口
 // （compat 是 core 的严格超集），且没有 `./api/*` 子路径映射——所以
-// `openAICompletionsApi`/`anthropicMessagesApi` 必须从顶层取。
-import { anthropicMessagesApi, createProvider, openAICompletionsApi } from "@earendil-works/pi-ai";
+// `anthropicMessagesApi` 必须从顶层取。
+import { anthropicMessagesApi, createProvider } from "@earendil-works/pi-ai";
 import type { ApiKeyCredential, AuthResult, Model, ProviderAuthInteraction, ThinkingLevelMap } from "@earendil-works/pi-ai";
 import { CONFIG_DIR_NAME, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
@@ -39,7 +39,10 @@ const AUTH_JSON_PATH = join(homedir(), CONFIG_DIR_NAME, "agent", "auth.json");
 const ANALYTICS_DIR = join(homedir(), ".mirasim", "analytics");
 const KEYCHAIN_SERVICE = "mirasim";
 const KEYCHAIN_ACCOUNT = "config-secret-key";
-const RELAY_BASE = "https://mirasim-relay.mirofish.ai/v1";
+// 根路径（不带 /v1）：pi-ai 的 anthropicMessagesApi 内部用 Anthropic SDK，
+// 会在 baseUrl 后补 /v1/messages。若 baseUrl 带 /v1 会拼成 /v1/v1/messages。
+// relay 只有 anthropic messages 一条模型通道（openai chat/completions 404）。
+const RELAY_BASE = "https://mirasim-relay.mirofish.ai";
 const ADMIN_REFRESH_URL = "https://admin.test.mirofish.ai/auth/refresh";
 const TOKEN_PREFIX = "mrs1:";
 const ACCESS_TOKEN_TTL_SEC = 3600; // 文档约定：access token 有效期 1 小时
@@ -327,11 +330,9 @@ async function getFreshAccessToken(signal?: AbortSignal): Promise<string | null>
 // Model definitions
 // ---------------------------------------------------------------------------
 
-// 本地构造的模型形状，各自受 Model<对应 api> 约束：若任一模型不满足接口，
-// tsc 会立即报错（依赖升级时此处是最早的断点）。
-type PiModel =
-  | (Model<"openai-completions"> & { api: "openai-completions" })
-  | (Model<"anthropic-messages"> & { api: "anthropic-messages" });
+// 本地构造的模型形状，受 Model<"anthropic-messages"> 约束：若任一模型不满足
+// 接口，tsc 会立即报错（依赖升级时此处是最早的断点）。
+interface PiModel extends Model<"anthropic-messages"> {}
 
 // 只暴露这三个模型（实测 relay 对其余模型不兼容）
 const MIRASIM_MODEL_IDS = new Set(["gpt-5.6-sol", "claude-fable-5", "claude-opus-5"]);
@@ -347,33 +348,28 @@ const THINKING_LEVEL_MAP: ThinkingLevelMap = {
   max: "max",
 };
 
-// claude 系必须走 Anthropic Messages API（relay 对 openai 端点直接 400），
-// gpt 系走 OpenAI Completions。mixed provider 由 createProvider 的 api map 分发。
-const CLAUDE_IDS = new Set(["claude-fable-5", "claude-opus-5"]);
-
-// 模型元数据全部本地构造（白名单固定），relay 的 /models 只确认兼容性，不提供新信息
+// 模型元数据全部本地构造（白名单固定）。relay 只有 anthropic messages 一条
+// 模型通道（纯 openai endpoints 404）：gpt/claude 都在 /v1/messages 上，
+// 仅 model 字段区分。
 function buildLocalModels(): PiModel[] {
-  return [...MIRASIM_MODEL_IDS].map((id) => {
-    const isClaude = CLAUDE_IDS.has(id);
-    return {
-      id,
-      name: id,
-      provider: "mirasim",
-      // createProvider 的模型不会继承 provider 级 baseUrl，必须显式携带，
-      // 否则 pi 的 provider-attribution 在 model.baseUrl.includes() 处崩溃
-      baseUrl: RELAY_BASE,
-      api: isClaude ? ("anthropic-messages" as const) : ("openai-completions" as const),
-      reasoning: true,
-      thinkingLevelMap: { ...THINKING_LEVEL_MAP },
-      // claude 系：原生 anthropic API 自带 thinking 语义，无需 thinkingFormat hack；
-      // 只关掉 temperature（opus 4.7+ 拒绝非默认值）。gpt 系：支持 reasoning_effort。
-      compat: isClaude ? { supportsTemperature: false } : { supportsReasoningEffort: true },
-      input: ["text"] as ("text" | "image")[],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 128000,
-      maxTokens: 16384,
-    };
-  });
+  return [...MIRASIM_MODEL_IDS].map((id) => ({
+    id,
+    name: id,
+    provider: "mirasim",
+    // createProvider 的模型不会继承 provider 级 baseUrl，必须显式携带，
+    // 否则 pi 的 provider-attribution 在 model.baseUrl.includes() 处崩溃
+    baseUrl: RELAY_BASE,
+    api: "anthropic-messages",
+    reasoning: true,
+    thinkingLevelMap: { ...THINKING_LEVEL_MAP },
+    // 原生 anthropic API 自带 thinking 语义；temperature 关闭避免 opus 4.7+
+    // 拒绝非默认值（relay 模型行为未逐项实测，保持最小配置）
+    compat: { supportsTemperature: false },
+    input: ["text"] as ("text" | "image")[],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 128000,
+    maxTokens: 16384,
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -429,12 +425,8 @@ export default function (pi: ExtensionAPI) {
       baseUrl: RELAY_BASE,
       // 每个请求带客户端标识头：anthropic 端点的身份检查（缺失 → 401 client_outdated）
       headers: clientHeaders,
-      // mixed provider：按 model.api 分发给对应实现（mira relay 的 claude 模型
-      // 只接受 Anthropic Messages API，见 buildLocalModels 注释）
-      api: {
-        "openai-completions": openAICompletionsApi(),
-        "anthropic-messages": anthropicMessagesApi(),
-      },
+      // relay 只有 anthropic messages 一条模型通道（见 buildLocalModels 注释）
+      api: anthropicMessagesApi(),
       models,
       auth: {
         apiKey: {
