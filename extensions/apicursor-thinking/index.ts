@@ -1,29 +1,31 @@
 /**
  * apicursor-thinking — pi extension for the apicursor.com gateway.
  *
- * apicursor belongs to the cursoride2api family: an OpenAI-compatible façade
- * (Bearer auth, /v1/chat/completions, /v1/models) over the Cursor IDE agent
- * API. Every request is flattened into a single Cursor `userMessage` — the
- * whole conversation, system prompt included — and sent with an empty
- * `conversationState` under a fresh `conversationId`. Two consequences shape
- * this extension; a third one cannot be fixed from the client:
+ * What the endpoint is, by measurement (curl): an OpenAI-compatible reseller
+ * façade — Bearer auth, /v1/chat/completions, /v1/models, `server: nginx`
+ * behind Tencent EdgeOne, root page "reAPI Worker" — in front of Anthropic
+ * Claude, almost certainly on Bedrock: streamed tool calls come back with
+ * `toolu_bdrk_…` ids. Billing is the reseller's own quota, so what it charges
+ * is not visible from the API. Three client-side consequences:
  *
  *  1. Chain of thought arrives inline in `content` as an XML `<think>` block
- *     (verified by curl; no reasoning_content / reasoning / reasoning_text
- *     field is ever sent), so pi's stock OpenAI adapter renders it as answer
- *     text. ThinkingSplitter splits it back out — see thinking-splitter.ts for
- *     the captured protocol. Whether a `<think>` block appears at all is
- *     model-dependent: claude-opus-5 emits one, claude-sonnet-4.6 does not.
- *  2. The reported `usage` is unusable as prompt accounting (100×-inflated
- *     below a size threshold, real above it) and carries no cache field, so it
- *     is replaced with a local estimate — see usage.ts.
- *  3. Prompt cache cannot be observed or influenced here. Upstream Cursor does
- *     report `cacheReadTokens`/`cacheWriteTokens` in its `turnEnded` frame, but
- *     the gateway drops those fields and starts a new conversation per request,
- *     so every turn is accounted as a full prompt no matter how stable the
- *     prefix is. Splitting thinking out of the replayed content keeps that
- *     prefix byte-stable, which is all a client can contribute; surfacing real
- *     cache numbers requires a gateway that forwards them.
+ *     (no reasoning_content / reasoning / reasoning_text field is ever sent),
+ *     so pi's stock OpenAI adapter renders it as answer text. ThinkingSplitter
+ *     splits it back out — see thinking-splitter.ts for the captured protocol.
+ *     Whether a `<think>` block appears is model-dependent: claude-opus-5 emits
+ *     one, claude-sonnet-4.6 does not.
+ *  2. The reported `usage` is unusable as prompt accounting (a per-model
+ *     constant plus a 100× multiplier below a size threshold, real above it)
+ *     and never carries a cache field, so it is replaced with a local estimate
+ *     — see usage.ts.
+ *  3. Caching had no mechanism at all: an OpenAI-compat façade over Claude can
+ *     only cache when the client marks breakpoints, and pi sends none for an
+ *     unrecognised baseUrl. `cacheControlFormat: "anthropic"` in the model
+ *     compat below turns them on (verified accepted, HTTP 200). Whether the
+ *     reseller forwards them upstream cannot be observed from here — it reports
+ *     no cache tokens — so the effect shows up only in the account's quota
+ *     burn. What the client can prove is the precondition: prefix.ts measures,
+ *     per turn, how much of the payload repeats the previous request verbatim.
  *
  * Implementation: register the `apicursor` provider (models, key and baseUrl
  * all live here, not in models.json) with a wrapping `streamSimple` that pipes
@@ -261,10 +263,20 @@ const APICURSOR_MODELS: ProviderModelConfig[] = [
     contextWindow: 1_000_000,
     maxTokens: 128_000,
     cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
-    // The gateway wraps `role: "system"` in `<system>…</system>` for the Cursor
-    // prompt and has no branch for `developer`, which pi would otherwise use on
-    // reasoning models.
-    compat: { supportsDeveloperRole: false },
+    // supportsDeveloperRole: the flattener only special-cases `system`, never
+    //   `developer`, which pi would otherwise use on reasoning models.
+    // cacheControlFormat: the upstream is Anthropic-family (tool call ids come
+    //   back as `toolu_bdrk_…`, i.e. Claude on Bedrock), and an OpenAI-compat
+    //   façade over Claude can only cache when the client marks breakpoints;
+    //   pi sends none for an unrecognised baseUrl. Verified accepted (HTTP 200).
+    // supportsLongCacheRetention: opt into the 1h ttl when pi asks for long
+    //   retention (PI_CACHE_RETENTION=long), since pi sessions idle past the
+    //   default 5min window.
+    compat: {
+      supportsDeveloperRole: false,
+      cacheControlFormat: "anthropic",
+      supportsLongCacheRetention: true,
+    },
   },
   {
     id: "claude-sonnet-4.6",
@@ -274,7 +286,11 @@ const APICURSOR_MODELS: ProviderModelConfig[] = [
     contextWindow: 1_000_000,
     maxTokens: 64_000,
     cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
-    compat: { supportsDeveloperRole: false },
+    compat: {
+      supportsDeveloperRole: false,
+      cacheControlFormat: "anthropic",
+      supportsLongCacheRetention: true,
+    },
   },
 ];
 

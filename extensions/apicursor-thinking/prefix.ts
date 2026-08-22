@@ -2,13 +2,12 @@
  * Prefix-stability measurement — the only cache lever a client owns.
  *
  * First principles: a prompt-cache hit needs two things, and exactly one of them
- * is ours. (1) The server must keep a prefix cache — unknowable here, since this
- * gateway reports no cache field and the current Cursor protocol has no cache
- * token at all (`message TurnEndedUpdate {}` is empty in both community
- * implementations). (2) The bytes we send must repeat a previous request's prefix
- * verbatim — entirely under our control, and measurable without any cooperation
- * from the provider: serialise what this turn sends, diff it against what the
- * last turn sent, and report where the two stop agreeing.
+ * is ours. (1) The server must keep a prefix cache and be told where to cut —
+ * unknowable here, since this gateway reports no cache field whatever it does
+ * with the breakpoints we send. (2) The bytes we send must repeat a previous
+ * request's prefix verbatim — entirely under our control, and measurable without
+ * any cooperation from the provider: serialise what this turn sends, diff it
+ * against what the last turn sent, and report where the two stop agreeing.
  *
  * That makes "is the prefix cacheable" a local, falsifiable measurement instead
  * of a provider feature request. A stable prefix is a necessary condition for

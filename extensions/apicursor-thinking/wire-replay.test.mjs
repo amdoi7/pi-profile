@@ -47,6 +47,11 @@ const MODEL = {
 	compat: { supportsDeveloperRole: false },
 };
 
+const CACHING_MODEL = {
+	...MODEL,
+	compat: { supportsDeveloperRole: false, cacheControlFormat: "anthropic", supportsLongCacheRetention: true },
+};
+
 function secondTurnContext() {
 	return {
 		systemPrompt: "sys",
@@ -107,9 +112,9 @@ function sseResponse() {
 	return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
 }
 
-async function capturePayload(context) {
+async function capturePayload(context, model = MODEL) {
 	let captured;
-	const stream = streamSimple(MODEL, context, {
+	const stream = streamSimple(model, context, {
 		apiKey: "sk-test",
 		fetch: async (_url, init) => {
 			captured = JSON.parse(init.body);
@@ -120,6 +125,18 @@ async function capturePayload(context) {
 		if (event.type === "done" || event.type === "error") break;
 	}
 	return captured;
+}
+
+/** Every cache_control marker in a converted payload, with the message it sits on. */
+function cacheBreakpoints(payload) {
+	const found = [];
+	payload.messages.forEach((message, index) => {
+		if (!Array.isArray(message.content)) return;
+		for (const part of message.content) {
+			if (part?.cache_control) found.push({ index, role: message.role, ttl: part.cache_control.ttl });
+		}
+	});
+	return found;
 }
 
 test("second turn replays the answer without the chain of thought", async () => {
@@ -155,4 +172,47 @@ test("a signed thinking block would reach the wire, and the strip is what stops 
 	assert.equal(JSON.stringify(unguarded.messages).includes(COT), true, "expected the adapter to replay a signed chain of thought");
 	const guarded = await capturePayload(dropThinkingFromHistory(signed()));
 	assert.equal(JSON.stringify(guarded.messages).includes(COT), false);
+});
+
+/**
+ * Cache breakpoints are the only mechanism by which an OpenAI-compat façade over
+ * Claude can cache at all. Without `cacheControlFormat: "anthropic"` pi sends
+ * none, which is why this provider re-prefilled a full prompt every turn.
+ */
+test("no cache breakpoints without the anthropic cache-control compat flag", async () => {
+	const payload = await capturePayload(dropThinkingFromHistory(secondTurnContext()));
+	assert.deepEqual(cacheBreakpoints(payload), []);
+});
+
+test("the compat flag marks the system prompt and the last conversation message", async () => {
+	const payload = await capturePayload(dropThinkingFromHistory(secondTurnContext()), CACHING_MODEL);
+	const marks = cacheBreakpoints(payload);
+	assert.deepEqual(
+		marks.map((m) => `${m.role}#${m.index}`),
+		["system#0", "user#3"],
+	);
+	// Short retention is the default: no ttl until pi asks for long retention.
+	assert.deepEqual(
+		marks.map((m) => m.ttl),
+		[undefined, undefined],
+	);
+});
+
+test("long retention adds the 1h ttl to the same breakpoints", async () => {
+	let captured;
+	const stream = streamSimple(CACHING_MODEL, dropThinkingFromHistory(secondTurnContext()), {
+		apiKey: "sk-test",
+		cacheRetention: "long",
+		fetch: async (_url, init) => {
+			captured = JSON.parse(init.body);
+			return sseResponse();
+		},
+	});
+	for await (const event of stream) {
+		if (event.type === "done" || event.type === "error") break;
+	}
+	assert.deepEqual(
+		cacheBreakpoints(captured).map((m) => m.ttl),
+		["1h", "1h"],
+	);
 });
