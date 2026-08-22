@@ -45,8 +45,12 @@ import {
   type ToolCall,
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
+import { appendFileSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { ThinkingSplitter, type Segment } from "./thinking-splitter.ts";
 import { dropThinkingFromHistory } from "./replay.ts";
+import { comparePrefix, describeContext, type PayloadSegment } from "./prefix.ts";
 import { normalizeUsage } from "./usage.ts";
 
 type ContentBlock = {
@@ -58,10 +62,38 @@ type ContentBlock = {
   thinkingSignature: string;
 } | ToolCall;
 
+/**
+ * Per-turn prefix-stability trace. Cache cannot be observed on this link, so the
+ * one controllable precondition — sending a byte-identical prefix — is measured
+ * locally instead: one JSONL line per request, `ratio` = share of the payload
+ * reproduced verbatim from the previous turn, `firstDiverged` = the segment that
+ * broke it. A ratio that drops on an appended turn is a client-side bug (history
+ * rewritten), not a provider limitation.
+ */
+const PREFIX_LOG = join(homedir(), ".pi", "agent", ".pi", "apicursor-prefix.jsonl");
+const lastPayload = new Map<string, PayloadSegment[]>();
+
+function tracePrefix(model: Model<Api>, context: Context, sessionId: string | undefined): void {
+  const key = sessionId ?? "default";
+  const segments = describeContext(context);
+  const report = comparePrefix(lastPayload.get(key), segments);
+  lastPayload.set(key, segments);
+  try {
+    mkdirSync(dirname(PREFIX_LOG), { recursive: true });
+    appendFileSync(
+      PREFIX_LOG,
+      `${JSON.stringify({ ts: new Date().toISOString(), session: key, model: model.id, ...report })}\n`,
+    );
+  } catch {
+    // Tracing must never break a request.
+  }
+}
+
 function streamApicursor(model: Model<Api>, rawContext: Context, options?: SimpleStreamOptions) {
   // Chain of thought never goes back on the wire: it cannot be consumed upstream
   // and, with no cache on this link, every replayed token is paid again per turn.
   const context = dropThinkingFromHistory(rawContext);
+  tracePrefix(model, context, options?.sessionId);
   const inner = openAICompletionsApi().streamSimple(model, context, options);
   const outer = createAssistantMessageEventStream();
   const splitter = new ThinkingSplitter();
