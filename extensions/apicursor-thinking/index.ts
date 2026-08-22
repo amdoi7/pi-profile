@@ -46,6 +46,7 @@ import {
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import { ThinkingSplitter, type Segment } from "./thinking-splitter.ts";
+import { dropThinkingFromHistory } from "./replay.ts";
 import { normalizeUsage } from "./usage.ts";
 
 type ContentBlock = {
@@ -57,7 +58,10 @@ type ContentBlock = {
   thinkingSignature: string;
 } | ToolCall;
 
-function streamApicursor(model: Model<Api>, context: Context, options?: SimpleStreamOptions) {
+function streamApicursor(model: Model<Api>, rawContext: Context, options?: SimpleStreamOptions) {
+  // Chain of thought never goes back on the wire: it cannot be consumed upstream
+  // and, with no cache on this link, every replayed token is paid again per turn.
+  const context = dropThinkingFromHistory(rawContext);
   const inner = openAICompletionsApi().streamSimple(model, context, options);
   const outer = createAssistantMessageEventStream();
   const splitter = new ThinkingSplitter();
@@ -225,6 +229,10 @@ const APICURSOR_MODELS: ProviderModelConfig[] = [
     contextWindow: 1_000_000,
     maxTokens: 128_000,
     cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+    // The gateway wraps `role: "system"` in `<system>…</system>` for the Cursor
+    // prompt and has no branch for `developer`, which pi would otherwise use on
+    // reasoning models.
+    compat: { supportsDeveloperRole: false },
   },
   {
     id: "claude-sonnet-4.6",
@@ -234,6 +242,7 @@ const APICURSOR_MODELS: ProviderModelConfig[] = [
     contextWindow: 1_000_000,
     maxTokens: 64_000,
     cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+    compat: { supportsDeveloperRole: false },
   },
 ];
 
