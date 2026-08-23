@@ -104,9 +104,11 @@ const DIFF_TIMEOUT_MS = 250;
 const UTF8_ENCODER = new TextEncoder();
 
 /**
- * 词级细化 DP 细胞预算：token 乘积超限跳过行内细化。
- * 正常代码行 < 200 token（< 40k cells）；2M cells ≈ 16MB 分配 + 数十 ms，
- * 防 jsdiff diffWordsWithSpace（无超时）在长行上 O(ND) 爆炸。
+ * 词级细化 DP 细胞预算：行字符数乘积超限跳过行内细化。
+ * 字符数是 diffWordsWithSpace token 数的上界（按 \S+ 计数会漏放
+ * 低空格长行——minified/长字面量单行数千 word token，Myers 无超时爆炸：
+ * worker 5s watchdog 杀掉后主线程同步 fallback 重跑同样计算，卡死 TUI）。
+ * 正常代码行 < 200 字符（< 40k cells）；~1.4k 字符以上的行跳过细化，整行高亮。
  */
 const WORD_REFINEMENT_MAX_CELLS = 2_000_000;
 
@@ -323,9 +325,7 @@ function pairChangedItems(
 function refinePair(oldRow: DisplayDiffRow, newRow: DisplayDiffRow): void {
 	// 调用方保证 changed 配对；fold 行（gap）无 content，防御收窄。
 	if (!("content" in oldRow) || !("content" in newRow)) return;
-	const oldTokens = oldRow.content.match(/\S+/g)?.length ?? 0;
-	const newTokens = newRow.content.match(/\S+/g)?.length ?? 0;
-	if ((oldTokens + 1) * (newTokens + 1) > WORD_REFINEMENT_MAX_CELLS) return;
+	if ((oldRow.content.length + 1) * (newRow.content.length + 1) > WORD_REFINEMENT_MAX_CELLS) return;
 	let oldOffset = 0;
 	let newOffset = 0;
 	for (const part of diffWordsWithSpace(oldRow.content, newRow.content)) {

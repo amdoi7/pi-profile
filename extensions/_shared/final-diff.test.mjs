@@ -315,3 +315,28 @@ test("small diffs are never degraded by a tiny timeout", () => {
 		highlights: [{ start: 14, end: 22 }],
 	});
 });
+
+test("word refinement budget counts characters, not whitespace-separated tokens", () => {
+	// 单个 \S+ token 但上千 jsdiff word token 的行（minified/长字面量形态）：
+	// 预算若按 \S+ 计数会漏放，Myers 词级 diff 无超时爆炸（worker 5s watchdog →
+	// 主线程同步 fallback 卡死 TUI）。字符数是 token 数的上界，超预算必须跳过细化。
+	const packedLine = (tag) =>
+		`const m={${Array.from({ length: 160 }, (_, i) => `k${i}:${tag}${i}`).join(",")}};`.padEnd(1600, ";");
+	const diff = generateFinalDiff(`${packedLine("a")}\n`, `${packedLine("b")}\n`, 0);
+
+	assert.equal(diff.degraded, false);
+	// 预算跳过的既有约定（同 block 级 DEFAULT_MAX_BYTES 跳过）：不计算词级高亮，行保持无 range。
+	for (const row of diff.display.rows) {
+		assert.deepEqual(row.highlights, [], "over-budget pair skips word refinement");
+	}
+});
+
+test("word refinement still runs on normal-length low-whitespace lines", () => {
+	const packedLine = (tag) => `const m={${Array.from({ length: 16 }, (_, i) => `k${i}:${tag}${i}`).join(",")}};`;
+	const diff = generateFinalDiff(`${packedLine("a")}\n`, `${packedLine("b")}\n`, 0);
+
+	const removeRow = diff.display.rows.find((row) => row.kind === "remove");
+	assert.ok(removeRow.highlights.length >= 1, "refinement produced word-level highlights");
+	const spanned = removeRow.highlights.reduce((sum, range) => sum + range.end - range.start, 0);
+	assert.ok(spanned < removeRow.content.length, "highlights are narrower than the whole row");
+});
