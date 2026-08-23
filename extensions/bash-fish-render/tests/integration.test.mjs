@@ -81,10 +81,16 @@ it("bash execute runs a real apply_patch with guarded diff (no hang)", async () 
 
 	assert.equal(fs.readFileSync(path.join(cwd, "hello.txt"), "utf8"), "hello\npi\n");
 	assert.match(result.content[0].text, /Success\. Updated the following files:/);
-	assert.ok(Array.isArray(result.details?.diffs), "diffs must be present");
-	assert.equal(result.details.diffs[0].path, "hello.txt");
-	// 与内置 generateDiffString 逐字节同构（add 行用新侧行号："pi" 是新文件第 2 行）。
-	assert.equal(result.details.diffs[0].diff, " 1 hello\n-2 world\n+2 pi");
+	assert.ok(Array.isArray(result.details?.patchFiles), "structured patchFiles must be present");
+	const [file] = result.details.patchFiles;
+	assert.equal(file.path, "hello.txt");
+	assert.equal(file.kind, "Update");
+	assert.deepEqual(file.changeStats, { additions: 1, deletions: 1, changedLines: 2 });
+	// 双侧行号坐标（与 edit 同源的 DisplayDiff）：remove 带 oldLine，add 带 newLine。
+	const rows = file.display.rows;
+	assert.ok(rows.some((row) => row.kind === "remove" && row.oldLine === 2 && row.content === "world"), JSON.stringify(rows));
+	assert.ok(rows.some((row) => row.kind === "add" && row.newLine === 2 && row.content === "pi"), JSON.stringify(rows));
+	assert.equal(result.details.diffs, undefined, "legacy single-column string diffs are no longer emitted");
 	await fs.promises.rm(tempRoot, { recursive: true, force: true });
 });
 

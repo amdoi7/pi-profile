@@ -95,4 +95,54 @@ describe("bash-fish-render", () => {
 		const output = component.render(200).join("\n");
 		expect(output).toContain("PATCH");
 	});
+
+	it("renderResult renders structured patchFiles as dual-gutter file diffs", async () => {
+		const pi = makePi();
+		registerExtension(pi);
+		const tool = pi.registered[0];
+		const { generateFinalDiff } = await import("../../_shared/final-diff.ts");
+		const diff = generateFinalDiff("hello\nworld\n", "hello\npi\n");
+		const result = {
+			content: [{ type: "text", text: "Success. Updated the following files:\nM hello.txt" }],
+			details: {
+				patchFiles: [{
+					kind: "Update",
+					path: "hello.txt",
+					cwd: "/tmp",
+					changeStats: diff.stats,
+					display: diff.display,
+					truncated: diff.truncated,
+				}],
+			},
+		};
+		const component = tool.renderResult(
+			result,
+			{ isPartial: false, expanded: false },
+			makeTheme(),
+			makeContext("apply_patch '...'", { executionStarted: true }),
+		);
+		const output = component.render(120).join("\n")
+			.replace(/\x1b\]8;;.*?(?:\x1b\\|\x07)/g, "")
+			.replace(/\x1b\[[0-9;]*m/g, "");
+		// 文件头：工具归因 + kind + 路径 + stats（与 edit 同源的 fileResultItem）。
+		expect(output).toMatch(/apply_patch Update file .*hello\.txt · \+1 -1/);
+		// 双列行号 gutter（与 edit 同源的 DiffPreviewComponent）：remove 行另一侧留空，add 行反之。
+		expect(output).toMatch(/-2 {3}│ world/);
+		expect(output).toMatch(/\+ {2}2 │ pi/);
+	});
+
+	it("renderResult without patchFiles delegates to the built-in shape", () => {
+		const pi = makePi();
+		registerExtension(pi);
+		const tool = pi.registered[0];
+		const component = tool.renderResult(
+			{ content: [{ type: "text", text: "plain output" }], details: {} },
+			{ isPartial: false, expanded: false },
+			makeTheme(),
+			makeContext("ls", { executionStarted: true }),
+		);
+		const output = STRIP_ANSI(component.render(120).join("\n"));
+		expect(output).toContain("plain output");
+		expect(output).not.toContain("│");
+	});
 });
