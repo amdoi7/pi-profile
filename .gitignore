@@ -44,7 +44,4 @@
 
 # pi-worker 审计目录(worker session jsonl,机器本地状态)
 /.pi/worker-sessions/
-branch_structure.json
-temp_auto_push.bat
-temp_interactive_push.bat
 .gitignore
