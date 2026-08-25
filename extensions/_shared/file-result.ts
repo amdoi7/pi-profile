@@ -31,9 +31,16 @@ import type { FileMutationRenderItem } from "./file-mutation-view.ts";
 
 export type FileMutationKind = "Add" | "Update" | "Move" | "Delete" | "Rewrite";
 
+/** 行尾注记：`· <note>`（muted）；空/缺席不占位。 */
+function noteSuffix(note: string | undefined, theme: Theme): string {
+	return note === undefined || note === "" ? "" : theme.fg("muted", ` · ${note}`);
+}
+
 export type FileMutationResult = {
-	/** 工具名归因（title 头）。 */
+	/** 工具名归因（title 头）；空串 = 由调用方在批头承担归因，行内不重复。 */
 	label: string;
+	/** 行尾 muted 注记（batch 的 per-file 意图、not written 等状态）。 */
+	note?: string;
 	/** apply_patch 特有：Add/Update/Move/Delete/Rewrite；edit 无。 */
 	kind?: FileMutationKind;
 	path: string;
@@ -70,9 +77,11 @@ export function fileResultItem(
 	const linkTarget = result.destination ?? result.path;
 	const count = "";
 	const kindWord = result.kind === undefined ? "" : ` ${theme.fg("success", result.kind)} file`;
+	const labelWord = result.label === "" ? "" : `${theme.fg("toolTitle", theme.bold(result.label))}${kindWord} `;
 	// 顺序与 apply_patch 原实现一致：link → " · "+stats → patches 计数。
-	const title = `${theme.fg("toolTitle", theme.bold(result.label))}${kindWord} ` +
-		`${renderCwdFilePathLink(displayPath, linkTarget, result.cwd ?? fallbackCwd, theme)}${suffix}${count}`;
+	const title = `${labelWord}` +
+		`${renderCwdFilePathLink(displayPath, linkTarget, result.cwd ?? fallbackCwd, theme)}${suffix}${count}` +
+		`${noteSuffix(result.note, theme)}`;
 	if (result.status === "failed") {
 		return { title, outcome: "failed", message: result.error ?? "" };
 	}
@@ -90,7 +99,7 @@ export function fileResultItem(
  * 非零时显示；多文件一行（in-place edit pending）是特例，保留在 bash-ui。
  */
 export function fileMutationPlanItem(
-	result: Pick<FileMutationResult, "label" | "kind" | "path" | "destination" | "cwd" | "changeStats">,
+	result: Pick<FileMutationResult, "label" | "kind" | "path" | "destination" | "cwd" | "changeStats" | "note">,
 	theme: Theme,
 	fallbackCwd: string,
 	indent = false,
@@ -100,12 +109,14 @@ export function fileMutationPlanItem(
 		? `${result.path}${theme.fg("muted", " -> ")}${result.destination}`
 		: result.path;
 	const linkTarget = result.destination ?? result.path;
-	const parts = [
-		`${indent ? "  " : ""}${theme.fg("toolTitle", theme.bold(result.label))}${kindWord}`,
-		renderCwdFilePathLink(displayPath, linkTarget, result.cwd ?? fallbackCwd, theme),
-	];
+	const labelWord = result.label === "" ? "" : `${theme.fg("toolTitle", theme.bold(result.label))}${kindWord}`;
+	const parts = labelWord === "" ? [] : [labelWord];
+	parts.push(renderCwdFilePathLink(displayPath, linkTarget, result.cwd ?? fallbackCwd, theme));
 	if (result.changeStats.changedLines > 0) {
 		parts.push(renderDiffSummary(result.changeStats, theme));
 	}
-	return { title: parts.join(" "), outcome: "pending" };
+	return {
+		title: `${indent ? "  " : ""}${parts.join(" ")}${noteSuffix(result.note, theme)}`,
+		outcome: "pending",
+	};
 }
