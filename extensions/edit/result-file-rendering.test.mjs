@@ -30,7 +30,7 @@ async function loadRegisteredEditTool() {
 		recursive: true,
 		filter: (source) => path.basename(source) !== "node_modules",
 	});
-	await copySharedFiles(tempSharedDir, ["file-link.ts", "code-preview.ts", "final-diff.ts", "diff-view.ts", "file-mutation-view.ts", "diff-service.ts", "diff-worker.ts"]);
+	await copySharedFiles(tempSharedDir, ["file-link.ts", "code-preview.ts", "final-diff.ts", "diff-view.ts", "file-mutation-view.ts", "file-result.ts", "diff-service.ts", "diff-worker.ts"]);
 	await linkPiPackages(tempExtensionDir, { tui: true });
 	await linkSharedPackages(tempExtensionDir);
 
@@ -48,8 +48,10 @@ async function loadRegisteredEditTool() {
 	return registeredTool;
 }
 
-function makeEditArgs(pathName, edits) {
-	return { path: pathName, edits };
+const INTENT = "narrow the ctx type";
+
+function makeBatchArgs(files, intent = INTENT) {
+	return { intent, files };
 }
 
 function createTheme() {
@@ -129,98 +131,87 @@ function contextDisplay(entries) {
 	};
 }
 
-function buildSingleFileSuccessGroup() {
+function appliedFile(filePath, display, overrides = {}) {
 	return {
-		path: "/tmp/pi-edit-ui-demo/example.ts",
+		path: filePath,
 		status: "applied",
+		changeStats: { additions: 1, deletions: 1, changedLines: 2 },
+		display,
+		truncated: false,
 		firstChangedLine: 1,
-		previewDisplay: contextDisplay([
-			[1, "export const value = 1;"],
-			[2, 'export const name = "after";'],
-		]),
+		...overrides,
 	};
 }
 
-function buildAgentResult(fileResult, cwd = process.cwd()) {
+/** execute 的真实结果形状：compact JSON content + 批次 details。 */
+function buildAgentResult(files, { status = "applied", cwd = process.cwd(), intent = INTENT } = {}) {
 	return {
-		content: [{
-			type: "text",
-			text: JSON.stringify({
-				status: fileResult.status,
-				path: fileResult.path,
-			}),
-		}],
-		details: {
-			kind: "result",
-			file: fileResult.status === "applied"
-				? {
-					label: "edit",
-					path: fileResult.path,
-					cwd,
-					display: fileResult.previewDisplay,
-					truncated: false,
-					changeStats: fileResult.changeStats ?? { additions: 1, deletions: 1, changedLines: 2 },
-				}
-				: {
-					label: "edit",
-					path: fileResult.path,
-					cwd,
-					changeStats: { additions: 0, deletions: 0, changedLines: 0 },
-					display: { lineNumberWidth: 1, rows: [] },
-					truncated: false,
-					status: "failed",
-					error: fileResult.error.message,
-				},
-		},
+		content: [{ type: "text", text: JSON.stringify({ status }) }],
+		isError: status !== "applied",
+		details: { status, intent, cwd, files },
 	};
 }
 
-test("pending edit render shows only compact file headers", async () => {
+test("pending render shows the intent and the planned files without any diff text", async () => {
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
 	const output = renderText(
 		tool.renderCall(
-			makeEditArgs("src/example.ts", [{ oldText: "before", newText: "after" }]),
+			makeBatchArgs([
+				{ path: "src/example.ts", hint: "call site", edits: [{ oldText: "before", newText: "after" }] },
+				{ path: "src/other.ts", edits: [{ oldText: "left", newText: "right" }] },
+			]),
 			createTheme(),
 			createRenderContext({ executionStarted: false, argsComplete: true, isPartial: false }),
 		),
 	);
 
-	assert.match(output, /edit src\/example\.ts/);
+	assertAppearsInOrder(output, [INTENT, "src/example.ts", "src/other.ts"]);
+	assert.match(output, /call site/);
 	assert.doesNotMatch(output, /before|after/);
 });
 
-test("applied result header uses the compact +A -D summary", async () => {
+test("applied result attributes the tool once in the intent header", async () => {
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
 	const output = renderText(tool.renderResult(
-		buildAgentResult({
-			path: "src/example.ts",
-			status: "applied",
-			firstChangedLine: 1,
-			previewDisplay: replacementDisplay(1, "before", "after"),
-			changeStats: { additions: 2, deletions: 1, changedLines: 3 },
-		}),
+		buildAgentResult([
+			appliedFile("src/example.ts", replacementDisplay(1, "before", "after"), {
+				changeStats: { additions: 2, deletions: 1, changedLines: 3 },
+			}),
+			appliedFile("src/other.ts", replacementDisplay(1, "left", "right")),
+		]),
 		{ expanded: true },
 		createTheme(),
 		createRenderContext(),
 	));
-	assert.match(output, /edit src\/example\.ts · \+2 -1/);
-	assert.doesNotMatch(output, /changed/);
+
+	assert.equal(countOccurrences(output, "edit"), 1, output);
+	assertAppearsInOrder(output, [`edit ${INTENT}`, "src/example.ts · +2 -1", "src/other.ts · +1 -1"]);
+});
+
+test("per-file hint rides on the file line", async () => {
+	initTheme("dark");
+	const tool = await loadRegisteredEditTool();
+	const output = renderText(tool.renderResult(
+		buildAgentResult([
+			appliedFile("src/example.ts", replacementDisplay(1, "before", "after"), { hint: "compile site" }),
+		]),
+		{ expanded: true },
+		createTheme(),
+		createRenderContext(),
+	));
+
+	assert.match(output, /src\/example\.ts · \+1 -1 · compile site/);
 });
 
 test("production result renderer uses Pi native diff rendering", async () => {
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
-	const result = buildAgentResult({
-		path: "src/example.ts",
-		status: "applied",
-		firstChangedLine: 10,
-		previewDisplay: replacementDisplay(10, "\tindented", "  indented"),
-	});
-
 	const output = renderText(tool.renderResult(
-		result,
+		buildAgentResult([
+			appliedFile("src/example.ts", replacementDisplay(10, "\tindented", "  indented"), { firstChangedLine: 10 }),
+		]),
 		{ expanded: true },
 		createTheme(),
 		createRenderContext(),
@@ -230,16 +221,11 @@ test("production result renderer uses Pi native diff rendering", async () => {
 	assert.match(output, /\+ {3}10 │ {3}indented/);
 });
 
-test("result file header and diff are adjacent", async () => {
+test("each file header sits directly above its own diff", async () => {
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
 	const output = renderText(tool.renderResult(
-		buildAgentResult({
-			path: "src/example.ts",
-			status: "applied",
-			firstChangedLine: 1,
-			previewDisplay: replacementDisplay(1, "before", "after"),
-		}),
+		buildAgentResult([appliedFile("src/example.ts", replacementDisplay(1, "before", "after"))]),
 		{ expanded: true },
 		createTheme(),
 		createRenderContext(),
@@ -251,61 +237,66 @@ test("result file header and diff are adjacent", async () => {
 	assert.equal(diffIndex - headerIndex, 1, output);
 });
 
-test("failed result shows the path only in its header", async () => {
+test("rejected batch says nothing was written and marks the untouched files", async () => {
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
 	const output = renderText(tool.renderResult(
-		buildAgentResult({
-			path: "src/example.ts",
-			status: "failed",
-				error: {
-					message: "oldText was not found.",
-				},
-		}),
+		buildAgentResult([
+			{ path: "src/resolvable.ts", status: "notWritten", restored: false },
+			{ path: "src/stale.ts", status: "failed", error: "oldText was not found." },
+		], { status: "rejected" }),
 		{ expanded: true },
 		createTheme(),
 		createRenderContext(),
 	));
 
-	assert.equal(countOccurrences(output, "src/example.ts"), 1, output);
+	assert.match(output, /rejected · nothing written/);
+	assert.match(output, /src\/resolvable\.ts · not written/);
+	assert.equal(countOccurrences(output, "src/stale.ts"), 1, output);
 	assert.match(output, /oldText was not found/);
 });
 
-test("result without structured details shows the contract diagnostic (no legacy fallback)", async () => {
+test("a rolled-back file says it was restored, not merely skipped", async () => {
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
-	const context = createRenderContext();
-	const structured = tool.renderResult(
-		buildAgentResult({
-			path: "src/example.ts",
-			status: "applied",
-			firstChangedLine: 1,
-			previewDisplay: replacementDisplay(1, "before", "after"),
-		}),
+	const output = renderText(tool.renderResult(
+		buildAgentResult([
+			{ path: "src/first.ts", status: "notWritten", restored: true, hint: "leading change" },
+			{ path: "src/second.ts", status: "failed", error: "EACCES: permission denied" },
+		], { status: "rejected" }),
 		{ expanded: true },
 		createTheme(),
-		context,
-	);
+		createRenderContext(),
+	));
 
-	// 不向后兼容：成功 + details 无法解析即契约破坏，显示开发诊断而非降级文本。
-	const diagnostic = tool.renderResult(
-		{ content: [{ type: "text", text: "raw fallback" }], details: undefined },
-		{ expanded: true },
-		createTheme(),
-		{ ...context, lastComponent: structured },
-	);
-	assert.match(renderText(diagnostic), /edit_result_contract_invalid/);
-	assert.doesNotMatch(renderText(diagnostic), /raw fallback/);
+	assert.match(output, /src\/first\.ts · leading change · restored/);
 });
 
-test("legacy summary-shaped details shows the contract diagnostic (no format compat)", async () => {
+test("partial batch warns that files were left changed", async () => {
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
-	// 旧格式 details（{ kind, summary, groups }）：不兼容，诊断指出契约破坏。
+	const output = renderText(tool.renderResult(
+		buildAgentResult([
+			appliedFile("src/stranded.ts", replacementDisplay(1, "before", "after")),
+			{ path: "src/failed.ts", status: "failed", error: "ENOSPC: no space left on device" },
+		], { status: "partial" }),
+		{ expanded: true },
+		createTheme(),
+		createRenderContext(),
+	));
+
+	assert.match(output, /partial · some files left changed/);
+	assert.match(output, /src\/stranded\.ts · \+1 -1/);
+	assert.match(output, /ENOSPC/);
+});
+
+test("legacy single-file details shows the contract diagnostic (no format compat)", async () => {
+	initTheme("dark");
+	const tool = await loadRegisteredEditTool();
 	const output = renderText(tool.renderResult(
 		{
-			content: [{ type: "text", text: "legacy summary payload" }],
-			details: { kind: "summary", summary: "1 applied", groups: [] },
+			content: [{ type: "text", text: "legacy single-file payload" }],
+			details: { status: "applied", path: "src/example.ts", cwd: process.cwd(), changeStats: { additions: 1, deletions: 1, changedLines: 2 }, display: contextDisplay([[1, "after"]]), truncated: false },
 			isError: false,
 		},
 		{ expanded: false },
@@ -314,29 +305,16 @@ test("legacy summary-shaped details shows the contract diagnostic (no format com
 	));
 
 	assert.match(output, /edit_result_contract_invalid/);
-	assert.doesNotMatch(output, /legacy summary payload/);
+	assert.doesNotMatch(output, /legacy single-file payload/);
 });
 
-test("empty content without details keeps the contract diagnostic", async () => {
-	initTheme("dark");
-	const tool = await loadRegisteredEditTool();
-	const output = renderText(tool.renderResult(
-		{ content: [], details: undefined },
-		{ expanded: false },
-		createTheme(),
-		createRenderContext(),
-	));
-
-	assert.match(output, /edit_result_contract_invalid/);
-});
-
-test("error result renders the real failure message, not the contract diagnostic", async () => {
+test("validation error without details renders the real failure message", async () => {
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
 	const output = renderText(tool.renderResult(
 		{
-			content: [{ type: "text", text: "edits[0].oldText must be a string (was missing)" }],
-			details: {},
+			content: [{ type: "text", text: "files[0].oldText must be a string" }],
+			details: undefined,
 			isError: true,
 		},
 		{ expanded: false },
@@ -348,11 +326,11 @@ test("error result renders the real failure message, not the contract diagnostic
 	assert.doesNotMatch(output, /edit_result_contract_invalid/);
 });
 
-test("partial result without details keeps pending instead of flashing the contract diagnostic", async () => {
+test("partial stream keeps pending instead of flashing a diagnostic", async () => {
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
 	const output = renderText(tool.renderResult(
-		{ content: [], details: undefined },
+		{ content: [], details: { status: "applied", intent: INTENT, cwd: process.cwd(), files: [] } },
 		{ expanded: false, isPartial: true },
 		createTheme(),
 		createRenderContext(),
@@ -361,63 +339,29 @@ test("partial result without details keeps pending instead of flashing the contr
 	assert.doesNotMatch(output, /edit_result_contract_invalid/);
 });
 
-test("renderResult keeps the single-file path header visible before its diff", async () => {
+test("completed tool execution replaces the pending plan with the final diff", async () => {
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
-	const output = renderText(
-		tool.renderResult(
-			buildAgentResult({
-					path: "src/example.ts",
-					status: "applied",
-					firstChangedLine: 1,
-					previewDisplay: contextDisplay([[1, "after"]]),
-				},
-			),
-			{ expanded: true },
-			createTheme(),
-			createRenderContext(),
-		),
+	const args = makeBatchArgs([
+		{ path: "/tmp/pi-edit-ui-demo/example.ts", edits: [{ oldText: "before", newText: "after" }] },
+	]);
+	const component = createToolExecutionComponent(tool, args);
+	component.setArgsComplete();
+	component.markExecutionStarted();
+	component.updateResult(
+		buildAgentResult([
+			appliedFile("/tmp/pi-edit-ui-demo/example.ts", contextDisplay([
+				[1, "export const value = 1;"],
+				[2, 'export const name = "after";'],
+			])),
+		]),
+		false,
 	);
 
-	assertAppearsInOrder(output, ["src/example.ts", " 1 1 │ after"]);
-});
-
-
-test("single-file execution replaces pending header with final diff", async () => {
-	initTheme("dark");
-	const tool = await loadRegisteredEditTool();
-	const args = makeEditArgs("/tmp/pi-edit-ui-demo/example.ts", [{ oldText: "before", newText: "after" }]);
-	const component = createToolExecutionComponent(tool, args);
-	component.setArgsComplete();
-	component.markExecutionStarted();
-	component.updateResult({
-		...buildAgentResult(buildSingleFileSuccessGroup()),
-		isError: false,
-	}, false);
-
 	const output = renderText(component);
-	assertAppearsInOrder(output, ["/tmp/pi-edit-ui-demo/example.ts", "export const name = \"after\";"]);
-});
-
-test("completed single-file tool execution renders one standalone per-file block", async () => {
-	initTheme("dark");
-	const tool = await loadRegisteredEditTool();
-	const args = makeEditArgs("/tmp/pi-edit-ui-demo/example.ts", [{ oldText: "before", newText: "after" }]);
-	const component = createToolExecutionComponent(tool, args);
-	component.markExecutionStarted();
-	component.setArgsComplete();
-	component.updateResult({
-		...buildAgentResult(buildSingleFileSuccessGroup()),
-		isError: false,
-	}, false);
-
-	const output = renderText(component);
-
 	assert.equal(countOccurrences(output, "/tmp/pi-edit-ui-demo/example.ts"), 1);
-	assert.doesNotMatch(output, /Applied 1 file\./);
-	assertAppearsInOrder(output, ["/tmp/pi-edit-ui-demo/example.ts", "export const name = \"after\";"]);
+	assertAppearsInOrder(output, [INTENT, "/tmp/pi-edit-ui-demo/example.ts", 'export const name = "after";']);
 });
-
 
 test("renderResult makes edit path headers clickable file hyperlinks", async () => {
 	initTheme("dark");
@@ -425,14 +369,7 @@ test("renderResult makes edit path headers clickable file hyperlinks", async () 
 	const cwd = "/tmp/pi-edit-link-demo";
 	const raw = renderRawText(
 		tool.renderResult(
-			buildAgentResult({
-				path: "src/example.ts",
-				status: "applied",
-				firstChangedLine: 1,
-				previewDisplay: contextDisplay([[1, "after"]]),
-			},
-			cwd,
-		),
+			buildAgentResult([appliedFile("src/example.ts", contextDisplay([[1, "after"]]))], { cwd }),
 			{ expanded: true },
 			createTheme(),
 			createRenderContext({ cwd }),

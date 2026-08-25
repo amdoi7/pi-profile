@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import editExtension from "./index.ts";
+import { editRequestParameters } from "./pipeline.ts";
 
 function captureTool() {
 	let registeredTool;
@@ -25,42 +26,67 @@ async function writeTempFile(name, content) {
 	return file;
 }
 
-// Soft failure (status:failed payload) must surface as isError so the harness
+function run(tool, args) {
+	return tool.execute("call-1", args, undefined, undefined, { cwd: process.cwd() });
+}
+
+// Soft failure (a rejected/partial batch) must surface as isError so the harness
 // error channel and downstream isError routing see it; a silent success-shaped
 // result trains blind retries. Evidence: 24 例 applied:0 但 isError:false
 // (fail-mining 2026-08-13).
 
-test("failed edit outcome is returned with isError true", async () => {
+test("rejected batch is returned with isError true", async () => {
 	const tool = captureTool();
 	const file = await writeTempFile("target.ts", "const x = 1;\n");
 
-	const result = await tool.execute(
-		"call-1",
-		{ path: file, edits: [{ oldText: "missing text", newText: "replacement" }] },
-		undefined,
-		undefined,
-		{ cwd: process.cwd() },
-	);
+	const result = await run(tool, {
+		intent: "retarget the constant",
+		files: [{ path: file, edits: [{ oldText: "missing text", newText: "replacement" }] }],
+	});
 
 	assert.equal(result.isError, true, "soft failure must be marked isError");
 	const payload = JSON.parse(result.content[0].text);
-	assert.equal(payload.status, "failed");
-	assert.equal(payload.error.kind, "NOT_FOUND");
+	assert.equal(payload.status, "rejected");
+	assert.deepEqual(payload.written, []);
+	assert.equal(payload.failed[0].kind, "NOT_FOUND");
 });
 
-test("applied edit outcome is not an error", async () => {
+test("applied batch is not an error and keeps the intent in the UI details", async () => {
 	const tool = captureTool();
 	const file = await writeTempFile("target.ts", "const x = 1;\n");
 
-	const result = await tool.execute(
-		"call-1",
-		{ path: file, edits: [{ oldText: "const x = 1;", newText: "const x = 2;" }] },
-		undefined,
-		undefined,
-		{ cwd: process.cwd() },
-	);
+	const result = await run(tool, {
+		intent: "bump the constant",
+		files: [{ path: file, hint: "only definition", edits: [{ oldText: "const x = 1;", newText: "const x = 2;" }] }],
+	});
 
 	assert.notEqual(result.isError, true);
-	const payload = JSON.parse(result.content[0].text);
-	assert.equal(payload.status, "applied");
+	assert.equal(JSON.parse(result.content[0].text).status, "applied");
+	assert.equal(result.details.intent, "bump the constant");
+	assert.equal(result.details.files[0].hint, "only definition");
+});
+
+// provider 侧契约:intent 与 files 必填、每层禁未知键、数组非空——
+// 声明漏一项就会让模型合法地发出无意图/空批次。
+test("the provider schema requires an intent and a non-empty files array", () => {
+	assert.deepEqual(editRequestParameters.required, ["intent", "files"]);
+	assert.equal(editRequestParameters.additionalProperties, false);
+
+	const fileSchema = editRequestParameters.properties.files;
+	assert.equal(fileSchema.minItems, 1);
+	assert.deepEqual(fileSchema.items.required, ["path", "edits"]);
+	assert.equal(fileSchema.items.additionalProperties, false);
+	assert.equal(fileSchema.items.properties.edits.minItems, 1);
+	assert.deepEqual(fileSchema.items.properties.edits.items.required, ["oldText", "newText"]);
+});
+
+test("a batch missing its intent is rejected before touching the file", async () => {
+	const tool = captureTool();
+	const file = await writeTempFile("target.ts", "const x = 1;\n");
+
+	await assert.rejects(
+		() => run(tool, { files: [{ path: file, edits: [{ oldText: "const x = 1;", newText: "const x = 2;" }] }] }),
+		/intent must be a string/,
+	);
+	assert.equal(await fs.readFile(file, "utf-8"), "const x = 1;\n");
 });

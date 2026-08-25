@@ -1,10 +1,10 @@
 import { constants } from "node:fs";
 import { access, readFile, stat, writeFile } from "node:fs/promises";
-import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-import { generateFinalDiff, type ChangeStats, type DisplayDiff } from "../_shared/final-diff.ts";
+import { DEFAULT_MAX_LINES, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
+import { degradeToUnlocated, type ChangeStats, type DisplayDiff } from "../_shared/final-diff.ts";
 import { requestDiffBatch, warmUpDiffWorker, type DiffStrategy } from "../_shared/diff-service.ts";
 
-/** preview 的 context 行数（与 generateFinalDiff 默认一致）。 */
+/** preview 的 context 行数（与共享 diff 引擎默认一致）。 */
 const EDIT_PREVIEW_CONTEXT_LINES = 4;
 
 export type FileEditOperation = {
@@ -22,13 +22,6 @@ export type MatchedEditSpan = {
 	matchIndex: number;
 	matchLength: number;
 	newText: string;
-};
-
-export type ExecutedFileEditResult = {
-	previewDisplay: DisplayDiff;
-	previewStartLine?: number;
-	previewTruncated: boolean;
-	changeStats: ChangeStats;
 };
 
 // Hard file-size gate. Files larger than this are rejected before reading.
@@ -390,22 +383,88 @@ function formatAccessError(error: unknown): Error {
 	return new Error(String(error));
 }
 
-export async function executeFileEdits(
-	absolutePath: string,
-	edits: FileEditOperation[],
-	signal?: AbortSignal,
-	operations: EditEngineOperations = defaultEditEngineOperations,
-): Promise<ExecutedFileEditResult> {
-	return withFileMutationQueue(absolutePath, async () => {
-		throwIfAborted(signal);
+/**
+ * 一次事务持有 batch 内全部文件的 mutation lock。
+ *
+ * 获取顺序 = canonical path 字典序（全局一致的顺序 → 并发 batch 之间的等待图
+ * 无环 → 无死锁；内置 write/edit 只取单锁，同样不成环）。同一 queue key 重复
+ * 获取会自锁，调用方必须先按 canonical path 去重。
+ */
+async function withAllFileMutationQueues<T>(
+	absolutePaths: readonly string[],
+	run: () => Promise<T>,
+): Promise<T> {
+	const ordered = [...absolutePaths].sort();
+	const acquire = (index: number): Promise<T> =>
+		index === ordered.length
+			? run()
+			: withFileMutationQueue(ordered[index]!, () => acquire(index + 1));
+	return acquire(0);
+}
 
-		// 预热 diff worker（不等待）：冷启动（~300ms 模块加载）与文件 IO 重叠，
-		// 消除首次 preview 的冷启动延迟；后续 edit 全部 warm。
-		warmUpDiffWorker();
+export type BatchFileEditRequest = {
+	/** 已 canonicalize 的绝对路径；同一 batch 内必须互不相同（pipeline 去重）。 */
+	absolutePath: string;
+	edits: FileEditOperation[];
+};
 
+export type FileDiffPreview = {
+	previewDisplay: DisplayDiff;
+	previewStartLine?: number;
+	previewTruncated: boolean;
+	changeStats: ChangeStats;
+};
+
+export type BatchFileOutcome =
+	/** 落盘完成（batch status=partial 时表示回滚失败、内容仍留在盘上）。 */
+	| { status: "applied"; preview: FileDiffPreview }
+	| { status: "failed"; error: string; errorKind?: RecoverableEditErrorKind }
+	/** 匹配无误但整批被拒，未落盘；restored=true 表示写过又被回滚。 */
+	| { status: "notWritten"; restored: boolean };
+
+export type BatchEditResult = {
+	/** applied=全部落盘；rejected=一个字节都没落；partial=部分留在盘上且无法回滚。 */
+	status: "applied" | "rejected" | "partial";
+	/** 与输入同序同长。 */
+	files: BatchFileOutcome[];
+};
+
+type PreparedFile = {
+	absolutePath: string;
+	/** 原始字节（含 BOM / 原行尾）——回滚按 verbatim 还原，不经归一化往返。 */
+	rawContent: string;
+	bom: string;
+	lineEnding: "\r\n" | "\n";
+	normalizedContent: string;
+	newContent: string;
+	matchedSpans: MatchedEditSpan[];
+};
+
+type PreparedFileResult =
+	| { kind: "prepared"; prepared: PreparedFile }
+	| { kind: "failed"; error: string; errorKind?: RecoverableEditErrorKind };
+
+function toFailure(error: unknown): PreparedFileResult {
+	if (isEditToolError(error)) {
+		return { kind: "failed", error: error.message, errorKind: error.kind };
+	}
+	return { kind: "failed", error: error instanceof Error ? error.message : String(error) };
+}
+
+/**
+ * 解析面（只读）：尺寸闸门 → 可读写 → 读入 → 内存内应用 edits。
+ * 不写任何字节；失败作为 per-file 事实返回，abort 直接抛出。
+ */
+async function prepareFileEdit(
+	request: BatchFileEditRequest,
+	operations: EditEngineOperations,
+	signal: AbortSignal | undefined,
+): Promise<PreparedFileResult> {
+	throwIfAborted(signal);
+	try {
 		// Preflight: hard file-size gate before reading content into memory.
 		try {
-			const fileStat = await operations.stat(absolutePath);
+			const fileStat = await operations.stat(request.absolutePath);
 			if (fileStat.size > MAX_EDIT_FILE_SIZE_BYTES) {
 				throw new Error(
 					`File too large: sizeBytes=${fileStat.size} limitBytes=${MAX_EDIT_FILE_SIZE_BYTES}; use a narrower oldText or a streaming tool.`,
@@ -417,57 +476,195 @@ export async function executeFileEdits(
 		}
 
 		try {
-			await operations.access(absolutePath);
+			await operations.access(request.absolutePath);
 		} catch (error) {
 			throw formatAccessError(error);
 		}
 		throwIfAborted(signal);
 
-		const rawContent = await operations.readFile(absolutePath);
+		const rawContent = await operations.readFile(request.absolutePath);
 		throwIfAborted(signal);
 
 		const { bom, text } = stripBom(rawContent);
-		const originalEnding = detectLineEnding(text);
+		const lineEnding = detectLineEnding(text);
 		const normalizedContent = normalizeToLF(text);
-
-		// Resolve, validate, apply, and return spans in one call.
-		// applyEditsToNormalizedContent is the single source of truth for match logic.
-		const { newContent, matchedSpans } = applyEditsToNormalizedContent(normalizedContent, edits);
-		throwIfAborted(signal);
-
-		await operations.writeFile(absolutePath, bom + restoreLineEndings(newContent, originalEnding));
-		throwIfAborted(signal);
-
-		// 可证明的 whole rewrite：matched spans 覆盖完整文件 → O(N) rewrite diff（不跑 Myers）。
-		// 无法证明时 exact（250ms 超时是 abnormal 输入 tripwire，不用阈值猜测）。
-		const strategy: DiffStrategy = spansCoverWholeFile(matchedSpans, normalizedContent.length)
-			? { kind: "rewrite", reason: "all-lines-replaced" }
-			: { kind: "exact" };
-		const preview = await requestDiffBatch(
-			[{
-				fileId: "preview",
-				oldContent: normalizedContent,
-				newContent,
-				strategy,
-				contextLines: EDIT_PREVIEW_CONTEXT_LINES,
-			}],
-			"edit-preview",
-		).then((response) => response.files[0])
-			.catch((error) => {
-				// diff worker 不可用（崩溃 / session dispose）：只在失败路径回退主线程同步引擎，
-				// 保证 mutation 结果与 preview 始终可用；正常路径全部经 worker。
-				console.error(
-					`edit preview diff worker failed ` +
-					`error=${error instanceof Error ? error.message : String(error)} ` +
-					`action="falling back to synchronous diff engine for this preview"`,
-				);
-				return generateFinalDiff(normalizedContent, newContent);
-			});
+		// applyEditsToNormalizedContent 是匹配语义的唯一来源。
+		const { newContent, matchedSpans } = applyEditsToNormalizedContent(normalizedContent, request.edits);
 		return {
-			previewDisplay: preview.display,
-			previewStartLine: preview.firstChangedLine,
-			previewTruncated: preview.truncated,
-			changeStats: preview.stats,
+			kind: "prepared",
+			prepared: {
+				absolutePath: request.absolutePath,
+				rawContent,
+				bom,
+				lineEnding,
+				normalizedContent,
+				newContent,
+				matchedSpans,
+			},
+		};
+	} catch (error) {
+		// abort 不是 per-file 事实：直接上抛，整批不落盘。
+		if (signal?.aborted || (error instanceof Error && error.message === "Operation aborted")) throw error;
+		return toFailure(error);
+	}
+}
+
+function serializeForDisk(prepared: PreparedFile): string {
+	return prepared.bom + restoreLineEndings(prepared.newContent, prepared.lineEnding);
+}
+
+/** 展示 diff：一次 worker batch 覆盖整批文件（每文件独立 strategy）。 */
+async function computePreviews(
+	files: readonly PreparedFile[],
+): Promise<Map<string, FileDiffPreview>> {
+	const previews = new Map<string, FileDiffPreview>();
+	if (files.length === 0) return previews;
+
+	const inputs = files.map((file, index) => ({
+		fileId: String(index),
+		oldContent: file.normalizedContent,
+		newContent: file.newContent,
+		// 可证明的 whole rewrite：matched spans 覆盖完整文件 → O(N) rewrite path。
+		strategy: (spansCoverWholeFile(file.matchedSpans, file.normalizedContent.length)
+			? { kind: "rewrite", reason: "all-lines-replaced" }
+			: { kind: "exact" }) as DiffStrategy,
+		contextLines: EDIT_PREVIEW_CONTEXT_LINES,
+	}));
+
+	try {
+		const response = await requestDiffBatch(inputs, "edit-preview");
+		for (const output of response.files) {
+			const file = files[Number(output.fileId)];
+			if (file === undefined) continue;
+			previews.set(file.absolutePath, {
+				previewDisplay: output.display,
+				previewStartLine: output.firstChangedLine,
+				previewTruncated: output.truncated,
+				changeStats: output.stats,
+			});
+		}
+	} catch (error) {
+		// worker 不可用/病态输入：降级为 O(N) unlocated 行 diff（stats 仍精确），
+		// 绝不在主线程重跑刚刚失败的 Myers —— 那把有界失败换成无界 UI 冻结。
+		console.error(
+			`edit preview diff worker failed ` +
+			`error=${error instanceof Error ? error.message : String(error)} ` +
+			`action="degrading this batch to unlocated line diff"`,
+		);
+		for (const file of files) {
+			previews.set(file.absolutePath, degradedPreview(file));
+		}
+	}
+	return previews;
+}
+
+function degradedPreview(file: PreparedFile): FileDiffPreview {
+	const degraded = degradeToUnlocated(file.normalizedContent, file.newContent);
+	const truncated = degraded.rows.length > DEFAULT_MAX_LINES;
+	return {
+		previewDisplay: {
+			lineNumberWidth: 1,
+			rows: truncated ? degraded.rows.slice(0, DEFAULT_MAX_LINES) : degraded.rows,
+		},
+		previewTruncated: truncated,
+		changeStats: degraded.stats,
+	};
+}
+
+/**
+ * 一个意图 = 一个事务：batch 内全部文件先解析、再整批落盘。
+ *
+ * - 解析面任一文件失败 → 一个字节都不写，全部失败一次性回报（status=rejected）；
+ * - 落盘面 IO 失败 → 已写文件按原始字节回滚；全部还原 = rejected，
+ *   还原失败的留在盘上 = partial（响亮报出，绝不静默半提交）；
+ * - abort 在提交点之前生效；越过提交点后事务必须走完，避免半写状态。
+ */
+export async function executeBatchEdits(
+	files: readonly BatchFileEditRequest[],
+	signal?: AbortSignal,
+	operations: EditEngineOperations = defaultEditEngineOperations,
+): Promise<BatchEditResult> {
+	return withAllFileMutationQueues(files.map((file) => file.absolutePath), async () => {
+		throwIfAborted(signal);
+
+		// 预热 diff worker（不等待）：冷启动（~300ms 模块加载）与文件 IO 重叠。
+		warmUpDiffWorker();
+
+		const resolutions: PreparedFileResult[] = [];
+		for (const file of files) {
+			resolutions.push(await prepareFileEdit(file, operations, signal));
+		}
+
+		if (resolutions.some((resolution) => resolution.kind === "failed")) {
+			return {
+				status: "rejected",
+				files: resolutions.map((resolution) =>
+					resolution.kind === "failed"
+						? { status: "failed", error: resolution.error, errorKind: resolution.errorKind }
+						: { status: "notWritten", restored: false }
+				),
+			};
+		}
+
+		const prepared = resolutions.map((resolution) => {
+			if (resolution.kind !== "prepared") throw new Error("unreachable: unresolved batch entry");
+			return resolution.prepared;
+		});
+		// 提交点：此后不再检查 abort，事务走完，避免半写状态。
+		throwIfAborted(signal);
+
+		const written: PreparedFile[] = [];
+		let writeFailure: { index: number; message: string } | undefined;
+		for (let index = 0; index < prepared.length; index += 1) {
+			const file = prepared[index]!;
+			try {
+				await operations.writeFile(file.absolutePath, serializeForDisk(file));
+				written.push(file);
+			} catch (error) {
+				writeFailure = { index, message: error instanceof Error ? error.message : String(error) };
+				break;
+			}
+		}
+
+		if (writeFailure === undefined) {
+			const previews = await computePreviews(prepared);
+			return {
+				status: "applied",
+				files: prepared.map((file) => ({
+					status: "applied" as const,
+					preview: previews.get(file.absolutePath) ?? degradedPreview(file),
+				})),
+			};
+		}
+
+		// 回滚：逆序写回原始字节（锁仍在手，无第三方写入窗口）。
+		const restored = new Set<string>();
+		for (const file of [...written].reverse()) {
+			try {
+				await operations.writeFile(file.absolutePath, file.rawContent);
+				restored.add(file.absolutePath);
+			} catch {
+				// 无法还原 → 该文件留在盘上，由 partial 状态响亮报出。
+			}
+		}
+		const stranded = written.filter((file) => !restored.has(file.absolutePath));
+		const previews = await computePreviews(stranded);
+		const strandedPaths = new Set(stranded.map((file) => file.absolutePath));
+
+		return {
+			status: stranded.length > 0 ? "partial" : "rejected",
+			files: prepared.map((file, index) => {
+				if (index === writeFailure.index) {
+					return { status: "failed" as const, error: writeFailure.message };
+				}
+				if (strandedPaths.has(file.absolutePath)) {
+					return {
+						status: "applied" as const,
+						preview: previews.get(file.absolutePath) ?? degradedPreview(file),
+					};
+				}
+				return { status: "notWritten" as const, restored: restored.has(file.absolutePath) };
+			}),
 		};
 	});
 }

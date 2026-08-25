@@ -5,18 +5,14 @@ import os from "node:os";
 import path from "node:path";
 
 import {
-	executeFileEdits,
+	executeBatchEdits,
 	MAX_EDIT_FILE_SIZE_BYTES,
 } from "./edit-engine.ts";
-import { buildOutcomeAgentContent, executeSingleFileEdit } from "./pipeline.ts";
+import { buildOutcomeAgentContent, executeEditBatch } from "./pipeline.ts";
 import { generateFinalDiff, serializeDisplayDiff } from "../_shared/final-diff.ts";
 
-async function makeTempDir(prefix) {
-	return fs.promises.mkdtemp(path.join(os.tmpdir(), prefix));
-}
-
 async function writeTempFile(prefix, name, content) {
-	const dir = await makeTempDir(prefix);
+	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), prefix));
 	const file = path.join(dir, name);
 	await fs.promises.writeFile(file, content, "utf-8");
 	return file;
@@ -25,77 +21,122 @@ async function writeTempFile(prefix, name, content) {
 test("large file exceeding MAX_EDIT_FILE_SIZE_BYTES is rejected without reading content", async () => {
 	let readCalled = false;
 
-	await assert.rejects(
-		() =>
-			executeFileEdits(
-				"/fake/big.ts",
-				[{ oldText: "x", newText: "y" }],
-				undefined,
-				{
-					stat: async () => ({ size: MAX_EDIT_FILE_SIZE_BYTES + 1 }),
-					access: async () => {},
-					readFile: async () => {
-						readCalled = true;
-						return "x\n";
-					},
-					writeFile: async () => {},
-				},
-			),
-		(err) => {
-			assert.ok(err instanceof Error);
-			assert.equal(
-				err.message,
-				`File too large: sizeBytes=${MAX_EDIT_FILE_SIZE_BYTES + 1} limitBytes=${MAX_EDIT_FILE_SIZE_BYTES}; use a narrower oldText or a streaming tool.`,
-			);
-			return true;
+	const result = await executeBatchEdits(
+		[{ absolutePath: "/fake/big.ts", edits: [{ oldText: "x", newText: "y" }] }],
+		undefined,
+		{
+			stat: async () => ({ size: MAX_EDIT_FILE_SIZE_BYTES + 1 }),
+			access: async () => {},
+			readFile: async () => {
+				readCalled = true;
+				return "x\n";
+			},
+			writeFile: async () => {},
 		},
 	);
 
+	assert.equal(result.status, "rejected");
+	assert.equal(
+		result.files[0].error,
+		`File too large: sizeBytes=${MAX_EDIT_FILE_SIZE_BYTES + 1} limitBytes=${MAX_EDIT_FILE_SIZE_BYTES}; use a narrower oldText or a streaming tool.`,
+	);
 	assert.equal(readCalled, false, "readFile must not be called for oversized files");
 });
 
-// ─── 2. Single-file execution outcome contract ───────────────────────────────
+// ─── 2. Batch outcome contract ──────────────────────────────────────────────
 
-test("successful execution outcome carries structured preview and changeStats", async () => {
+test("applied outcome carries structured preview and changeStats per file", async () => {
 	const file = await writeTempFile("pi-contract-", "target.ts", "const x = 1;\nconst y = 2;\n");
 
-	const outcome = await executeSingleFileEdit(
-		{ path: file, edits: [{ oldText: "const x = 1;", newText: "const x = 99;" }] },
+	const outcome = await executeEditBatch(
+		{
+			intent: "bump x",
+			files: [{ path: file, edits: [{ oldText: "const x = 1;", newText: "const x = 99;" }] }],
+		},
 		process.cwd(),
 	);
 
 	assert.equal(outcome.status, "applied");
-	if (outcome.status !== "applied") throw new Error("expected applied");
-
-	assert.ok(Array.isArray(outcome.previewDisplay.rows), "previewDisplay must be present");
-	assert.ok(typeof outcome.changeStats === "object", "changeStats must be present");
-
-	assert.ok(!("diff" in outcome), "diff field must not exist on success outcome");
-	assert.ok(!("canonicalPath" in outcome), "canonicalPath must not leak from execution");
-	assert.ok(!("edits" in outcome), "edit input must not be echoed in the outcome");
-	assert.ok(!("editCount" in outcome), "editCount must not be retained when the input already contains it");
+	const [fileOutcome] = outcome.files;
+	assert.equal(fileOutcome.status, "applied");
+	assert.equal(fileOutcome.path, file, "outcome reports the path the model wrote, not the canonical one");
+	assert.ok(Array.isArray(fileOutcome.display.rows), "display must be present");
+	assert.ok(typeof fileOutcome.changeStats === "object", "changeStats must be present");
+	assert.ok(!("edits" in fileOutcome), "edit input must not be echoed in the outcome");
+	assert.ok(!("canonicalPath" in fileOutcome), "canonicalPath must not leak from execution");
 });
 
-test("failed execution outcome carries errorKind for recoverable edit errors", async () => {
-	const file = await writeTempFile("pi-contract-", "target.ts", "const x = 1;\n");
+test("rejected outcome reports the disk state and every failure to the agent", async () => {
+	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-contract-batch-"));
+	const good = path.join(dir, "good.ts");
+	const stale = path.join(dir, "stale.ts");
+	await fs.promises.writeFile(good, "const a = 1;\n", "utf-8");
+	await fs.promises.writeFile(stale, "const b = 2;\n", "utf-8");
 
-	const outcome = await executeSingleFileEdit(
-		{ path: file, edits: [{ oldText: "missing text", newText: "replacement" }] },
+	const outcome = await executeEditBatch(
+		{
+			intent: "renumber constants",
+			files: [
+				{ path: good, edits: [{ oldText: "const a = 1;", newText: "const a = 11;" }] },
+				{ path: stale, edits: [{ oldText: "missing text", newText: "replacement" }] },
+			],
+		},
 		process.cwd(),
 	);
 
-	assert.equal(outcome.status, "failed");
-	if (outcome.status !== "failed") throw new Error("expected failed");
-	assert.equal(outcome.errorKind, "NOT_FOUND");
-	assert.match(outcome.error, /^oldText was not found\.$/);
+	assert.equal(outcome.status, "rejected");
 	assert.deepEqual(JSON.parse(buildOutcomeAgentContent(outcome)), {
-		status: "failed",
-		path: file,
-		error: {
-			kind: "NOT_FOUND",
-			message: "oldText was not found.",
-		},
+		status: "rejected",
+		written: [],
+		failed: [{ path: stale, kind: "NOT_FOUND", message: "oldText was not found." }],
 	});
+	assert.equal(await fs.promises.readFile(good, "utf-8"), "const a = 1;\n");
+});
+
+test("applied agent payload lists one entry per file with stats and location", async () => {
+	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-contract-applied-"));
+	const first = path.join(dir, "a.ts");
+	const second = path.join(dir, "b.ts");
+	await fs.promises.writeFile(first, "const a = 1;\n", "utf-8");
+	await fs.promises.writeFile(second, "const b = 2;\n", "utf-8");
+
+	const outcome = await executeEditBatch(
+		{
+			intent: "renumber constants",
+			files: [
+				{ path: first, hint: "left side", edits: [{ oldText: "const a = 1;", newText: "const a = 11;" }] },
+				{ path: second, edits: [{ oldText: "const b = 2;", newText: "const b = 22;" }] },
+			],
+		},
+		process.cwd(),
+	);
+
+	assert.deepEqual(JSON.parse(buildOutcomeAgentContent(outcome)), {
+		status: "applied",
+		files: [
+			{ path: first, changes: { additions: 1, deletions: 1, changedLines: 2 }, firstChangedLine: 1 },
+			{ path: second, changes: { additions: 1, deletions: 1, changedLines: 2 }, firstChangedLine: 1 },
+		],
+	});
+});
+
+test("the same physical file twice in one batch is rejected before any write", async () => {
+	const file = await writeTempFile("pi-contract-dup-", "target.ts", "const x = 1;\n");
+
+	await assert.rejects(
+		() => executeEditBatch(
+			{
+				intent: "double entry",
+				files: [
+					{ path: file, edits: [{ oldText: "const x = 1;", newText: "const x = 2;" }] },
+					{ path: `./${path.relative(process.cwd(), file)}`, edits: [{ oldText: "const", newText: "let" }] },
+				],
+			},
+			process.cwd(),
+		),
+		/same file; merge their edits/,
+	);
+	assert.equal(await fs.promises.readFile(file, "utf-8"), "const x = 1;\n");
 });
 
 test("shared final diff produces only the changed window, not the whole file", () => {

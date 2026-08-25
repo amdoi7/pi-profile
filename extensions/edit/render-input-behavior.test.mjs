@@ -3,122 +3,176 @@ import assert from "node:assert/strict";
 
 import { buildCallToolViewModel, parseEditRequest } from "./pipeline.ts";
 
-function makeArgs(path, edits) {
-	return { path, edits };
+function batch(files, intent = "state the change") {
+	return { intent, files };
 }
 
 function makeEdit(oldText, newText) {
 	return { oldText, newText };
 }
 
-test("parseEditRequest returns a ready request for a valid single-file edit", () => {
-	const resolution = parseEditRequest(makeArgs("a.ts", [
-		makeEdit("foo", "alpha"),
-		makeEdit("bar", "beta"),
+test("parseEditRequest returns a ready batch for several files", () => {
+	const request = parseEditRequest(batch([
+		{ path: "a.ts", edits: [makeEdit("foo", "alpha"), makeEdit("bar", "beta")] },
+		{ path: "b.ts", hint: "call site", edits: [makeEdit("baz", "gamma")] },
 	]));
 
-	assert.equal(resolution.path, "a.ts");
-	assert.equal(resolution.edits.length, 2);
+	assert.equal(request.intent, "state the change");
+	assert.equal(request.files.length, 2);
+	assert.equal(request.files[0].edits.length, 2);
+	assert.equal(request.files[1].hint, "call site");
+});
+
+test("parseEditRequest collapses a multi-line intent into one label", () => {
+	const request = parseEditRequest(batch([{ path: "a.ts", edits: [makeEdit("foo", "alpha")] }], "split\n  ToolCtx  into two"));
+
+	assert.equal(request.intent, "split ToolCtx into two");
+});
+
+test("parseEditRequest rejects an empty intent", () => {
+	assert.throws(
+		() => parseEditRequest(batch([{ path: "a.ts", edits: [makeEdit("foo", "alpha")] }], "   ")),
+		/intent must not be empty/,
+	);
+});
+
+test("parseEditRequest rejects a missing intent", () => {
+	assert.throws(
+		() => parseEditRequest({ files: [{ path: "a.ts", edits: [makeEdit("foo", "alpha")] }] }),
+		/intent must be a string/,
+	);
 });
 
 test("parseEditRequest accepts replaceAll", () => {
-	const resolution = parseEditRequest(makeArgs("/tmp/demo.ts", [
-		{ oldText: "before", newText: "after", replaceAll: true },
+	const request = parseEditRequest(batch([
+		{ path: "/tmp/demo.ts", edits: [{ oldText: "before", newText: "after", replaceAll: true }] },
 	]));
 
-	assert.equal(resolution.edits[0]?.replaceAll, true);
+	assert.equal(request.files[0].edits[0].replaceAll, true);
 });
 
-test("parseEditRequest rejects non-boolean replaceAll", () => {
-	assert.throws(() =>
-		parseEditRequest(makeArgs("/tmp/demo.ts", [
-			{ oldText: "before", newText: "after", replaceAll: "yes" },
+test("parseEditRequest rejects non-boolean replaceAll with the field path", () => {
+	assert.throws(
+		() => parseEditRequest(batch([
+			{ path: "/tmp/demo.ts", edits: [{ oldText: "before", newText: "after", replaceAll: "yes" }] },
 		])),
-	/replaceAll must be boolean/,
+		/files\[0\]\.edits\[0\]\.replaceAll must be boolean/,
 	);
 });
 
-test("parseEditRequest parses edits given as a JSON string", () => {
-	const resolution = parseEditRequest(makeArgs("a.ts", JSON.stringify([makeEdit("foo", "alpha")])));
+test("parseEditRequest parses files given as a JSON string", () => {
+	const request = parseEditRequest({
+		intent: "state the change",
+		files: JSON.stringify([{ path: "a.ts", edits: [makeEdit("foo", "alpha")] }]),
+	});
 
-	assert.equal(resolution.edits.length, 1);
-	assert.deepEqual(resolution.edits, [makeEdit("foo", "alpha")]);
+	assert.equal(request.files.length, 1);
+	assert.deepEqual(request.files[0].edits, [makeEdit("foo", "alpha")]);
+});
+
+test("parseEditRequest parses per-file edits given as a JSON string", () => {
+	const request = parseEditRequest(batch([
+		{ path: "a.ts", edits: JSON.stringify([makeEdit("foo", "alpha")]) },
+	]));
+
+	assert.deepEqual(request.files[0].edits, [makeEdit("foo", "alpha")]);
 });
 
 test("parseEditRequest still rejects malformed JSON string edits", () => {
-	assert.throws(() =>
-		parseEditRequest(makeArgs("a.ts", "not-json")),
-	/edits must be an array/,
+	assert.throws(
+		() => parseEditRequest(batch([{ path: "a.ts", edits: "not-json" }])),
+		/files\[0\]\.edits must be an array/,
 	);
 });
 
-test("parseEditRequest merges the flat legacy { path, oldText, newText } shape", () => {
-	const resolution = parseEditRequest({
+test("parseEditRequest lifts the built-in single-file shape into the batch", () => {
+	const request = parseEditRequest({
+		intent: "state the change",
 		path: "a.ts",
-		oldText: "foo",
-		newText: "alpha",
+		edits: [makeEdit("foo", "alpha")],
 	});
 
-	assert.equal(resolution.path, "a.ts");
-	assert.deepEqual(resolution.edits, [{ oldText: "foo", newText: "alpha" }]);
+	assert.equal(request.files.length, 1);
+	assert.equal(request.files[0].path, "a.ts");
+	assert.deepEqual(request.files[0].edits, [makeEdit("foo", "alpha")]);
 });
 
-test("parseEditRequest keeps a flat legacy replaceAll on the merged edit", () => {
-	const resolution = parseEditRequest({
+test("parseEditRequest lifts the flat { path, oldText, newText } shape with replaceAll", () => {
+	const request = parseEditRequest({
+		intent: "state the change",
 		path: "a.ts",
 		oldText: "foo",
 		newText: "alpha",
 		replaceAll: true,
 	});
 
-	assert.deepEqual(resolution.edits, [{ oldText: "foo", newText: "alpha", replaceAll: true }]);
+	assert.deepEqual(request.files[0].edits, [{ oldText: "foo", newText: "alpha", replaceAll: true }]);
 });
 
-test("parseEditRequest appends flat legacy edits after explicit edits", () => {
-	const resolution = parseEditRequest({
+test("parseEditRequest keeps a lifted single file ahead of explicitly listed files", () => {
+	const request = parseEditRequest({
+		intent: "state the change",
 		path: "a.ts",
-		edits: [{ oldText: "foo", newText: "alpha" }],
-		oldText: "bar",
-		newText: "beta",
+		oldText: "foo",
+		newText: "alpha",
+		files: [{ path: "b.ts", edits: [makeEdit("bar", "beta")] }],
 	});
 
-	assert.equal(resolution.edits.length, 2);
-	assert.deepEqual(resolution.edits[1], { oldText: "bar", newText: "beta" });
+	assert.deepEqual(request.files.map((file) => file.path), ["a.ts", "b.ts"]);
 });
 
-test("parseEditRequest rejects unknown edit properties", () => {
-	assert.throws(() =>
-		parseEditRequest(makeArgs("a.ts", [{ oldText: "foo", newText: "bar", extra: true }])),
-	/extra must be removed/,
+test("parseEditRequest rejects the same path listed twice", () => {
+	assert.throws(
+		() => parseEditRequest(batch([
+			{ path: "a.ts", edits: [makeEdit("foo", "alpha")] },
+			{ path: "a.ts", edits: [makeEdit("bar", "beta")] },
+		])),
+		/files\[1\]\.path repeats a\.ts; merge its edits into one entry/,
+	);
+});
+
+test("parseEditRequest rejects unknown edit properties with the field path", () => {
+	assert.throws(
+		() => parseEditRequest(batch([
+			{ path: "a.ts", edits: [{ oldText: "foo", newText: "bar", extra: true }] },
+		])),
+		/files\[0\]\.edits\[0\]\.extra must be removed/,
+	);
+});
+
+test("parseEditRequest rejects unknown file properties", () => {
+	assert.throws(
+		() => parseEditRequest(batch([{ path: "a.ts", note: "why", edits: [makeEdit("foo", "alpha")] }])),
+		/files\[0\]\.note must be removed/,
 	);
 });
 
 test("parseEditRequest rejects extra top-level properties", () => {
-	assert.throws(() =>
-		parseEditRequest({ path: "a.ts", edits: [makeEdit("foo", "alpha")], surprise: 1 }),
-	/surprise must be removed/,
+	assert.throws(
+		() => parseEditRequest({ ...batch([{ path: "a.ts", edits: [makeEdit("foo", "alpha")] }]), surprise: 1 }),
+		/surprise must be removed/,
 	);
 });
 
 test("buildCallToolViewModel reports a missing oldText", () => {
-	const viewModel = buildCallToolViewModel(makeArgs("a.ts", [{ newText: "foo" }]));
+	const viewModel = buildCallToolViewModel(batch([{ path: "a.ts", edits: [{ newText: "foo" }] }]));
 
 	assert.equal(viewModel.kind, "invalid");
-	assert.match(viewModel.message, /edits\[0\]\.oldText must be a string/);
+	assert.match(viewModel.message, /files\[0\]\.edits\[0\]\.oldText must be a string/);
 });
 
 test("buildCallToolViewModel rejects a missing path", () => {
-	const viewModel = buildCallToolViewModel({ edits: [{ oldText: "foo", newText: "bar" }] });
+	const viewModel = buildCallToolViewModel(batch([{ edits: [makeEdit("foo", "bar")] }]));
 
 	assert.equal(viewModel.kind, "invalid");
-	assert.match(viewModel.message, /path must be a string/);
+	assert.match(viewModel.message, /files\[0\]\.path must be a string/);
 });
 
-test("buildCallToolViewModel preserves the request path without reading or canonicalizing files", () => {
-	const viewModel = buildCallToolViewModel(makeArgs("./nested/../example.ts", [
-		{ oldText: "hello", newText: "hi" },
+test("buildCallToolViewModel preserves request paths without reading or canonicalizing files", () => {
+	const viewModel = buildCallToolViewModel(batch([
+		{ path: "./nested/../example.ts", edits: [makeEdit("hello", "hi")] },
 	]));
 
 	assert.equal(viewModel.kind, "call");
-	assert.equal(viewModel.path, "./nested/../example.ts");
+	assert.deepEqual(viewModel.files, [{ path: "./nested/../example.ts", editCount: 1 }]);
 });

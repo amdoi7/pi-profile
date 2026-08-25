@@ -1,3 +1,12 @@
+/**
+ * pipeline.ts —— edit 的适配层：参数契约 → 事务执行 → agent/UI payload。
+ *
+ * 契约核心：一个意图 = 一次调用 = 一个事务。`intent` 是这批修改存在的理由，
+ * `files[]` 是这个意图触碰的全部文件；整批要么全部落盘，要么一个字节都不落
+ * （engine 保证）。模型因此不需要在「多次单文件调用」之间自己维护一致性，
+ * 也不会在半应用状态上重试。
+ */
+
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -5,8 +14,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import type { ChangeStats, DisplayDiff } from "../_shared/final-diff.ts";
 import {
-	executeFileEdits,
-	isEditToolError,
+	executeBatchEdits,
 	type FileEditOperation,
 	type RecoverableEditErrorKind,
 } from "./edit-engine.ts";
@@ -23,15 +31,30 @@ const editOperationSchema = Type.Object(
 	{ additionalProperties: false },
 );
 
-// One file per call ({ path, edits }), matching pi's built-in edit tool so
-// models never have to learn a second shape. Multi-file edits are done with
-// one call per file; pi executes them in parallel.
-const editRequestSchema = Type.Object(
+const fileEditsSchema = Type.Object(
 	{
 		path: Type.String({ description: "Path to the file to edit (relative or absolute)." }),
+		hint: Type.Optional(Type.String({
+			description: "Short note on this file's role in the intent, e.g. 'compile site picks ctx by outlet'.",
+		})),
 		edits: Type.Array(editOperationSchema, {
 			minItems: 1,
-			description: "One or more targeted replacements, each matched against the original file.",
+			description: "Targeted replacements for this file, each matched against the file's original content.",
+		}),
+	},
+	{ additionalProperties: false },
+);
+
+// 一次调用 = 一个意图 = 一个事务：意图触碰的每个文件都进 files[]，
+// 不拆成多次调用（多次调用之间没有事务边界，失败会留下半应用状态）。
+const editRequestSchema = Type.Object(
+	{
+		intent: Type.String({
+			description: "One line: the single change this batch delivers, e.g. 'split ToolCtx into PullCtx/ActCtx'.",
+		}),
+		files: Type.Array(fileEditsSchema, {
+			minItems: 1,
+			description: "Every file this intent touches; the whole batch applies atomically or not at all.",
 		}),
 	},
 	{ additionalProperties: false },
@@ -40,44 +63,37 @@ const editRequestSchema = Type.Object(
 export const editRequestParameters: ToolDefinition["parameters"] = editRequestSchema;
 
 export type EditRequest = Static<typeof editRequestSchema>;
+export type FileEditRequest = Static<typeof fileEditsSchema>;
 
-export type EditOutcome =
+/** 文件在本次事务中的结局；path 回报模型给的原始路径（展示与定位都用它）。 */
+export type FileOutcome = { path: string; hint?: string } & (
 	| {
 			status: "applied";
-			path: string;
-			previewDisplay: DisplayDiff;
-			previewStartLine?: number;
-			previewTruncated: boolean;
 			changeStats: ChangeStats;
+			display: DisplayDiff;
+			truncated: boolean;
+			firstChangedLine?: number;
 	  }
-	| {
-			status: "failed";
-			path: string;
-			error: string;
-			errorKind?: RecoverableEditErrorKind;
-	  };
+	| { status: "failed"; error: string; errorKind?: RecoverableEditErrorKind }
+	/** 匹配无误但未落盘；restored=true 表示写过又被回滚。 */
+	| { status: "notWritten"; restored: boolean }
+);
+
+export type BatchOutcome = {
+	status: "applied" | "rejected" | "partial";
+	intent: string;
+	files: FileOutcome[];
+};
 
 export type CallToolViewModel = {
 	kind: "call";
-	path: string;
-	edits: FileEditOperation[];
-};
-
-/** 文件结果统一为 _shared 的 FileMutationResult（label="edit"，构建时填入 cwd）。 */
-export type FileResultView = FileMutationResult;
-
-export type ResultToolViewModel = {
-	kind: "result";
-	file: FileResultView;
+	intent: string;
+	files: Array<{ path: string; hint?: string; editCount: number }>;
 };
 
 export type CallRenderViewModel =
 	| { kind: "invalid"; message: string }
 	| CallToolViewModel;
-
-export type ToolViewModel =
-	| CallRenderViewModel
-	| ResultToolViewModel;
 
 function resolveFilePath(filePath: string, cwd: string): string {
 	return path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
@@ -100,31 +116,20 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/**
- * 手写校验（schema 只做 provider 参数契约）：规则简单、错误消息带字段路径，
- * 模型可直接行动；unknown key 报 "must be removed"（normalize 不吞未知键）。
- */
-export function parseEditRequest(input: unknown): EditRequest {
-	const normalized = normalizeEditInput(input);
-	if (!isRecord(normalized)) invalidEditRequest("path must be a string");
-	for (const key of Object.keys(normalized)) {
-		if (key !== "path" && key !== "edits") invalidEditRequest(`${key} must be removed`);
-	}
-	if (typeof normalized.path !== "string") invalidEditRequest("path must be a string");
-	if (!Array.isArray(normalized.edits)) invalidEditRequest("edits must be an array");
-	if (normalized.edits.length === 0) invalidEditRequest("edits must not be empty");
-
-	const edits = normalized.edits.map((entry, index) => {
-		if (!isRecord(entry)) invalidEditRequest(`edits[${index}] must be an object`);
+function parseEditOperations(rawEdits: unknown, filePath: string): FileEditOperation[] {
+	if (!Array.isArray(rawEdits)) invalidEditRequest(`${filePath}.edits must be an array`);
+	if (rawEdits.length === 0) invalidEditRequest(`${filePath}.edits must not be empty`);
+	return rawEdits.map((entry, index) => {
+		if (!isRecord(entry)) invalidEditRequest(`${filePath}.edits[${index}] must be an object`);
 		for (const key of Object.keys(entry)) {
 			if (key !== "oldText" && key !== "newText" && key !== "replaceAll") {
-				invalidEditRequest(`${key} must be removed`);
+				invalidEditRequest(`${filePath}.edits[${index}].${key} must be removed`);
 			}
 		}
-		if (typeof entry.oldText !== "string") invalidEditRequest(`edits[${index}].oldText must be a string`);
-		if (typeof entry.newText !== "string") invalidEditRequest(`edits[${index}].newText must be a string`);
+		if (typeof entry.oldText !== "string") invalidEditRequest(`${filePath}.edits[${index}].oldText must be a string`);
+		if (typeof entry.newText !== "string") invalidEditRequest(`${filePath}.edits[${index}].newText must be a string`);
 		if (entry.replaceAll !== undefined && typeof entry.replaceAll !== "boolean") {
-			invalidEditRequest(`edits[${index}].replaceAll must be boolean`);
+			invalidEditRequest(`${filePath}.edits[${index}].replaceAll must be boolean`);
 		}
 		return {
 			oldText: entry.oldText,
@@ -132,8 +137,49 @@ export function parseEditRequest(input: unknown): EditRequest {
 			...(entry.replaceAll !== undefined ? { replaceAll: entry.replaceAll } : {}),
 		};
 	});
+}
 
-	return { path: normalized.path, edits };
+/**
+ * 手写校验（schema 只做 provider 参数契约）：错误消息带字段路径，模型可直接
+ * 行动。unknown key 报 "must be removed"（normalize 不吞未知键）。
+ */
+export function parseEditRequest(input: unknown): EditRequest {
+	const normalized = normalizeEditInput(input);
+	if (!isRecord(normalized)) invalidEditRequest("intent must be a string");
+	for (const key of Object.keys(normalized)) {
+		if (key !== "intent" && key !== "files") invalidEditRequest(`${key} must be removed`);
+	}
+	if (typeof normalized.intent !== "string") invalidEditRequest("intent must be a string");
+	// 换行/连续空白折叠：intent 是一行标签，折叠语义无歧义。
+	const intent = normalized.intent.replace(/\s+/g, " ").trim();
+	if (intent === "") invalidEditRequest("intent must not be empty");
+	if (!Array.isArray(normalized.files)) invalidEditRequest("files must be an array");
+	if (normalized.files.length === 0) invalidEditRequest("files must not be empty");
+
+	const seenPaths = new Set<string>();
+	const files = normalized.files.map((entry, index) => {
+		if (!isRecord(entry)) invalidEditRequest(`files[${index}] must be an object`);
+		for (const key of Object.keys(entry)) {
+			if (key !== "path" && key !== "hint" && key !== "edits") {
+				invalidEditRequest(`files[${index}].${key} must be removed`);
+			}
+		}
+		if (typeof entry.path !== "string") invalidEditRequest(`files[${index}].path must be a string`);
+		if (entry.hint !== undefined && typeof entry.hint !== "string") {
+			invalidEditRequest(`files[${index}].hint must be a string`);
+		}
+		if (seenPaths.has(entry.path)) {
+			invalidEditRequest(`files[${index}].path repeats ${entry.path}; merge its edits into one entry`);
+		}
+		seenPaths.add(entry.path);
+		return {
+			path: entry.path,
+			...(entry.hint !== undefined ? { hint: entry.hint } : {}),
+			edits: parseEditOperations(entry.edits, `files[${index}]`),
+		};
+	});
+
+	return { intent, files };
 }
 
 export function buildCallToolViewModel(args: unknown): CallRenderViewModel {
@@ -141,122 +187,120 @@ export function buildCallToolViewModel(args: unknown): CallRenderViewModel {
 		const request = parseEditRequest(args);
 		return {
 			kind: "call",
-			path: request.path,
-			edits: request.edits.slice(),
+			intent: request.intent,
+			files: request.files.map((file) => ({
+				path: file.path,
+				...(file.hint !== undefined ? { hint: file.hint } : {}),
+				editCount: file.edits.length,
+			})),
 		};
 	} catch (error) {
 		return { kind: "invalid", message: error instanceof Error ? error.message : String(error) };
 	}
 }
 
-function isOperationAborted(error: unknown): boolean {
-	return error instanceof Error && error.message === "Operation aborted";
-}
-
 /**
- * Execute the single-file edit request atomically and build its outcome.
- * Aborts rethrow; recoverable edit failures become failed outcomes.
+ * 执行整批：canonical path 去重后交给 engine 的事务。
+ * 文件级失败进 outcome（软失败）；abort 与重复路径等硬失败上抛。
  */
-export async function executeSingleFileEdit(
+export async function executeEditBatch(
 	request: EditRequest,
 	cwd: string,
 	signal?: AbortSignal,
-): Promise<EditOutcome> {
-	const targetPath = canonicalizePath(request.path, cwd);
+): Promise<BatchOutcome> {
+	const canonicalPaths = request.files.map((file) => canonicalizePath(file.path, cwd));
+	// 同一物理文件出现两次 → 事务会自锁，且第二份 edits 会针对已改内容匹配：
+	// 结构上不可执行，响亮拒绝而不是猜测合并顺序。
+	const firstIndexByPath = new Map<string, number>();
+	canonicalPaths.forEach((canonicalPath, index) => {
+		const first = firstIndexByPath.get(canonicalPath);
+		if (first !== undefined) {
+			invalidEditRequest(
+				`files[${index}].path and files[${first}].path are the same file; merge their edits into one entry`,
+			);
+		}
+		firstIndexByPath.set(canonicalPath, index);
+	});
 
-	try {
-		const result = await executeFileEdits(targetPath, request.edits, signal);
+	const result = await executeBatchEdits(
+		request.files.map((file, index) => ({
+			absolutePath: canonicalPaths[index]!,
+			edits: file.edits,
+		})),
+		signal,
+	);
 
-		const outcome: EditOutcome = {
-			path: request.path,
+	return {
+		status: result.status,
+		intent: request.intent,
+		files: result.files.map((fileResult, index) => {
+			const source = request.files[index]!;
+			const identity = { path: source.path, ...(source.hint !== undefined ? { hint: source.hint } : {}) };
+			if (fileResult.status === "applied") {
+				return {
+					...identity,
+					status: "applied",
+					changeStats: fileResult.preview.changeStats,
+					display: fileResult.preview.previewDisplay,
+					truncated: fileResult.preview.previewTruncated,
+					...(fileResult.preview.previewStartLine !== undefined
+						? { firstChangedLine: fileResult.preview.previewStartLine }
+						: {}),
+				};
+			}
+			if (fileResult.status === "failed") {
+				return {
+					...identity,
+					status: "failed",
+					error: fileResult.error,
+					...(fileResult.errorKind !== undefined ? { errorKind: fileResult.errorKind } : {}),
+				};
+			}
+			return { ...identity, status: "notWritten", restored: fileResult.restored };
+		}),
+	};
+}
+
+/**
+ * agent 结果：只传事实。成功列每个文件的 stats/定位；失败列磁盘现状
+ * （written = 仍被改动的文件，rejected 时为空数组）+ 每个失败点。
+ */
+export function buildOutcomeAgentContent(outcome: BatchOutcome): string {
+	if (outcome.status === "applied") {
+		return JSON.stringify({
 			status: "applied",
-			previewDisplay: result.previewDisplay,
-			previewTruncated: result.previewTruncated,
-			changeStats: result.changeStats,
-		};
-		if (typeof result.previewStartLine === "number") {
-			outcome.previewStartLine = result.previewStartLine;
-		}
-		return outcome;
-	} catch (error) {
-		if (signal?.aborted || isOperationAborted(error)) {
-			throw error instanceof Error ? error : new Error(String(error));
-		}
-
-		const failure = error instanceof Error ? error : new Error(String(error));
-		return {
-			path: request.path,
-			status: "failed",
-			error: failure.message,
-			errorKind: isEditToolError(failure) ? failure.kind : undefined,
-		};
-	}
-}
-
-export type AgentEditOutcome =
-	| {
-			status: "applied";
-			path: string;
-			changes: ChangeStats;
-			firstChangedLine?: number;
-	  }
-	| {
-			status: "failed";
-			path: string;
-			error: {
-				kind?: RecoverableEditErrorKind;
-				message: string;
-			};
-	  };
-
-export function buildOutcomeAgentContent(outcome: EditOutcome): string {
-	if (outcome.status === "failed") {
-		const agentOutcome: AgentEditOutcome = {
-			status: "failed",
-			path: outcome.path,
-			error: {
-				kind: outcome.errorKind,
-				message: outcome.error,
-			},
-		};
-		return JSON.stringify(agentOutcome);
+			files: outcome.files.map((file) => {
+				if (file.status !== "applied") throw new Error("unreachable: applied batch with unapplied file");
+				return {
+					path: file.path,
+					changes: file.changeStats,
+					...(file.firstChangedLine !== undefined ? { firstChangedLine: file.firstChangedLine } : {}),
+				};
+			}),
+		});
 	}
 
-	const agentOutcome: AgentEditOutcome = {
-		status: "applied",
-		path: outcome.path,
-		changes: outcome.changeStats,
-		firstChangedLine: outcome.previewStartLine,
-	};
-	return JSON.stringify(agentOutcome);
+	return JSON.stringify({
+		status: outcome.status,
+		written: outcome.files.filter((file) => file.status === "applied").map((file) => file.path),
+		failed: outcome.files
+			.filter((file): file is Extract<FileOutcome, { status: "failed" }> => file.status === "failed")
+			.map((file) => ({
+				path: file.path,
+				...(file.errorKind !== undefined ? { kind: file.errorKind } : {}),
+				message: file.error,
+			})),
+	});
 }
 
-function buildFileResultView(outcome: EditOutcome, cwd: string): FileResultView {
-	if (outcome.status === "failed") {
-		return {
-			label: "edit",
-			path: outcome.path,
-			cwd,
-			changeStats: { additions: 0, deletions: 0, changedLines: 0 },
-			display: { lineNumberWidth: 1, rows: [] },
-			truncated: false,
-			status: "failed",
-			error: outcome.error,
-		};
-	}
-	return {
-		label: "edit",
-		path: outcome.path,
-		cwd,
-		changeStats: outcome.changeStats,
-		display: outcome.previewDisplay,
-		truncated: outcome.previewTruncated,
-	};
-}
+/** UI details：renderResult 从这里重建整批展示（execute 的唯一 UI 出口）。 */
+export type BatchUiDetails = {
+	status: BatchOutcome["status"];
+	intent: string;
+	cwd: string;
+	files: FileOutcome[];
+};
 
-export function buildOutcomeUiDetails(outcome: EditOutcome, cwd: string): ResultToolViewModel {
-	return {
-		kind: "result",
-		file: buildFileResultView(outcome, cwd),
-	};
+export function buildOutcomeUiDetails(outcome: BatchOutcome, cwd: string): BatchUiDetails {
+	return { status: outcome.status, intent: outcome.intent, cwd, files: outcome.files };
 }

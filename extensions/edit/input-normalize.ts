@@ -1,17 +1,55 @@
 /**
- * Model-input tolerance for the edit tool, aligned with pi's built-in edit.
+ * Model-input tolerance for the batch edit tool.
  *
- * Only the two shapes whose intent is unambiguous are normalized:
- * - edits given as a JSON string (built-in parity);
- * - flat legacy shape { path, oldText, newText } merged into the edits
- *   (built-in parity), with a flat replaceAll kept on the merged edit.
+ * Only shapes whose intent is unambiguous are normalized into { intent, files }:
+ * - `files` / `edits` given as a JSON string (provider serialization slip);
+ * - the single-file shape `{ path, edits }` (pi's built-in edit shape, which
+ *   models reach for by habit) lifted into `files: [{ path, edits }]`;
+ * - the flat shape `{ path, oldText, newText }` lifted the same way.
  *
- * Anything else is left untouched so validation rejects it loudly. No
- * numbered-pair or expectedOccurrences compatibility (not backward compatible).
+ * `intent` is never invented: a batch without a stated intent is rejected by
+ * validation, because the intent is the transaction's name, not decoration.
+ * Anything else is left untouched so validation rejects it loudly.
  */
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseJsonArray(value: unknown): unknown {
+	if (typeof value !== "string") return value;
+	try {
+		const parsed = JSON.parse(value);
+		return Array.isArray(parsed) ? parsed : value;
+	} catch {
+		// fall through to the validation error for a non-array value
+		return value;
+	}
+}
+
+/** 单文件形状（内置 edit / 旧契约）→ files[0]；flat oldText/newText 同理。 */
+function liftSingleFileShape(request: Record<string, unknown>): void {
+	if (typeof request.path !== "string") return;
+
+	const edits = Array.isArray(request.edits) ? request.edits : [];
+	if (typeof request.oldText === "string" && typeof request.newText === "string") {
+		edits.push({
+			oldText: request.oldText,
+			newText: request.newText,
+			...(typeof request.replaceAll === "boolean" ? { replaceAll: request.replaceAll } : {}),
+		});
+	}
+	if (edits.length === 0) return;
+
+	const file: Record<string, unknown> = { path: request.path, edits };
+	if (typeof request.hint === "string") file.hint = request.hint;
+	request.files = [file, ...(Array.isArray(request.files) ? request.files : [])];
+	delete request.path;
+	delete request.edits;
+	delete request.oldText;
+	delete request.newText;
+	delete request.replaceAll;
+	delete request.hint;
 }
 
 export function normalizeEditInput(input: unknown): unknown {
@@ -20,28 +58,19 @@ export function normalizeEditInput(input: unknown): unknown {
 	}
 	const request = { ...input };
 
-	if (typeof request.edits === "string") {
-		try {
-			const parsed = JSON.parse(request.edits);
-			if (Array.isArray(parsed)) {
-				request.edits = parsed;
-			}
-		} catch {
-			// fall through to the validation error for a non-array edits
-		}
-	}
+	request.files = parseJsonArray(request.files);
+	request.edits = parseJsonArray(request.edits);
+	if (request.files === undefined) delete request.files;
+	if (request.edits === undefined) delete request.edits;
 
-	if (typeof request.oldText === "string" && typeof request.newText === "string") {
-		const edits = Array.isArray(request.edits) ? [...request.edits] : [];
-		const edit: Record<string, unknown> = { oldText: request.oldText, newText: request.newText };
-		if (typeof request.replaceAll === "boolean") {
-			edit.replaceAll = request.replaceAll;
-		}
-		edits.push(edit);
-		delete request.oldText;
-		delete request.newText;
-		delete request.replaceAll;
-		request.edits = edits;
+	liftSingleFileShape(request);
+
+	if (Array.isArray(request.files)) {
+		request.files = request.files.map((entry) =>
+			isRecord(entry) && entry.edits !== undefined
+				? { ...entry, edits: parseJsonArray(entry.edits) }
+				: entry
+		);
 	}
 	return request;
 }
