@@ -30,7 +30,8 @@ async function loadRegisteredEditTool() {
 		recursive: true,
 		filter: (source) => path.basename(source) !== "node_modules",
 	});
-	await copySharedFiles(tempSharedDir, ["file-link.ts", "code-preview.ts", "final-diff.ts", "diff-view.ts", "file-mutation-view.ts", "file-result.ts", "diff-service.ts", "diff-worker.ts"]);
+	// edit 不再依赖 diff worker：共享文件只剩渲染与 diff 构造链。
+	await copySharedFiles(tempSharedDir, ["file-link.ts", "code-preview.ts", "final-diff.ts", "diff-view.ts", "file-mutation-view.ts", "file-result.ts"]);
 	await linkPiPackages(tempExtensionDir, { tui: true });
 	await linkSharedPackages(tempExtensionDir);
 

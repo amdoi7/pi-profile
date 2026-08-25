@@ -62,9 +62,24 @@
 - abort 在提交点之前生效；越过提交点后事务走完，避免半写状态
 - 重叠或嵌套的 replacement 被拒绝
 - LF/CRLF 与直引号/弯引号只做窄范围归一化；空白、破折号和其他文本仍须精确匹配
-- 展示 diff：整批一次 worker 往返（每文件独立 strategy：可证明整文件替换走 O(N)
-  rewrite path，否则 exact + 250ms Myers tripwire）；worker 不可用时降级为 O(N)
-  unlocated 行 diff（stats 仍精确），绝不在主线程重跑刚失败的 Myers
+
+## 展示 diff：不求解，直接构造
+
+通用 diff（Myers, O(N·D)）解决的是「只知道前后两个文本、不知道改了哪里」；
+edit **确切知道**改了哪些字节（matched spans），所以 diff 是已知的，不是待求的。
+`span-diff.ts` 由此把展示 diff 的规模从**文件规模**降到**编辑规模**：
+
+- 每个 span 扩到行边界 + 4 行 context = 一个展示窗口，重叠窗口合并；
+- 窗口内部仍交给共享 diff 引擎（行对齐、词级高亮、EOF annotation），输入只有
+  窗口那几行；窗口被 span 完整覆盖时走 O(N) rewrite path；
+- 窗口之间/首尾按精确行数补 fold 行（未改动区域两侧文本相同，行数天然相等）；
+  相邻 fold 合并成一条；
+- 唯一的全文级成本是数换行（`indexOf` 扫描，用于行号与折叠计数）。
+
+因此没有 diff worker、没有超时 tripwire 依赖、没有阈值预算——那些机器原本都是
+为「求解一个已知答案」服务的。正确性判据是逐字节等价：`span-diff.test.mjs` 断言
+构造出的 display / stats / firstChangedLine / 词级高亮与「把整个文件交给通用
+diff」完全相同。
 
 ## Failures
 
@@ -112,6 +127,7 @@ replacement 不显示内部数组下标；后续 replacement 显示为 `replacem
 - `index.ts`：tool 注册入口（schema/guidelines/execute/render 装配）
 - `pipeline.ts`：参数契约与校验、canonical 去重、批次执行、agent/UI payload
 - `input-normalize.ts`：模型输入容错（单文件形状 → 批次）
-- `edit-engine.ts`：匹配、替换、事务（多锁 + 解析闸门 + 回滚）、展示 diff
+- `edit-engine.ts`：匹配、替换、事务（多锁 + 解析闸门 + 回滚）
+- `span-diff.ts`：已知 span → 展示 diff（规模 = 编辑规模）
 - `ui.ts`：call/result render
 - `*.test.mjs`：行为测试

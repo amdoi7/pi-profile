@@ -1,8 +1,8 @@
 import { constants } from "node:fs";
 import { access, readFile, stat, writeFile } from "node:fs/promises";
-import { DEFAULT_MAX_LINES, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-import { degradeToUnlocated, type ChangeStats, type DisplayDiff } from "../_shared/final-diff.ts";
-import { requestDiffBatch, warmUpDiffWorker, type DiffStrategy } from "../_shared/diff-service.ts";
+import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
+import type { ChangeStats, DisplayDiff } from "../_shared/final-diff.ts";
+import { diffFromSpans } from "./span-diff.ts";
 
 /** preview 的 context 行数（与共享 diff 引擎默认一致）。 */
 const EDIT_PREVIEW_CONTEXT_LINES = 4;
@@ -513,61 +513,22 @@ function serializeForDisk(prepared: PreparedFile): string {
 	return prepared.bom + restoreLineEndings(prepared.newContent, prepared.lineEnding);
 }
 
-/** 展示 diff：一次 worker batch 覆盖整批文件（每文件独立 strategy）。 */
-async function computePreviews(
-	files: readonly PreparedFile[],
-): Promise<Map<string, FileDiffPreview>> {
-	const previews = new Map<string, FileDiffPreview>();
-	if (files.length === 0) return previews;
-
-	const inputs = files.map((file, index) => ({
-		fileId: String(index),
-		oldContent: file.normalizedContent,
-		newContent: file.newContent,
-		// 可证明的 whole rewrite：matched spans 覆盖完整文件 → O(N) rewrite path。
-		strategy: (spansCoverWholeFile(file.matchedSpans, file.normalizedContent.length)
-			? { kind: "rewrite", reason: "all-lines-replaced" }
-			: { kind: "exact" }) as DiffStrategy,
-		contextLines: EDIT_PREVIEW_CONTEXT_LINES,
-	}));
-
-	try {
-		const response = await requestDiffBatch(inputs, "edit-preview");
-		for (const output of response.files) {
-			const file = files[Number(output.fileId)];
-			if (file === undefined) continue;
-			previews.set(file.absolutePath, {
-				previewDisplay: output.display,
-				previewStartLine: output.firstChangedLine,
-				previewTruncated: output.truncated,
-				changeStats: output.stats,
-			});
-		}
-	} catch (error) {
-		// worker 不可用/病态输入：降级为 O(N) unlocated 行 diff（stats 仍精确），
-		// 绝不在主线程重跑刚刚失败的 Myers —— 那把有界失败换成无界 UI 冻结。
-		console.error(
-			`edit preview diff worker failed ` +
-			`error=${error instanceof Error ? error.message : String(error)} ` +
-			`action="degrading this batch to unlocated line diff"`,
-		);
-		for (const file of files) {
-			previews.set(file.absolutePath, degradedPreview(file));
-		}
-	}
-	return previews;
-}
-
-function degradedPreview(file: PreparedFile): FileDiffPreview {
-	const degraded = degradeToUnlocated(file.normalizedContent, file.newContent);
-	const truncated = degraded.rows.length > DEFAULT_MAX_LINES;
+/**
+ * 展示 diff：用已知的 matched spans 直接构造（span-diff），规模 = 编辑规模。
+ * 没有 worker、没有超时 tripwire、没有阈值预算——因为没有要「求解」的东西。
+ */
+function computePreview(file: PreparedFile): FileDiffPreview {
+	const diff = diffFromSpans(
+		file.normalizedContent,
+		file.newContent,
+		file.matchedSpans,
+		EDIT_PREVIEW_CONTEXT_LINES,
+	);
 	return {
-		previewDisplay: {
-			lineNumberWidth: 1,
-			rows: truncated ? degraded.rows.slice(0, DEFAULT_MAX_LINES) : degraded.rows,
-		},
-		previewTruncated: truncated,
-		changeStats: degraded.stats,
+		previewDisplay: diff.display,
+		previewStartLine: diff.firstChangedLine,
+		previewTruncated: diff.truncated,
+		changeStats: diff.stats,
 	};
 }
 
@@ -586,9 +547,6 @@ export async function executeBatchEdits(
 ): Promise<BatchEditResult> {
 	return withAllFileMutationQueues(files.map((file) => file.absolutePath), async () => {
 		throwIfAborted(signal);
-
-		// 预热 diff worker（不等待）：冷启动（~300ms 模块加载）与文件 IO 重叠。
-		warmUpDiffWorker();
 
 		const resolutions: PreparedFileResult[] = [];
 		for (const file of files) {
@@ -627,13 +585,9 @@ export async function executeBatchEdits(
 		}
 
 		if (writeFailure === undefined) {
-			const previews = await computePreviews(prepared);
 			return {
 				status: "applied",
-				files: prepared.map((file) => ({
-					status: "applied" as const,
-					preview: previews.get(file.absolutePath) ?? degradedPreview(file),
-				})),
+				files: prepared.map((file) => ({ status: "applied" as const, preview: computePreview(file) })),
 			};
 		}
 
@@ -648,7 +602,6 @@ export async function executeBatchEdits(
 			}
 		}
 		const stranded = written.filter((file) => !restored.has(file.absolutePath));
-		const previews = await computePreviews(stranded);
 		const strandedPaths = new Set(stranded.map((file) => file.absolutePath));
 
 		return {
@@ -658,26 +611,10 @@ export async function executeBatchEdits(
 					return { status: "failed" as const, error: writeFailure.message };
 				}
 				if (strandedPaths.has(file.absolutePath)) {
-					return {
-						status: "applied" as const,
-						preview: previews.get(file.absolutePath) ?? degradedPreview(file),
-					};
+					return { status: "applied" as const, preview: computePreview(file) };
 				}
 				return { status: "notWritten" as const, restored: restored.has(file.absolutePath) };
 			}),
 		};
 	});
-}
-
-/** matched spans 覆盖完整文件内容 → 可证明的 whole rewrite。 */
-function spansCoverWholeFile(spans: readonly MatchedEditSpan[], contentLength: number): boolean {
-	if (contentLength === 0) return true;
-	const sorted = [...spans].sort((a, b) => a.matchIndex - b.matchIndex);
-	let cursor = 0;
-	for (const span of sorted) {
-		if (span.matchIndex > cursor) return false;
-		cursor = Math.max(cursor, span.matchIndex + span.matchLength);
-		if (cursor >= contentLength) return true;
-	}
-	return false;
 }

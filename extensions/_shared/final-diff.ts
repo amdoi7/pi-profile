@@ -724,7 +724,7 @@ export function displayDiffFromLines(
 	};
 }
 
-function truncateDisplay(display: DisplayDiff): { display: DisplayDiff; truncated: boolean } {
+export function truncateDisplay(display: DisplayDiff): { display: DisplayDiff; truncated: boolean } {
 	const fullText = serializeDisplayDiff(display);
 	const truncated = truncateHead(fullText, {
 		maxLines: DEFAULT_MAX_LINES,
