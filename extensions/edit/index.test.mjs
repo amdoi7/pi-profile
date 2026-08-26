@@ -7,16 +7,23 @@ import * as path from "node:path";
 import editExtension from "./index.ts";
 import { editRequestParameters } from "./pipeline.ts";
 
-function captureTool() {
+function captureExtension() {
 	let registeredTool;
+	const handlers = new Map();
 	editExtension({
 		registerTool(definition) {
 			registeredTool = definition;
 		},
-		on() {},
+		on(event, handler) {
+			handlers.set(event, handler);
+		},
 	});
 	if (!registeredTool) throw new Error("edit tool was not registered");
-	return registeredTool;
+	return { tool: registeredTool, handlers };
+}
+
+function captureTool() {
+	return captureExtension().tool;
 }
 
 async function writeTempFile(name, content) {
@@ -30,13 +37,13 @@ function run(tool, args) {
 	return tool.execute("call-1", args, undefined, undefined, { cwd: process.cwd() });
 }
 
-// Soft failure (a rejected/partial batch) must surface as isError so the harness
-// error channel and downstream isError routing see it; a silent success-shaped
-// result trains blind retries. Evidence: 24 例 applied:0 但 isError:false
-// (fail-mining 2026-08-13).
+// 软失败（rejected/partial）必须进错误信封。但 AgentToolResult 没有 isError 字段：
+// executePreparedToolCall 正常返回一律 isError:false（pi-agent-core dist/agent-loop.js），
+// execute 里写 isError 会被丢弃；能改信封的只有 tool_result handler。
+// 语料证据：2026-08-25/26 共 23 例 rejected + 18 例 failed 落盘时 isError 都是 false。
 
-test("rejected batch is returned with isError true", async () => {
-	const tool = captureTool();
+test("a rejected batch flips the tool result envelope to isError", async () => {
+	const { tool, handlers } = captureExtension();
 	const file = await writeTempFile("target.ts", "const x = 1;\n");
 
 	const result = await run(tool, {
@@ -44,11 +51,31 @@ test("rejected batch is returned with isError true", async () => {
 		files: [{ path: file, edits: [{ oldText: "missing text", newText: "replacement" }] }],
 	});
 
-	assert.equal(result.isError, true, "soft failure must be marked isError");
 	const payload = JSON.parse(result.content[0].text);
 	assert.equal(payload.status, "rejected");
 	assert.deepEqual(payload.written, []);
 	assert.equal(payload.failed[0].kind, "NOT_FOUND");
+
+	const onToolResult = handlers.get("tool_result");
+	assert.ok(onToolResult, "extension must register a tool_result handler");
+	assert.deepEqual(
+		onToolResult({ type: "tool_result", toolName: "edit", isError: false, details: result.details }),
+		{ isError: true },
+	);
+});
+
+test("an applied batch and other tools leave the envelope untouched", async () => {
+	const { tool, handlers } = captureExtension();
+	const onToolResult = handlers.get("tool_result");
+	const file = await writeTempFile("target.ts", "const x = 1;\n");
+
+	const applied = await run(tool, {
+		intent: "bump the constant",
+		files: [{ path: file, edits: [{ oldText: "const x = 1;", newText: "const x = 2;" }] }],
+	});
+
+	assert.equal(onToolResult({ type: "tool_result", toolName: "edit", isError: false, details: applied.details }), undefined);
+	assert.equal(onToolResult({ type: "tool_result", toolName: "bash", isError: false, details: { status: "rejected" } }), undefined);
 });
 
 test("applied batch is not an error and keeps the intent in the UI details", async () => {

@@ -91,13 +91,22 @@ promptGuidelines/schema 中声明，不重复传递：
 - `NO_CHANGE`：`newText` 归一化后等于 `oldText`（替换不产生任何变化）
 - 重叠：`replacement N overlaps replacement M`
 - 参数校验失败：带字段路径（`files[1].edits[0].oldText must be a string`）
+- 参数残缺：报残缺本身，不报成形状错误——`edits` 缺失说「这一项只写了
+  path，重发」；`edits` 到达时是不合法 JSON 文本则带上 parser 原因并说「很可能在
+  传输中被截断，原样重发」。依据：实测语料里这两种形状几乎全是参数截断，
+  而非模型搞错 schema；报错说错原因会把模型送去改一个本来就对的东西。
 
 `path` 独立保存在结果字段和 UI 文件行中，不在错误正文重复。单个文件内的首个
 replacement 不显示内部数组下标；后续 replacement 显示为 `replacement N`。
 
 ## Agent Result
 
-`execute()` 返回 compact JSON `content`；`isError = status !== "applied"`。
+`execute()` 返回 compact JSON `content` 与批次 `details`。
+
+信封（`isError`）不在 `execute` 的返回值里：`AgentToolResult` 没有这个字段，
+`executePreparedToolCall` 对正常返回一律写 `isError:false`（pi-agent-core
+`dist/agent-loop.js`）。所以软失败（`rejected`/`partial`）由扩展的 `tool_result`
+handler 改信封；写在 execute 返回值里会被静默丢弃。
 
 成功：
 
@@ -119,8 +128,12 @@ replacement 不显示内部数组下标；后续 replacement 显示为 `replacem
 - 结果显示意图头（失败态附 `rejected · nothing written` / `partial · some files
   left changed`），下面每文件一行：路径 + 统计 + `hint` / `not written` /
   `restored`，成功文件行后接自己的 diff
-- 工具名归因只在意图头出现一次，文件行靠缩进归属
+- 工具名归因只在意图头出现一次，文件行靠缩进归属；缩进用 `Text` 的 paddingX
+  而不是字符串前缀——paddingX 逐行施加，所以 hint / 长路径折行后续行仍在层级内
+  （hint 宽度 p90=77 列，常见终端宽度下必然折行）
 - diff 旧/新行号分列，changed word 使用反显，折叠行显示省略数量
+- 渲染层不做契约裁判：读不懂 details 时（执行前失败的 `details={}`、旧版本会话
+  回放）直接降级渲染工具自己的 content 文本——那是当时能给用户的唯一真实信息
 
 ## Structure
 

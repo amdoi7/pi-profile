@@ -8,6 +8,7 @@
 import {
 	type Theme,
 	type ToolDefinition,
+	type ToolRenderResultOptions,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Text } from "@earendil-works/pi-tui";
 
@@ -40,7 +41,7 @@ function isFileOutcome(value: unknown): value is FileOutcome {
 	return value.status === "notWritten" && typeof value.restored === "boolean";
 }
 
-function isBatchUiDetails(value: unknown): value is BatchUiDetails {
+export function isBatchUiDetails(value: unknown): value is BatchUiDetails {
 	if (!isRecord(value)) return false;
 	if (value.status !== "applied" && value.status !== "rejected" && value.status !== "partial") return false;
 	if (typeof value.intent !== "string" || typeof value.cwd !== "string") return false;
@@ -87,7 +88,7 @@ export function renderCallViewModel(
 	return container;
 }
 
-/** 清 pending 态并复用/新建 Text（契约诊断与错误结果共享的单出口）。 */
+/** 清 pending 态并复用/新建 Text（文本态结果的单出口）。 */
 function replaceWithText(context: EditToolRenderContext, value: string): Text {
 	clearPendingFileMutationRender(context);
 	const text = context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
@@ -95,17 +96,21 @@ function replaceWithText(context: EditToolRenderContext, value: string): Text {
 	return text;
 }
 
-/** 执行错误结果（校验/abort）：渲染真实错误文本。 */
-export function renderResultTextContent(
+/**
+ * 非批次 payload 的落地渲染：显示工具自己的 content 文本。
+ *
+ * 覆盖 pi 的执行前失败信封（createErrorToolResult → details={}，execute 从未运行）
+ * 与历史版本记录的旧 payload。渲染层不做契约裁判：读不懂 payload 时，能给用户的
+ * 唯一真实信息就是这条消息，掩盖它等于把可行动信息换成作者向诊断。
+ */
+function renderResultTextContent(
 	result: { content: Array<{ type: string; text?: string }> },
 	theme: Theme,
 	context: EditToolRenderContext,
 ): Text {
 	const message = result.content.map((part) => part.text ?? "").join("\n").trim();
-	return replaceWithText(
-		context,
-		`${theme.fg("toolTitle", theme.bold("edit"))}\n${theme.fg("error", message || "edit failed")}`,
-	);
+	const title = theme.fg("toolTitle", theme.bold("edit"));
+	return replaceWithText(context, message === "" ? title : `${title}\n${theme.fg("error", message)}`);
 }
 
 /** 未落盘文件的行尾注记：回滚过的说清楚「写过又还原」。 */
@@ -156,21 +161,26 @@ function batchStatusWord(details: BatchUiDetails): string | undefined {
 	return details.status === "rejected" ? "rejected · nothing written" : "partial · some files left changed";
 }
 
-export function renderResultFromDetails(
-	details: unknown,
+/**
+ * 结果渲染的唯一分流点。顺序即优先级：流式未完成 → 保持 pending；本扩展的批次
+ * payload → 批次视图；其余（信封错误 / 旧版本 payload）→ 工具文本。
+ */
+export function renderResultView(
+	result: { content: Array<{ type: string; text?: string }>; details?: unknown },
+	options: ToolRenderResultOptions,
 	theme: Theme,
 	context: EditToolRenderContext,
 ): Container | Text {
-	if (!isBatchUiDetails(details)) {
-		const debugInfo = isRecord(details)
-			? `status=${String(details.status)}, keys=${Object.keys(details).join(",")}`
-			: `type=${typeof details}`;
-		return replaceWithText(
-			context,
-			theme.fg("error", `edit_result_contract_invalid: details format unexpected (${debugInfo})`),
-		);
-	}
+	if (options.isPartial && !isBatchUiDetails(result.details)) return renderClearedCallState(context);
+	if (!isBatchUiDetails(result.details)) return renderResultTextContent(result, theme, context);
+	return renderBatchResult(result.details, theme, context);
+}
 
+function renderBatchResult(
+	details: BatchUiDetails,
+	theme: Theme,
+	context: EditToolRenderContext,
+): Container | Text {
 	const container = beginFileMutationResultRender(context);
 	container.addChild(new Text(renderBatchTitle(details.intent, theme, batchStatusWord(details)), 0, 0));
 	appendFileMutationBatch(container, fileItems(details, theme), theme, FILE_RAIL);

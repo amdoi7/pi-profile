@@ -18,10 +18,10 @@ import {
 	parseEditRequest,
 } from "./pipeline.ts";
 import {
+	isBatchUiDetails,
 	renderCallViewModel,
 	renderClearedCallState,
-	renderResultFromDetails,
-	renderResultTextContent,
+	renderResultView,
 } from "./ui.ts";
 
 export default function (pi: ExtensionAPI) {
@@ -45,11 +45,10 @@ export default function (pi: ExtensionAPI) {
 			const request = parseEditRequest(params);
 			const outcome = await executeEditBatch(request, ctx.cwd, signal);
 
+			// AgentToolResult 没有 isError 字段：信封由 harness 写，写在这里会被静默丢弃；
+			// 软失败靠下面的 tool_result handler 改信封。
 			return {
 				content: [{ type: "text" as const, text: buildOutcomeAgentContent(outcome) }],
-				// 软失败必须进错误通道：status != applied 的 payload 若不带 isError，
-				// harness 与 isError 分流（渲染/重试统计）都看不见它。
-				isError: outcome.status !== "applied",
 				details: buildOutcomeUiDetails(outcome, ctx.cwd),
 			};
 		},
@@ -60,20 +59,21 @@ export default function (pi: ExtensionAPI) {
 			return renderCallViewModel(buildCallToolViewModel(args), theme, context);
 		},
 		renderResult(result, options, theme, context) {
-			const typedResult = result as {
-				content: Array<{ type: string; text?: string }>;
-				details?: unknown;
-				isError?: boolean;
-			};
-
-			// details 缺席 = 执行前就失败（参数校验 / abort）：渲染真实错误文本。
-			if (typedResult.details === undefined) {
-				return renderResultTextContent(typedResult, theme, context);
-			}
-			if (options.isPartial) {
-				return renderClearedCallState(context);
-			}
-			return renderResultFromDetails(typedResult.details, theme, context);
+			return renderResultView(
+				result as { content: Array<{ type: string; text?: string }>; details?: unknown },
+				options,
+				theme,
+				context,
+			);
 		},
+	});
+
+	// 一个字节都没落盘（rejected）或盘上留下半成品（partial）是失败，不是成功：
+	// 成功形的信封会让 provider 端的 is_error 与 pi 的错误样式/统计都看不见软失败。
+	pi.on("tool_result", (event) => {
+		if (event.toolName !== "edit" || event.isError) return;
+		const details: unknown = event.details;
+		if (!isBatchUiDetails(details) || details.status === "applied") return;
+		return { isError: true };
 	});
 }

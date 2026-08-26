@@ -78,10 +78,39 @@ test("parseEditRequest parses per-file edits given as a JSON string", () => {
 	assert.deepEqual(request.files[0].edits, [makeEdit("foo", "alpha")]);
 });
 
-test("parseEditRequest still rejects malformed JSON string edits", () => {
+// 实际语料（2026-08-25，2 例）：edits 到达时是一段未闭合的 JSON 文本（大代码串在
+// 传输中被截断）。把它报成「must be an array」会把模型引向改写本来就对的形状，
+// 而正确动作是原样重发。
+test("edits arriving as unparseable text says so and asks for a re-send", () => {
+	assert.throws(
+		() => parseEditRequest(batch([{ path: "a.ts", edits: '[{"oldText": "a", "newText"' }])),
+		/files\[0\]\.edits .*not valid JSON.*re-send/s,
+	);
 	assert.throws(
 		() => parseEditRequest(batch([{ path: "a.ts", edits: "not-json" }])),
-		/files\[0\]\.edits must be an array/,
+		/files\[0\]\.edits/,
+	);
+});
+
+// 语料 2026-08-26：文件项只剩 path（且 path 尾巴粘着 " }"）。报「must be an array」
+// 把「这一项根本没写完」说成了类型错误。
+test("a file entry without any edits says the entry is incomplete", () => {
+	assert.throws(
+		() => parseEditRequest({ intent: "route sessions to a branch", files: [{ path: "src/tenancy.py }" }] }),
+		/files\[0\]\.edits is missing/,
+	);
+});
+
+// 语料 2026-08-25：单文件形状 + edits 是截断的 JSON 文本。旧行为报「path must be
+// removed」——把模型指向删掉唯一正确的字段。
+test("a truncated single-file shape blames the edits text, not the path", () => {
+	assert.throws(
+		() => parseEditRequest({
+			intent: "import UTC",
+			path: "a.py",
+			edits: '[{"newText": "from datetime import UTC, ',
+		}),
+		/files\[0\]\.edits .*not valid JSON.*re-send/s,
 	);
 });
 

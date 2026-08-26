@@ -291,40 +291,43 @@ test("partial batch warns that files were left changed", async () => {
 	assert.match(output, /ENOSPC/);
 });
 
-test("legacy single-file details shows the contract diagnostic (no format compat)", async () => {
+// pi 包装执行前失败(prepareArguments/schema/abort/blocked)时用的信封:
+// createErrorToolResult() => { content:[真实消息], details:{} },且 execute 从未运行。
+// 详见 @earendil-works/pi-agent-core dist/agent-loop.js。details 不是 undefined,
+// 所以渲染分流不能按「details 缺席」判断错误态。
+function harnessErrorResult(message) {
+	return { content: [{ type: "text", text: message }], details: {} };
+}
+
+test("a pre-execution failure renders the harness message, not a renderer diagnostic", async () => {
+	initTheme("dark");
+	const tool = await loadRegisteredEditTool();
+	const output = renderText(tool.renderResult(
+		harnessErrorResult("files[0].edits must be an array"),
+		{ expanded: false },
+		createTheme(),
+		createRenderContext({ isError: true }),
+	));
+
+	assert.match(output, /files\[0\]\.edits must be an array/);
+	assert.doesNotMatch(output, /contract/i);
+});
+
+test("a payload this renderer cannot read degrades to the tool's own text", async () => {
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
 	const output = renderText(tool.renderResult(
 		{
 			content: [{ type: "text", text: "legacy single-file payload" }],
 			details: { status: "applied", path: "src/example.ts", cwd: process.cwd(), changeStats: { additions: 1, deletions: 1, changedLines: 2 }, display: contextDisplay([[1, "after"]]), truncated: false },
-			isError: false,
 		},
 		{ expanded: false },
 		createTheme(),
 		createRenderContext(),
 	));
 
-	assert.match(output, /edit_result_contract_invalid/);
-	assert.doesNotMatch(output, /legacy single-file payload/);
-});
-
-test("validation error without details renders the real failure message", async () => {
-	initTheme("dark");
-	const tool = await loadRegisteredEditTool();
-	const output = renderText(tool.renderResult(
-		{
-			content: [{ type: "text", text: "files[0].oldText must be a string" }],
-			details: undefined,
-			isError: true,
-		},
-		{ expanded: false },
-		createTheme(),
-		createRenderContext(),
-	));
-
-	assert.match(output, /oldText must be a string/);
-	assert.doesNotMatch(output, /edit_result_contract_invalid/);
+	assert.match(output, /legacy single-file payload/);
+	assert.doesNotMatch(output, /contract/i);
 });
 
 test("partial stream keeps pending instead of flashing a diagnostic", async () => {
@@ -362,6 +365,84 @@ test("completed tool execution replaces the pending plan with the final diff", a
 	const output = renderText(component);
 	assert.equal(countOccurrences(output, "/tmp/pi-edit-ui-demo/example.ts"), 1);
 	assertAppearsInOrder(output, [INTENT, "/tmp/pi-edit-ui-demo/example.ts", 'export const name = "after";']);
+});
+
+// 端到端复现用户报的那一屏：参数残缺的 edit 调用（语料 2026-08-26）走到 pi 的
+// 执行前失败信封，整行结果必须是可行动的校验消息。
+test("a pre-execution failure shows the message in the live tool row", async () => {
+	initTheme("dark");
+	const tool = await loadRegisteredEditTool();
+	const component = createToolExecutionComponent(tool, {
+		intent: "route sessions to a branch",
+		files: [{ path: "src/tenancy.py }" }],
+	});
+	component.setArgsComplete();
+	component.markExecutionStarted();
+	component.updateResult(
+		{
+			content: [{ type: "text", text: "files[0].edits is missing: this file entry carries only a path — re-send the call with its edits." }],
+			details: {},
+			isError: true,
+		},
+		false,
+	);
+
+	const output = renderText(component);
+	assert.match(output, /files\[0\]\.edits is missing/);
+	assert.doesNotMatch(output, /contract/i);
+});
+
+// 批次视图的层级契约：归因只在意图头出现一次，文件行靠缩进归属。
+// 语料 2026-08-25/26：hint 宽度 p90=77 列，接在 path · stats 之后必然折行，
+// 而折行的续行一旦顶格，缩进归属就失效了。
+test("a wrapped file line keeps its indent under the intent header", async () => {
+	initTheme("dark");
+	const tool = await loadRegisteredEditTool();
+	const hint = "replace the false `details: undefined` fixture with the harness's real error envelope";
+	const component = tool.renderResult(
+		buildAgentResult([appliedFile("src/result-file-rendering.test.mjs", contextDisplay([[1, "after"]]), { hint })]),
+		{ expanded: true },
+		createTheme(),
+		createRenderContext(),
+	);
+	const lines = stripTerminalFormatting(component.render(80).join("\n")).split("\n");
+	const pathIndex = lines.findIndex((line) => line.includes("result-file-rendering.test.mjs"));
+	assert.ok(pathIndex >= 0, "file line not found");
+	const continuation = lines[pathIndex + 1] ?? "";
+	assert.match(continuation, /real error envelope/, `expected the hint to wrap, got:\n${lines.join("\n")}`);
+	assert.match(continuation, /^ {2}\S/, `wrapped line lost the rail:\n${lines.join("\n")}`);
+});
+
+test("a failed file puts its message directly under its own line", async () => {
+	initTheme("dark");
+	const tool = await loadRegisteredEditTool();
+	const output = renderText(tool.renderResult(
+		buildAgentResult(
+			[{ path: "src/a.ts", status: "failed", error: "replacement 2: oldText was not found." }],
+			{ status: "rejected" },
+		),
+		{ expanded: true },
+		createTheme(),
+		createRenderContext(),
+	));
+	const lines = output.split("\n");
+	const pathIndex = lines.findIndex((line) => line.includes("src/a.ts"));
+	assert.ok(pathIndex >= 0);
+	assert.match(lines[pathIndex + 1] ?? "", /oldText was not found/);
+});
+
+test("a wrapped pending file line keeps its indent too", async () => {
+	initTheme("dark");
+	const tool = await loadRegisteredEditTool();
+	const hint = "replace the false `details: undefined` fixture with the harness's real error envelope";
+	const component = tool.renderCall(
+		makeBatchArgs([{ path: "src/result-file-rendering.test.mjs", hint, edits: [{ oldText: "a", newText: "b" }] }]),
+		createTheme(),
+		createRenderContext(),
+	);
+	const lines = stripTerminalFormatting(component.render(80).join("\n")).split("\n");
+	const pathIndex = lines.findIndex((line) => line.includes("result-file-rendering.test.mjs"));
+	assert.match(lines[pathIndex + 1] ?? "", /^ {2}\S/, `wrapped pending line lost the rail:\n${lines.join("\n")}`);
 });
 
 test("renderResult makes edit path headers clickable file hyperlinks", async () => {

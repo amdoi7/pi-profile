@@ -116,7 +116,28 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * edits 以文本到达 = normalize 已经试过 JSON.parse 并失败（或解出非数组）。
+ * 重新 parse 一次取回那个被丢弃的原因：实测语料里这里几乎都是传输截断，
+ * 而不是模型搞错形状——报错说错了原因，模型就会去改一个本来就对的东西。
+ */
+function textEditsFailure(rawEdits: string, filePath: string): never {
+	try {
+		JSON.parse(rawEdits);
+	} catch (error) {
+		const reason = error instanceof Error ? error.message : String(error);
+		invalidEditRequest(
+			`${filePath}.edits arrived as text that is not valid JSON (${reason}); the call was likely cut off mid-emit — re-send it.`,
+		);
+	}
+	invalidEditRequest(`${filePath}.edits arrived as JSON text for a non-array value; it must be an array of edits`);
+}
+
 function parseEditOperations(rawEdits: unknown, filePath: string): FileEditOperation[] {
+	if (typeof rawEdits === "string") textEditsFailure(rawEdits, filePath);
+	if (rawEdits === undefined) {
+		invalidEditRequest(`${filePath}.edits is missing: this file entry carries only a path — re-send the call with its edits.`);
+	}
 	if (!Array.isArray(rawEdits)) invalidEditRequest(`${filePath}.edits must be an array`);
 	if (rawEdits.length === 0) invalidEditRequest(`${filePath}.edits must not be empty`);
 	return rawEdits.map((entry, index) => {

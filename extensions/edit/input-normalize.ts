@@ -27,12 +27,26 @@ function parseJsonArray(value: unknown): unknown {
 	}
 }
 
-/** 单文件形状（内置 edit / 旧契约）→ files[0]；flat oldText/newText 同理。 */
+/**
+ * 单文件形状（内置 edit / 旧契约）→ files[0]；flat oldText/newText 同理。
+ *
+ * 抬升只看形状不看值是否合法：edits 是一段坏文本时也要抬，否则它会留在顶层
+ * 被当成未知键，报出「path must be removed」——把模型指向删掉唯一正确的字段。
+ */
 function liftSingleFileShape(request: Record<string, unknown>): void {
 	if (typeof request.path !== "string") return;
 
+	const hasFlatReplacement = typeof request.oldText === "string" && typeof request.newText === "string";
+	if (typeof request.edits === "string") {
+		if (request.files !== undefined) return;
+		request.files = [{ path: request.path, edits: request.edits }];
+		delete request.path;
+		delete request.edits;
+		return;
+	}
+
 	const edits = Array.isArray(request.edits) ? request.edits : [];
-	if (typeof request.oldText === "string" && typeof request.newText === "string") {
+	if (hasFlatReplacement) {
 		edits.push({
 			oldText: request.oldText,
 			newText: request.newText,

@@ -1,5 +1,5 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import { Container, Spacer, Text } from "@earendil-works/pi-tui";
+import { Container, Text } from "@earendil-works/pi-tui";
 
 import { DiffPreviewComponent, type DiffPreview } from "./diff-view.ts";
 
@@ -54,12 +54,16 @@ export function beginFileMutationResultRender(context: ToolRenderContext): Conta
 	return reusableContainer(context);
 }
 
+/**
+ * 标题/消息用 Text 的 paddingX 而不是字符串前缀来上 rail：paddingX 逐行施加，
+ * 前缀只能给第一行。批次视图的归属全靠缩进，而 hint / 长路径在常见宽度下就会折行，
+ * 续行顶格等于层级契约在最长的那些行上失效。diff 行不走这里：它们自己排版。
+ */
 function fileMutationComponent(item: FileMutationRenderItem, theme: Theme, rail = ""): Container {
 	const block = new Container();
-	block.addChild(new Text(rail + item.title, 0, 0));
+	block.addChild(new Text(item.title, rail.length, 0));
 	if (item.outcome === "failed") {
-		block.addChild(new Spacer(1));
-		block.addChild(new Text(rail + theme.fg("error", item.message), 0, 0));
+		block.addChild(new Text(theme.fg("error", item.message), rail.length, 0));
 		return block;
 	}
 	if (item.outcome === "pending") return block;
