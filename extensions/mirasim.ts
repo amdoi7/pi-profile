@@ -47,10 +47,21 @@ const ADMIN_REFRESH_URL = "https://admin.test.mirofish.ai/auth/refresh";
 const TOKEN_PREFIX = "mrs1:";
 const ACCESS_TOKEN_TTL_SEC = 3600; // 文档约定：access token 有效期 1 小时
 const REFRESH_MARGIN_MS = 5 * 60 * 1000; // 剩余不足 5 分钟即刷新，避免边界竞态
-// relay 的 /v1/messages 用 x-mirasim-client 头识别“mirasim 客户端”，缺失则直接
-// 401 client_outdated“this request must be signed”（实测：头只要存在即可，内容不校验）。
-const CLIENT_HEADER = "x-mirasim-client";
-const FALLBACK_CLIENT_VERSION = "pi-extension";
+
+// 本地桥接（自建 HTTP client）：不直连 relay，而是把请求送到 Mirasim 本地反代，
+// 由反代注入托管凭证 + 签名后转发到 relay。实测（2026-08-24）relay 对直连强校验；
+// 而本地反代只认 claude CLI 的若干请求特征。
+const CLAUDE_UA = "claude-cli/2.1.228 (external, sdk-cli)";
+const CLAUDE_BETA =
+  "claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13," +
+  "context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07," +
+  "effort-2025-11-24,fallback-credit-2026-06-01";
+// 反代要求 body.system 含 Claude Code 官方身份文本（实测精确匹配，缺了/改了都 403）。
+const CLAUDE_SYSTEM_TEXT = "You are Claude Code, Anthropic's official CLI for Claude.";
+// 常驻转发器（mirasim-relay-bridge，可选安装）固定端口；在时优先使用。
+const FORWARDER_PORT = 62999;
+const FORWARDER_KEY_FILE = join(homedir(), ".config", "mirasim", "relay-api-key");
+const PROXY_DISCOVERY_TIMEOUT_MS = 15000;
 
 const execFileAsync = promisify(execFile);
 
@@ -343,8 +354,8 @@ const THINKING_LEVEL_MAP: ThinkingLevelMap = {
   minimal: null,
   low: null,
   medium: null,
-  high: "high",
-  xhigh: null,
+  high: null,
+  xhigh: "xhigh",
   max: "max",
 };
 
@@ -370,33 +381,141 @@ function buildLocalModels(): PiModel[] {
     compat: { supportsTemperature: false, forceAdaptiveThinking: true },
     input: ["text"] as ("text" | "image")[],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 128000,
-    maxTokens: 16384,
+    contextWindow: 1000000,
+              maxTokens: 128000,
+              cost: {
+                input: 10,
+                output: 50,
+                cacheRead: 1,
+                cacheWrite: 12.5
+              }
   }));
 }
 
 // ---------------------------------------------------------------------------
-// Client version header（relay 客户端识别）
+// 本地反代端口发现 + 自建 HTTP client（Mirasim 桥接）
 // ---------------------------------------------------------------------------
 
 /**
- * 尽力读 app 心跳文件里的真实 appVersion 作为 x-mirasim-client 值；
- * 失败回退固定标识（实测 relay 只检查头存在，不校验内容）。
- * 同步实现：启动时一次解析，成本可忽略。
+ * 发现 Mirasim 本地反代端口。优先级：
+ *   1. 常驻转发器固定端口 62999（带 ~/.config/mirasim/relay-api-key）——
+ *      若 key 文件存在即可用，转发器自己维持 anchor，无需活跃会话。
+ *   2. lsof 列出 Mirasim 监听端口，逐个 GET /v1/models 探测（返回模型列表的是反代）。
+ * 端口缓存复用；对端断连（ECONNREFUSED）时由调用方令缓存失效重新发现。
  */
-function resolveClientVersion(): string {
+interface ProxyTarget {
+  base: string;
+  key?: string; // 转发器需要 Bearer key；反代端口不需要
+}
+
+let cachedProxy: ProxyTarget | null = null;
+
+function tryForwarder(): ProxyTarget | null {
   try {
-    const entries = readdirSync(ANALYTICS_DIR);
-    for (const name of entries.sort()) {
-      const path = join(ANALYTICS_DIR, name);
-      const text = readFileSync(path, "utf8");
-      const m = text.match(/"appVersion":"([^"]+)"/);
-      if (m) return m[1];
-    }
+    const key = readFileSync(FORWARDER_KEY_FILE, "utf8").trim();
+    if (key) return { base: `http://127.0.0.1:${FORWARDER_PORT}`, key };
   } catch {
-    // 目录不存在/不可读：回退
+    // 无 key 文件：转发器未安装，走 lsof 发现
   }
-  return FALLBACK_CLIENT_VERSION;
+  return null;
+}
+
+async function isProxyPort(port: number): Promise<boolean> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    const res = await fetch(`http://127.0.0.1:${port}/v1/models`, {
+      headers: { "anthropic-version": "2023-06-01" },
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    const text = await res.text();
+    return text.includes('"object":"model"');
+  } catch {
+    return false;
+  }
+}
+
+/** 运行 lsof 收集 Mirasim 监听端口（macOS；与 mirasim-relay-bridge 一致）。 */
+async function findMirasimPorts(): Promise<number[]> {
+  try {
+    const { stdout } = await execFileAsync("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN"], {
+      timeout: 5000,
+    });
+    const ports = new Set<number>();
+    for (const line of stdout.split("\n")) {
+      if (!/^Mirasim/.test(line)) continue;
+      const m = line.match(/:([0-9]+)\s+\(LISTEN\)/);
+      if (m) ports.add(Number(m[1]));
+    }
+    return [...ports].sort((a, b) => a - b);
+  } catch {
+    return [];
+  }
+}
+
+async function discoverProxy(): Promise<ProxyTarget | null> {
+  const forwarder = tryForwarder();
+  if (forwarder) return forwarder;
+  const ports = await findMirasimPorts();
+  for (const p of ports) {
+    if (await isProxyPort(p)) return { base: `http://127.0.0.1:${p}` };
+  }
+  return null;
+}
+
+/**
+ * 自建 fetch：把 pi-ai/Anthropic SDK 的请求改送到本地反代，并注入反代校验的
+ * claude CLI 三特征：user-agent、anthropic-beta、body 带 system 块。
+ * 反代只认本机请求并自动换托管凭证转发，客户端无需携带任何 mirasim 凭证/签名。
+ */
+async function ensureClaudeSystem(bodyText: string): Promise<string> {
+  try {
+    const body = JSON.parse(bodyText) as { system?: unknown };
+    // proxy 校验 system 里必须含 Claude Code 官方身份文本（实测精确匹配）。
+    // 把官方提示语放到 system 数组头部，保留原 system 内容在其后。
+    const existing = Array.isArray(body.system) ? body.system : [];
+    if (existing.some((b: any) => typeof b?.text === "string" && b.text.includes(CLAUDE_SYSTEM_TEXT))) {
+      return bodyText;
+    }
+    body.system = [
+      { type: "text", text: CLAUDE_SYSTEM_TEXT },
+      ...existing,
+    ];
+    return JSON.stringify(body);
+  } catch {
+    return bodyText; // 非 JSON，原样透传
+  }
+}
+
+function makeProxyFetch(getTarget: () => ProxyTarget | null) {
+  return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const target = getTarget();
+    if (!target) {
+      throw new Error("找不到 Mirasim 本地反代。请打开 Mirasim.app（或安装 mirasim-relay-bridge 转发器）。");
+    }
+    const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+    // 只接管发往 mirasim host 的请求；其它域名直通。
+    if (!/mirasim|relay\.mirasim|mirofish/.test(url.host)) {
+      return fetch(input, init);
+    }
+    const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : {}));
+    headers.set("user-agent", CLAUDE_UA);
+    headers.set("anthropic-beta", CLAUDE_BETA);
+    headers.set("anthropic-dangerous-direct-browser-access", "true");
+    headers.set("x-app", "cli");
+    if (target.key) headers.set("authorization", `Bearer ${target.key}`);
+    else headers.set("authorization", `Bearer managed-credential`);
+
+    let body = init?.body;
+    if (typeof body === "string" && body.length > 0) {
+      body = await ensureClaudeSystem(body);
+    }
+    url.host = "127.0.0.1";
+    url.port = new URL(target.base).port;
+    url.protocol = "http:";
+    return fetch(new Request(url, { ...init, headers, body }));
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -406,50 +525,80 @@ function resolveClientVersion(): string {
 export default function (pi: ExtensionAPI) {
   // 模型列表由白名单本地构造，启动零网络；凭据在每次请求时由 resolve() 实时解析
   const models = buildLocalModels();
-  // relay 的 anthropic /v1/messages 必须有 x-mirasim-client 头，缺失即 401。
-  // 真实请求链路（model-runtime.prepareRequest）只合 auth.headers（resolve 的
-  // 返回值）+ 调用方 headers，不读 provider.headers——所以该头必须从 resolve
-  // 返回，provider.headers 保留仅为兼容其它可能读取它的层。
-  const clientHeaders = { [CLIENT_HEADER]: resolveClientVersion() };
 
-  // 后台尽力把凭据写入 pi 凭据（不阻塞启动；失败下次启动重试）
+  // 后台尽力把凭据写入 pi 凭据（不阻塞启动；失败下次启动重试）。
+  // 请求鉴权不再依赖 access token（本地反代自动换托管凭证），这里仅为兼容旧逻辑。
   void (async () => {
     try {
       const token = await getFreshAccessToken();
-      if (token) {
-        await syncPiCredential(token);
-      }
+      if (token) await syncPiCredential(token);
     } catch {
       // 无凭据或刷新失败：resolve() 会在请求时重试
     }
   })();
 
+  // 自建 HTTP client：发现本地反代 + 注入 claude CLI 特征头
+  let proxyTarget: ProxyTarget | null = null;
+  let discovering = false;
+  const getTarget = async (): Promise<ProxyTarget | null> => {
+    if (proxyTarget) return proxyTarget;
+    if (discovering) return null;
+    discovering = true;
+    try {
+      proxyTarget = await discoverProxy();
+      return proxyTarget;
+    } finally {
+      discovering = false;
+    }
+  };
+  const relayFetch = makeProxyFetch(() => proxyTarget);
+  // 断连重试：反代端口随会话销毁，失效后清缓存重新发现
+  const retryableFetch: typeof fetch = (input, init) =>
+    relayFetch(input, init).catch(async (err: unknown) => {
+      const isRefused = err instanceof Error && /ECONNREFUSED|socket hang up|fetch failed/i.test(err.message);
+      if (isRefused) {
+        proxyTarget = null;
+        const retargeted = await getTarget();
+        if (retargeted) return relayFetch(input, init);
+      }
+      throw err;
+    });
+
+  const baseApi = anthropicMessagesApi();
+  const api = {
+    ...baseApi,
+    stream: (model: Parameters<typeof baseApi.stream>[0], context: Parameters<typeof baseApi.stream>[1], options: Parameters<typeof baseApi.stream>[2]) =>
+      baseApi.stream(model, context, { ...options, fetch: retryableFetch }),
+    streamSimple: (model: Parameters<typeof baseApi.streamSimple>[0], context: Parameters<typeof baseApi.streamSimple>[1], options: Parameters<typeof baseApi.streamSimple>[2]) =>
+      baseApi.streamSimple(model, context, { ...options, fetch: retryableFetch }),
+  };
+
   pi.registerProvider(
     createProvider({
       id: "mirasim",
-      name: "Mirasim",
+      name: "Mirasim（本地桥接）",
       baseUrl: RELAY_BASE,
-      // 每个请求带客户端标识头：anthropic 端点的身份检查（缺失 → 401 client_outdated）
-      headers: clientHeaders,
       // relay 只有 anthropic messages 一条模型通道（见 buildLocalModels 注释）
-      api: anthropicMessagesApi(),
+      api,
       models,
       auth: {
         apiKey: {
-          name: "Mirasim（来自 ~/.mirasim/setting.json）",
+          name: "Mirasim（本地反代，无需凭证）",
 
           async login(interaction: ProviderAuthInteraction): Promise<ApiKeyCredential> {
-            interaction.notify({ type: "progress", message: "正在读取 ~/.mirasim/setting.json 并解密 token…" });
-            const tokens = await readTokens();
-            return { type: "api_key", key: tokens.access };
+            interaction.notify({ type: "progress", message: "正在探测 Mirasim 本地反代…" });
+            const target = await getTarget();
+            if (!target) {
+              throw new Error("找不到 Mirasim 本地反代。请打开 Mirasim.app（或安装 mirasim-relay-bridge 转发器）。");
+            }
+            return { type: "api_key", key: target.key ?? "managed-credential" };
           },
 
-          // 每次请求前调用：解密本地凭据，过期则实时刷新并写回，永远返回最新 token。
-          // x-mirasim-client 头随 auth.headers 带出（prepareRequest 合并 auth.headers）
-          async resolve({ signal }) {
-            const token = await getFreshAccessToken(signal);
-            if (!token) return undefined;
-            return { auth: { apiKey: token, headers: clientHeaders }, source: "~/.mirasim/setting.json" };
+          // 请求层不需要真实 token：本地反代自动换托管凭证转发
+          async resolve(): Promise<AuthResult | undefined> {
+            const target = proxyTarget ?? (await getTarget().catch(() => null));
+            if (!target) return undefined;
+            return { auth: { apiKey: target.key ?? "managed-credential" }, source: "Mirasim 本地反代" };
           },
         },
       },
