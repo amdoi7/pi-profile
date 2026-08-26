@@ -4,6 +4,12 @@
 AGENTS.md 与 skills。本文记录 harness 的 AX(Agent Experience)设计:为什么
 这样设计、借鉴了什么、界面与状态模型如何组装。
 
+> retire(2026-08-26):worker 机制(pi_worker 扩展、多 worker 拓扑、子会话
+> 编排)已整体移除;同机跨会话协作仅存 pi_peer(socket 即名册,who 实时身份,
+> 零磁盘缓存)。
+> 下文涉及 worker 的段落冻结为设计历史,不再对应运行实体;其中的通用原则
+> (角色分离判据、AIG 原则、核验优先级)不随机制退役。
+
 ## 设计角度:AX
 
 AX 是 harness 设计者的视角,对 Agent 接触的每个界面问四个问题:

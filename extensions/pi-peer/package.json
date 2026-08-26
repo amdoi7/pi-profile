@@ -1,10 +1,9 @@
 {
-	"name": "pi-worker",
+	"name": "pi-peer",
 	"private": true,
 	"type": "module",
 	"scripts": {
 		"test": "vitest run tests/*.test.mjs",
-		"test:live": "vitest run tests/substrate",
 		"typecheck": "tsc -p tsconfig.json"
 	},
 	"devDependencies": {

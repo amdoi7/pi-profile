@@ -21,7 +21,7 @@
 ### Workflow
 
 - `btw/` — side-channel assistant overlay；提供 `/btw` 侧聊与 handoff summary。提交即清空输入框（问题移入 transcript，不等回答结束）；transcript 以 ↑/↓ 行滚动、ctrl+PgUp/ctrl+PgDn 翻页（fullscreen 下裸 PgUp/PgDn 与滚轮被 alt-screen viewport listener 抢先消费，滚的是背后主 transcript，overlay 收不到）；dialog 高度按 overlay `maxHeight` 预算裁剪，避免输入行被 TUI 从底部切掉。
-- `pi-worker/` — 子 agent worker 编排：`pi_worker` 工具（run/send/stop/collect/kill/status）+ `/pi-worker` 决策面板 + room 消息平面；8 态 FSM，状态面单一来源 `STATE_FACETS`（投影漂移有一致性红测试）；终态决策在 API 边同步落标（session marker 唯一否决源，残行安全写入），`killAll` 零持久化副作用，重启认领（G1）与冷恢复（O3）存活。
+- `pi-peer/` — 同机 pi 会话互发消息：`pi_peer` 工具（list/send）+ unix socket 窄协议（NDJSON 一连接一请求：deliver 投递→接管→ack 同步往返，fail-fast；who 实时身份）；socket 目录即名册，零磁盘缓存（发现 = readdir + 并行 who，拒连即扫即清，mute 不动）；reconciler 在场循环：接管重试（退让非终态）+ 退役门（终端脱离 ppid→1/isatty→false 即释放 socket，僵尸不占身份）；list 带 idle 标注；收件渲染卡片（LLM 面安全声明与人面分离）；配额 10/5min/对 + 同文 60s 抑制（quiet 旁路）。
 - `session-breakdown/` — session/context inspection UI；统计 sessions、messages、tokens、cost 与 model/cwd/time breakdown。
 
 ### UI polish
