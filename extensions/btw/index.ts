@@ -23,6 +23,7 @@ import {
 import {
 	Markdown,
 	truncateToWidth,
+	wrapTextWithAnsi,
 	type OverlayHandle,
 } from "@earendil-works/pi-tui";
 
@@ -261,13 +262,24 @@ export default function (pi: ExtensionAPI) {
 				return typeof a.command === "string" ? truncateToWidth(a.command.split("\n")[0], 50, "…") : "";
 			case "read":
 			case "write":
-			case "edit":
 				return typeof a.path === "string" ? a.path : "";
+			// edit 是批次工具：一次调用一个意图，路径在 files[] 里，标题位给意图。
+			case "edit":
+				return typeof a.intent === "string" ? truncateToWidth(a.intent, 50, "…") : "";
 			default: {
 				const first = Object.values(a)[0];
 				return typeof first === "string" ? truncateToWidth(first.split("\n")[0], 40, "…") : "";
 			}
 		}
+	}
+
+	/** 折行 + 悬挂缩进(pi-worker 对齐换行借鉴):续行按前缀宽缩进,每行 ≤ width。 */
+	function wrapAligned(text: string, hang: number, width: number): string[] {
+		const wrapW = Math.max(4, width - hang);
+		const wrapped = wrapTextWithAnsi(text, wrapW);
+		if (wrapped.length <= 1 || hang <= 0) return wrapped;
+		const pad = " ".repeat(hang);
+		return wrapped.map((l, i) => (i === 0 ? l : pad + l));
 	}
 
 	function renderToolCallLines(toolCalls: ToolCallInfo[], theme: ExtensionContext["ui"]["theme"], width: number): string[] {
@@ -278,7 +290,15 @@ export default function (pi: ExtensionAPI) {
 			const label = theme.fg(color, `${icon} `) + theme.fg("toolTitle", tc.toolName);
 			const args = formatToolArgs(tc.toolName, tc.args);
 			const argsText = args ? theme.fg("dim", ` ${args}`) : "";
-			lines.push(truncateToWidth(`  ${label}${argsText}`, width, ""));
+			lines.push(...wrapAligned(`  ${label}${argsText}`, 2, width));
+			// tool 结果首行摘要(pi-worker ⤷ 借鉴):⤷ 成功 / ✗ 失败,超行计数,全文不刷屏
+			if (tc.result) {
+				const parts = tc.result.summary.split("\n");
+				const first = truncateToWidth(parts[0], 120, "…");
+				const tail = parts.length - 1;
+				const resultText = `${tc.result.isError ? "✗ " : "⤷ "}${first}${tail > 0 ? ` …(+${tail} 行)` : ""}`;
+				lines.push(...wrapAligned(`    ${theme.fg(tc.result.isError ? "error" : "dim", resultText)}`, 4, width));
+			}
 		}
 		return lines;
 	}

@@ -440,3 +440,55 @@ test("collectThreadEntries skips entries with missing or empty data", () => {
 		["ok"],
 	);
 });
+
+// ---------- tool 结果摘要(pi-worker ⤷ 借鉴) ----------
+test("tool_execution_end 携带 result → ToolCallInfo.result 摘要(首行 + 超行计数)", () => {
+	const turn = { question: "q", answer: "", toolCalls: [], state: "running" };
+	applyTurnEvent(turn, {
+		type: "tool_execution_start",
+		toolCallId: "call-1",
+		toolName: "bash",
+		args: { command: "ls" },
+	});
+	applyTurnEvent(turn, {
+		type: "tool_execution_end",
+		toolCallId: "call-1",
+		toolName: "bash",
+		result: { output: "a.txt\nb.txt\nc.txt", exitCode: 0 },
+		isError: false,
+	});
+	assert.equal(turn.toolCalls[0].result.summary, "a.txt\nb.txt\nc.txt");
+	assert.equal(turn.toolCalls[0].result.isError, false);
+});
+
+test("tool_execution_end isError → result.isError 落位(✗ 渲染依据)", () => {
+	const turn = { question: "q", answer: "", toolCalls: [], state: "running" };
+	applyTurnEvent(turn, {
+		type: "tool_execution_start",
+		toolCallId: "call-1",
+		toolName: "read",
+		args: { path: "x.ts" },
+	});
+	applyTurnEvent(turn, {
+		type: "tool_execution_end",
+		toolCallId: "call-1",
+		toolName: "read",
+		result: "ENOENT: no such file",
+		isError: true,
+	});
+	assert.equal(turn.toolCalls[0].result.summary, "ENOENT: no such file");
+	assert.equal(turn.toolCalls[0].result.isError, true);
+});
+
+test("tool_execution_end 空 result / 无文本 → 不落 result(无内容不造摘要)", () => {
+	const turn = { question: "q", answer: "", toolCalls: [], state: "running" };
+	applyTurnEvent(turn, {
+		type: "tool_execution_start",
+		toolCallId: "call-1",
+		toolName: "bash",
+		args: { command: "true" },
+	});
+	applyTurnEvent(turn, { type: "tool_execution_end", toolCallId: "call-1", toolName: "bash", result: undefined, isError: false });
+	applyTurnEvent(turn, { type: "tool_execution_end", toolCallId: "call-1", toolName: "bash", result: { output: "" }, isError: false });
+	assert.equal(turn.toolCalls[0].result, undefined);
+});

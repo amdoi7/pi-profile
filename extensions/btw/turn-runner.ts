@@ -23,6 +23,8 @@ export type ToolCallInfo = {
 	/** Raw args from the session event; formatted at render time. */
 	args: unknown;
 	status: "running" | "done" | "error";
+	/** tool 结果摘要(pi-worker ⤷ 借鉴):tool_execution_end 的 result 首行文本 + 成败。 */
+	result?: { summary: string; isError: boolean };
 };
 
 /**
@@ -90,6 +92,38 @@ function extractEventAssistantText(event: AgentSessionEvent): string {
 		.trim();
 }
 
+/** tool 结果摘要提取:字符串直取;对象优先 output/content/text 文本字段,
+ * 否则 JSON 序列化;空/无文本 → undefined(不造摘要)。 */
+export function summarizeToolResult(result: unknown): string | undefined {
+	let text = "";
+	if (typeof result === "string") {
+		text = result;
+	} else if (result && typeof result === "object") {
+		const rec = result as Record<string, unknown>;
+		for (const key of ["output", "content", "text", "stderr", "error"]) {
+			const v = rec[key];
+			if (typeof v === "string" && v.trim()) {
+				text = v;
+				break;
+			}
+		}
+		if (!text) {
+			// 全空字段对象(如 {"output":""})无内容可摘,不落
+			const values = Object.values(rec);
+			if (values.length > 0 && values.every((v) => v === undefined || v === null || (typeof v === "string" && !v.trim()))) {
+				return undefined;
+			}
+			try {
+				text = JSON.stringify(result);
+			} catch {
+				return undefined;
+			}
+		}
+	}
+	text = text.trim();
+	return text.length > 0 ? text : undefined;
+}
+
 /**
  * Apply a side-session event to the running turn.
  * Returns the status label to display, or null when the event needs no status change.
@@ -118,6 +152,9 @@ export function applyTurnEvent(turn: PendingTurn, event: AgentSessionEvent): str
 			const tc = turn.toolCalls.find((t) => t.toolCallId === event.toolCallId);
 			if (tc) {
 				tc.status = event.isError ? "error" : "done";
+				// 结果摘要(pi-worker ⤷ 借鉴):失败/成功都可读,空结果不造摘要
+				const summary = summarizeToolResult(event.result);
+				if (summary) tc.result = { summary, isError: event.isError };
 			}
 			return "Streaming side response...";
 		}
