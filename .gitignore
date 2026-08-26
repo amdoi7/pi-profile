@@ -28,20 +28,23 @@
 **/coverage/
 **/.cache/
 
-# Locally synced skillshare links and generated metadata
+# Vault-linked skills (content lives in the skills repo) and generated metadata
 /skills/.skillshare-manifest.json
 /skills/ascii-diagram
+/skills/coding-discipline
 /skills/commit
 /skills/human-prose
 /skills/idiomatic-go
 /skills/modern-python
+/skills/officecli
+/skills/skill-authoring
 /skills/skillshare
-/.pi/memory/
+/skills/tdd
 /bin/tmux-bridge
 
 # pi-peer 运行时名册(会话注册文件,机器本地状态)
 /peers/
 
-# pi-worker 审计目录(worker session jsonl,机器本地状态)
-/.pi/worker-sessions/
+# agent 本地运行时状态(memory、审计 jsonl、扩展缓存)
+/.pi/
 .gitignore
