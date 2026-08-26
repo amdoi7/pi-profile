@@ -63,8 +63,10 @@ function applyPatchFailureCode(event: HintEvent): string | undefined {
 // File-mutation shapes routed through bash instead of the auditable edit
 // contract. `cat <<EOF` without a redirect (git commit -m "$(cat ...)") is
 // not a mutation; perl -pi is a sanctioned path and intentionally absent.
+// python/node 行内脚本的原地改写也不在这里：它已由 command-policy 拦下，
+// 拒绝消息里就带了替代方案，提示再说一遍只是噪声。
 const BASH_MUTATION =
-	/(?:^|&&|\|\||[;|])\s*(?:cat\s+(?:>>?\s*\S+\s*<<|<<\s*\S+\s*>+\s*\S)|sed\s+-[^\s|;&]*i|python3?\s+(?:-\s+)?<<)/;
+	/(?:^|&&|\|\||[;|])\s*(?:cat\s+(?:>>?\s*\S+\s*<<|<<\s*\S+\s*>+\s*\S)|tee\s+-?[a-z]*\s*\S+\s*<<|sed\s+-[^\s|;&]*i)/;
 
 export const rules: HintRule[] = [
 	{
@@ -93,7 +95,9 @@ export const rules: HintRule[] = [
 	},
 	{
 		name: "bash-file-mutation",
-		evidence: "chain-mining 2026-08-13: 626 例 cat>heredoc 写文件 + 123 例 sed -i",
+		evidence:
+			"chain-mining 2026-08-13: 626 例 cat>heredoc 写文件 + 123 例 sed -i；" +
+			"2026-08-21..26 重测：cat>/tee 整文件写 341 例、追加 65 例、sed -i 23 例",
 		match(event) {
 			if (event.toolName !== "bash" || event.command === undefined) return undefined;
 			if (!BASH_MUTATION.test(event.command)) return undefined;

@@ -86,10 +86,11 @@ test("sed -i yields the mutation-contract hint", () => {
   assert.match(hints[0], /bash-file-mutation/);
 });
 
-test("python heredoc yields the mutation-contract hint", () => {
+// python 行内脚本改写已由 command-policy 直接拦截（带替代方案的拒绝消息），
+// hint 再说一遍只是噪声：一个行为只能有一个 owner。
+test("python heredoc is handled by the policy block, not by a hint", () => {
   const hints = matchAll(bashEvent("python3 - <<'EOF'", "", false));
-  assert.equal(hints.length, 1);
-  assert.match(hints[0], /bash-file-mutation/);
+  assert.equal(hints.length, 0);
 });
 
 test("git commit heredoc is not a file mutation", () => {

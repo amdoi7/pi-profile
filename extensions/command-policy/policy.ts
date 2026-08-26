@@ -1,4 +1,5 @@
 import { computeUvRewriteDecision, getBlockedCommandMessage } from "../uv/rewrite.ts";
+import { getFileMutationBlock } from "./file-mutation.ts";
 
 export type CommandDecision =
   | { kind: "pass"; command: string }
@@ -10,8 +11,9 @@ type CommandPolicies = {
   rewriteUv(command: string): string | null;
 };
 
+// 两个拦截源共用一个入口：uv 管 python 打包工具链，file-mutation 管变更路径。
 const defaultPolicies: CommandPolicies = {
-  getBlockedMessage: getBlockedCommandMessage,
+  getBlockedMessage: (command) => getBlockedCommandMessage(command) ?? getFileMutationBlock(command),
   rewriteUv: computeUvRewriteDecision,
 };
 
