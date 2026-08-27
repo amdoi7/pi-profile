@@ -82,12 +82,11 @@ export function registerPeerTool(pi: ExtensionAPI, getRt: () => PeerRuntime | un
 			if (!rt) throw new Error("pi_peer not ready (session not started); retry later");
 			const now = Date.now();
 			if (p.action === "list") {
-				const { alive, mute } = await discoverPeers(rt.self.sessionId);
+				const alive = await discoverPeers(rt.self.sessionId);
 				const lines = alive.map((peer) => formatPeerLine(peer, ctx.cwd, idleOf(peer, now)));
 				const head = lines.length > 0 ? `Online pi sessions (${lines.length}):` : "No other online pi sessions.";
-				const tail = mute > 0 ? `\n(${mute} unresponsive sockets skipped)` : "";
 				return {
-					content: [{ type: "text", text: head + (lines.length > 0 ? `\n${lines.join("\n")}` : "") + tail }],
+					content: [{ type: "text", text: head + (lines.length > 0 ? `\n${lines.join("\n")}` : "") }],
 					details: { peerCount: alive.length },
 				};
 			}
@@ -99,7 +98,7 @@ export function registerPeerTool(pi: ExtensionAPI, getRt: () => PeerRuntime | un
 			if (to === rt.self.name || to === rt.self.sessionId || rt.self.sessionId.startsWith(to)) {
 				throw new Error("cannot send to yourself (same session)");
 			}
-			const { alive } = await discoverPeers(rt.self.sessionId);
+			const alive = await discoverPeers(rt.self.sessionId);
 			const target = resolvePeer(alive, to, ctx.cwd);
 			if (!target.ok) throw new Error(target.reason);
 			if (p.mode !== "quiet") {

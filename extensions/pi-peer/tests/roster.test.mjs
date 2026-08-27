@@ -23,9 +23,8 @@ describe("roster(socket 目录即名册,零缓存)", () => {
 		const s1 = await serve(old);
 		const s2 = await serve(young);
 		const s3 = await serve(me);
-		const { alive, mute } = await discoverPeers("me-me-me");
+		const alive = await discoverPeers("me-me-me");
 		assert.deepEqual(alive.map((p) => p.name), ["younger", "elder"], "排除自己,按 startedAt 降序");
-		assert.equal(mute, 0);
 		s1.close();
 		s2.close();
 		s3.close();
@@ -36,28 +35,28 @@ describe("roster(socket 目录即名册,零缓存)", () => {
 		writeFileSync(join(dir, "corpse-1234-abcdef1234.sock"), ""); // 无进程持有
 		const live = identity({ sessionId: "live-live", name: "live" });
 		const s = await serve(live);
-		const { alive } = await discoverPeers("me");
+		const alive = await discoverPeers("me");
 		assert.deepEqual(alive.map((p) => p.name), ["live"]);
 		assert.ok(!readdirSync(dir).includes("corpse-1234-abcdef1234.sock"), "尸体文件已回收");
 		s.close();
 	});
 
-	test("mute socket(可连不应答):不列出、不回收、计数暴露(不确定即不动)", async () => {
+	// 能连上就说明监听进程还活着 → 不删文件；也不向调用方报数（零可行动性的遥测）。
+	test("mute socket(可连不应答):不列出、不回收、也不上报", async () => {
 		const dir = isolate();
 		const mutePath = join(dir, "mute-1234-abcdef1234.sock");
 		const silent = createServer(() => {});
 		await new Promise((r) => silent.listen(mutePath, r));
 		const query = (p) => import("../src/transport.ts").then((t) => t.queryPeer(p, 100));
-		const { alive, mute } = await discoverPeers("me", query);
+		const alive = await discoverPeers("me", query);
 		assert.deepEqual(alive, []);
-		assert.equal(mute, 1);
 		assert.ok(readdirSync(dir).includes("mute-1234-abcdef1234.sock"), "不确定的文件不动");
 		silent.close();
 	});
 
 	test("目录不存在 = 从未有 peer 上线,空名册不抛", async () => {
 		process.env.PI_PEER_DIR = join(tmpdir(), `pi-peer-never-${Date.now()}`);
-		assert.deepEqual(await discoverPeers("me"), { alive: [], mute: 0 });
+		assert.deepEqual(await discoverPeers("me"), []);
 	});
 });
 
