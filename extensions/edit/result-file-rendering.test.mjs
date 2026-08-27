@@ -31,9 +31,19 @@ async function loadRegisteredEditTool() {
 		filter: (source) => path.basename(source) !== "node_modules",
 	});
 	// edit 不再依赖 diff worker：共享文件只剩渲染与 diff 构造链。
+	// edit 不再依赖 diff worker：共享文件只剩渲染与 diff 构造链。
 	await copySharedFiles(tempSharedDir, ["file-link.ts", "code-preview.ts", "final-diff.ts", "diff-view.ts", "file-mutation-view.ts", "file-result.ts"]);
 	await linkPiPackages(tempExtensionDir, { tui: true });
 	await linkSharedPackages(tempExtensionDir);
+	// edit 自己的顶层依赖（typebox）也要可达：从扩展根向上找不到 edit/node_modules。
+	for (const dep of ["typebox"]) {
+		await fs.promises.mkdir(path.join(tempExtensionDir, "node_modules"), { recursive: true });
+		await fs.promises.symlink(
+			path.join(sourceDir, "node_modules", dep),
+			path.join(tempExtensionDir, "node_modules", dep),
+			"dir",
+		);
+	}
 
 	const extensionModule = await import(`${pathToFileURL(path.join(tempEditDir, "index.ts")).href}?t=${Date.now()}`);
 	let registeredTool;
