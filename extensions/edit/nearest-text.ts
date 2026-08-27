@@ -95,16 +95,20 @@ function bestAlignment(lines: string[], anchorLines: string[]): Alignment | unde
 	return best.score >= MIN_ALIGNMENT_SCORE ? best : undefined;
 }
 
+/** 入参是行内片段（不含换行）。数量词只用于均质空白：报错宁可笨，不可说谎。 */
 function describeText(text: string): string {
 	if (text === "") return "nothing";
-	if (text.trim() === "") {
-		const unit = text.includes("\t") ? "tab" : "space";
-		return text.length === 1 ? unit : `${text.length} ${unit}s`;
-	}
-	if ([...text].length === 1) {
+	if (/^ +$/.test(text)) return text.length === 1 ? "space" : `${text.length} spaces`;
+	if (/^\t+$/.test(text)) return text.length === 1 ? "tab" : `${text.length} tabs`;
+	const characters = [...text];
+	if (characters.length === 1) {
 		return `"${text}" U+${text.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}`;
 	}
-	return text.length > MAX_QUOTED_DIVERGENCE ? `"${text.slice(0, MAX_QUOTED_DIVERGENCE)}…"` : `"${text}"`;
+	// 混合空白原样示出（转义后可见）；截断按码位，不劈开代理对。
+	const shown = characters.length > MAX_QUOTED_DIVERGENCE
+		? `${characters.slice(0, MAX_QUOTED_DIVERGENCE).join("")}…`
+		: text;
+	return `"${shown.replace(/\t/g, "\\t")}"`;
 }
 
 /**

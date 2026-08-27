@@ -82,6 +82,15 @@ test("invisible whitespace drift is named, not just shown", () => {
 	assert.match(error.message, /space/);
 });
 
+test("mixed whitespace is shown, never miscounted as tabs or spaces", () => {
+	const content = ["\t  return compute()", ""].join("\n");
+	const error = failureOf(content, [{ oldText: "  \treturn compute()", newText: "x" }]);
+
+	assert.match(error.message, /L1 col 1:/);
+	assert.match(error.message, /"\\t  "/);
+	assert.doesNotMatch(error.message, /3 tabs|3 spaces/);
+});
+
 test("no similar text is said plainly, with no invented location", () => {
 	const content = ["alpha", "beta", "gamma", ""].join("\n");
 	const anchor = "totally unrelated payload that shares nothing";
