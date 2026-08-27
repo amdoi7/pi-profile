@@ -1,5 +1,4 @@
 import { computeUvRewriteDecision, getBlockedCommandMessage } from "../uv/rewrite.ts";
-import { getFileMutationBlock } from "./file-mutation.ts";
 
 export type CommandDecision =
   | { kind: "pass"; command: string }
@@ -11,9 +10,10 @@ type CommandPolicies = {
   rewriteUv(command: string): string | null;
 };
 
-// 两个拦截源共用一个入口：uv 管 python 打包工具链，file-mutation 管变更路径。
+// 只剩 uv：它编码的是环境事实（这台机器的 python 工具链），模型从代码里读不出来。
+// 行内脚本改写的硬拦截已删：见 index.test.mjs 里的理由。
 const defaultPolicies: CommandPolicies = {
-  getBlockedMessage: (command) => getBlockedCommandMessage(command) ?? getFileMutationBlock(command),
+  getBlockedMessage: (command) => getBlockedCommandMessage(command),
   rewriteUv: computeUvRewriteDecision,
 };
 
