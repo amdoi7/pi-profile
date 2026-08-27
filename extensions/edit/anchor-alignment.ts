@@ -133,31 +133,19 @@ function isSameMarkVariant(left: string, right: string): boolean {
 	return SAME_MARK_VARIANTS.some((group) => group.has(left) && group.has(right));
 }
 
-/**
- * 修复面：诊断出的最近区域与锚只差在同标记变体时，返回文件那段**真字节**，
- * 让调用方拿它去跑一次普通的精确匹配——定位、唯一性、重叠检查全回到精确字节上。
- *
- * 拒绝修复的情形：没有对齐、有并列的同分对齐（模棱两可）、或任何一处差异不属于同标记变体。
- */
-/**
- * 一次修复就是一个数据：文件那段真字节，加上「模型的写法 → 文件的写法」。
- * text 拿去跑普通的精确匹配（定位/唯一性/重叠检查全回到精确字节）；
- * marks 用于把 newText 里的同类标记翻回文件的方言（不含引号与空白）。
- */
+/** 一次修复 = 文件那段真字节 + 「模型写法 → 文件写法」方言表（不含引号与空白）。 */
 export type AnchorRepair = { text: string; marks: ReadonlyMap<string, string> };
 
 /**
- * 修复面：诊断出的最近区域与锚只差在同标记变体时，交出文件那段真字节。
+ * 修复面：最近区域与锚只差同标记变体时，交出文件那段真字节，调用方拿它跑
+ * 普通的精确匹配——定位、唯一性、重叠检查全回到精确字节上。
  *
- * 拒绝修复：没有对齐、有并列的同分对齐（模棱两可）、行长不等（不是纯标记差异）、
- * 或任何一处差异不属于同标记变体。引号与空白不进 marks：引号由
- * preserveQuoteStyle 按开闭上下文处理；空白到处都是，从一处全角空格学到的映射
- * 会把 newText 里每个空格都改掉（对抗性复审现场抓到）。
- */
-/**
- * 一段文件文本能不能修好这行锚：等长，且每一处差异都是同标记变体。
- * marks 只收非引号、非空白的对：引号由 preserveQuoteStyle 按上下文处理；空白到处都是，
- * 从一处全角空格学到的映射会把 newText 里每个空格都改掉（对抗性复审现场抓到）。
+ * 拒绝修复：没有对齐、并列的同分对齐（模棱两可）、行长不等（不是纯标记差异）、
+ * 任何一处差异不属于同标记变体。
+ *
+ * marks 只收非引号、非空白的对：引号由 preserveQuoteStyle 按开闭上下文处理；
+ * 空白到处都是，从一处全角空格学到的映射会把 newText 里每个空格都改掉
+ * （对抗性复审现场抓到）。
  */
 function repairSegment(onDisk: string, authored: string, marks: Map<string, string>): boolean {
 	if (onDisk.length !== authored.length) return false;
@@ -176,7 +164,13 @@ function repairSegment(onDisk: string, authored: string, marks: Map<string, stri
 	return true;
 }
 
-/** 单行锚：可能落在行内任意位置，逐位试。 */
+/**
+ * 修复搜索是结构性的，**不用**诊断面的相似度评分：前后缀相似度低估多处差异
+ * （五个全角标点散布一行时只有 0.15），拿它当门槛会把本可修的锚拦在外。
+ * 判据只有两条：等长，且每处差异都是同标记变体。两处以上都能修 → 模棱两可，不猜。
+ *
+ * 单行锚：可能落在行内任意位置，逐位试。
+ */
 function repairWithinLine(fileLine: string, anchor: string): AnchorRepair | undefined {
 	let found: AnchorRepair | undefined;
 	for (let offset = 0; offset + anchor.length <= fileLine.length; offset += 1) {
@@ -207,12 +201,6 @@ function repairAcrossLines(lines: string[], anchorLines: string[], start: number
 	return { text: segments.join("\n"), marks };
 }
 
-/**
- * 修复面：结构性暂力搜索，**不用**诊断面的相似度评分。
- * 前后缀相似度低估多处差异（五个全角标点散布一行时只有 0.15），拿它当门槛会把
- * 本可修的锚拦在外。判据只有两条：等长，且每处差异都是同标记变体。
- * 两处以上都能修 → 模棱两可，不猜。
- */
 export function repairAnchor(content: string, anchor: string): AnchorRepair | undefined {
 	const anchorLines = anchor.split("\n");
 	const lines = content.split("\n");

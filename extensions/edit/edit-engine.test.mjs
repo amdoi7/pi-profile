@@ -514,3 +514,19 @@ test("single empty anchor keeps its exact structured message", () => {
 		/^Error: oldText must not be empty\.$/,
 	);
 });
+
+// 匹配阶梯的语义优先级（不是性能优化，是行为承诺）：
+// - exact 命中存在 ⇒ 只用 exact 桶，fuzzy 变体不参与计数或替换；
+// - 全弯引号两处命中直引号锚 ⇒ fuzzy 层 DUPLICATE_MATCH（修复面不接 replaceAll）；
+// - 一处 exact + 一处 CJK 标点变体 ⇒ 只替 exact（CJK 变体只在修复面，不在匹配面）。
+test("exact hit suppresses the fuzzy variant of the same text", () => {
+	const { newContent } = applyEditsToNormalizedContent("x,y x，y\n", [{ oldText: "x,y", newText: "z" }]);
+	assert.equal(newContent, "z x，y\n");
+});
+
+test("two fuzzy variants of a straight-quote anchor are a duplicate, not repaired", () => {
+	assert.throws(
+		() => applyEditsToNormalizedContent("x’y x’y\n", [{ oldText: "x'y", newText: "z" }]),
+		/matched 2 locations/,
+	);
+});
