@@ -80,6 +80,38 @@ test("cat heredoc write yields the mutation-contract hint", () => {
   assert.match(hints[0], /^\[hint:bash-file-mutation\] /);
 });
 
+// once-per-session 规则:额度被临时脚本吃掉,本 session 真正改源文件时就没提示了。
+// 语料 2026-08-27:229 个触发 session 里 88 个(38%)的首次命中是 /tmp 脚本。
+test("a scratch script under /tmp is not the mutation the contract is about", () => {
+  const hints = matchAll(bashEvent("cat > /tmp/mine.py << 'EOF'", "", false));
+  assert.equal(hints.length, 0);
+});
+
+test("the macOS temp dir counts as scratch too", () => {
+  const hints = matchAll(bashEvent("cd /repo && cat > /var/folders/zs/8p2/T/probe.sh << 'EOF'", "", false));
+  assert.equal(hints.length, 0);
+});
+
+test("a repo path inside the heredoc body does not resurrect the hint", () => {
+  const command = [
+    "cat > /tmp/repro.mjs << 'EOF'",
+    "import { run } from '/Users/me/.pi/agent/extensions/edit/edit-engine.ts';",
+    "EOF",
+  ].join("\n");
+  const hints = matchAll(bashEvent(command, "", false));
+  assert.equal(hints.length, 0);
+});
+
+test("tee into the workspace still yields the hint, tee into /tmp does not", () => {
+  assert.equal(matchAll(bashEvent("tee src/out.txt << 'EOF'", "", false)).length, 1);
+  assert.equal(matchAll(bashEvent("tee /tmp/out.txt << 'EOF'", "", false)).length, 0);
+});
+
+test("sed -i on a scratch file is not the mutation the contract is about", () => {
+  const hints = matchAll(bashEvent("sed -i '' 's/a/b/' /tmp/scratch.txt", "", false));
+  assert.equal(hints.length, 0);
+});
+
 test("sed -i yields the mutation-contract hint", () => {
   const hints = matchAll(bashEvent("sed -i.bak 's/a/b/' file.ts", "", false));
   assert.equal(hints.length, 1);

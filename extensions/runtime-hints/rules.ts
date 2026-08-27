@@ -68,6 +68,41 @@ function applyPatchFailureCode(event: HintEvent): string | undefined {
 const BASH_MUTATION =
 	/(?:^|&&|\|\||[;|])\s*(?:cat\s+(?:>>?\s*\S+\s*<<|<<\s*\S+\s*>+\s*\S)|tee\s+-?[a-z]*\s*\S+\s*<<|sed\s+-[^\s|;&]*i)/;
 
+/** 临时区:草稿脚本没有 reviewer,可审计 diff 的契约对它不成立。 */
+const SCRATCH_PATH = /^(?:\/tmp\/|\/private\/tmp\/|\/var\/folders\/|\$TMPDIR\b|\$\{TMPDIR\})/;
+const SED_IN_PLACE = /\bsed\s+-[^\s|;&]*i/;
+
+/**
+ * 改写目标：重定向/tee 的那个文件；sed -i 取子句末尾的文件参数。
+ * 只看命令首行——heredoc 正文里的路径是数据,不是目标。
+ * 认不出目标就返回空:宁可多提示一次,不可漏掉真的源文件改写。
+ */
+function mutationTargets(command: string): string[] {
+	const newline = command.indexOf("\n");
+	const head = newline === -1 ? command : command.slice(0, newline);
+	const tokens = head.split(/\s+/).filter((token) => token !== "");
+	const targets: string[] = [];
+	for (let index = 0; index < tokens.length; index += 1) {
+		const token = tokens[index]!;
+		if (token === ">" || token === ">>" || token === "tee") {
+			const next = tokens[index + 1];
+			if (next !== undefined && !next.startsWith("-") && !next.startsWith("<")) targets.push(next);
+			continue;
+		}
+		if (token.startsWith(">")) {
+			const inlineTarget = token.replace(/^>+/, "");
+			if (inlineTarget !== "") targets.push(inlineTarget);
+		}
+	}
+	if (SED_IN_PLACE.test(head) && tokens.length > 0) targets.push(tokens[tokens.length - 1]!);
+	return targets;
+}
+
+function mutatesOnlyScratch(command: string): boolean {
+	const targets = mutationTargets(command);
+	return targets.length > 0 && targets.every((target) => SCRATCH_PATH.test(target));
+}
+
 export const rules: HintRule[] = [
 	{
 		name: "rg-grep-exit-1",
@@ -97,10 +132,13 @@ export const rules: HintRule[] = [
 		name: "bash-file-mutation",
 		evidence:
 			"chain-mining 2026-08-13: 626 例 cat>heredoc 写文件 + 123 例 sed -i；" +
-			"2026-08-21..26 重测：cat>/tee 整文件写 341 例、追加 65 例、sed -i 23 例",
+			"2026-08-21..26 重测：cat>/tee 整文件写 341 例、追加 65 例、sed -i 23 例；" +
+			"2026-08-27 全量：229 个触发 session 中 88 个(38%)的首次命中是 /tmp 草稿脚本," +
+			"once-per-session 的额度被误报吃掉 → 临时区目标不再触发",
 		match(event) {
 			if (event.toolName !== "bash" || event.command === undefined) return undefined;
 			if (!BASH_MUTATION.test(event.command)) return undefined;
+			if (mutatesOnlyScratch(event.command)) return undefined;
 			return "[hint:bash-file-mutation] file mutation via bash (cat>/sed -i/python heredoc) bypasses the auditable edit contract — use edit, apply_patch, or perl so the change stays reviewable as a diff (AGENTS.md Mechanics).";
 		},
 	},
