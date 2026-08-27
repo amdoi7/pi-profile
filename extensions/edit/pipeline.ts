@@ -74,7 +74,6 @@ const editRequestSchema = Type.Object(
 export const editRequestParameters: ToolDefinition["parameters"] = editRequestSchema;
 
 export type EditRequest = Static<typeof editRequestSchema>;
-export type FileEditRequest = Static<typeof fileEditsSchema>;
 
 /** 文件在本次事务中的结局；path 回报模型给的原始路径（展示与定位都用它）。 */
 export type FileOutcome = { path: string; hint?: string } & (
@@ -110,7 +109,7 @@ function resolveFilePath(filePath: string, cwd: string): string {
 	return path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
 }
 
-export function canonicalizePath(filePath: string, cwd: string): string {
+function canonicalizePath(filePath: string, cwd: string): string {
 	const resolvedPath = resolveFilePath(filePath, cwd);
 	try {
 		return fs.realpathSync.native(resolvedPath);
@@ -266,10 +265,6 @@ export function buildCallToolViewModel(args: unknown): CallRenderViewModel {
 	}
 }
 
-/**
- * 执行整批：canonical path 去重后交给 engine 的事务。
- * 文件级失败进 outcome（软失败）；abort 与重复路径等硬失败上抛。
- */
 /**
  * 执行整批：canonical path 去重后交给 engine 的事务。
  * 文件级失败进 outcome（软失败）；abort 与别名路径等硬失败上抛。

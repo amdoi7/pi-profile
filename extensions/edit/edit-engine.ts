@@ -14,7 +14,7 @@ export type FileEditOperation = {
 	replaceAll?: boolean;
 };
 
-export type AppliedEditsResult = {
+type AppliedEditsResult = {
 	newContent: string;
 	matchedSpans: MatchedEditSpan[];
 };
@@ -27,14 +27,14 @@ export type MatchedEditSpan = {
 // Hard file-size gate. Files larger than this are rejected before reading.
 export const MAX_EDIT_FILE_SIZE_BYTES = 8 * 1024 * 1024; // 8 MB
 
-export const EDIT_TOOL_ERROR_KINDS = ["NOT_FOUND", "DUPLICATE_MATCH", "NO_CHANGE"] as const;
-export type RecoverableEditErrorKind = (typeof EDIT_TOOL_ERROR_KINDS)[number];
+const EDIT_TOOL_ERROR_KINDS = ["NOT_FOUND", "DUPLICATE_MATCH", "NO_CHANGE"] as const;
+type RecoverableEditErrorKind = (typeof EDIT_TOOL_ERROR_KINDS)[number];
 
-export interface EditToolError extends Error {
+interface EditToolError extends Error {
 	kind: RecoverableEditErrorKind;
 }
 
-export function isEditToolError(error: unknown): error is EditToolError {
+function isEditToolError(error: unknown): error is EditToolError {
 	return error instanceof Error
 		&& typeof (error as Partial<EditToolError>).kind === "string"
 		&& (EDIT_TOOL_ERROR_KINDS as readonly string[]).includes((error as EditToolError).kind);
@@ -68,7 +68,7 @@ const LEFT_SINGLE_CURLY_QUOTE = "‘";
 const RIGHT_SINGLE_CURLY_QUOTE = "’";
 const LEFT_DOUBLE_CURLY_QUOTE = "“";
 const RIGHT_DOUBLE_CURLY_QUOTE = "”";
-export const defaultEditEngineOperations: EditEngineOperations = {
+const defaultEditEngineOperations: EditEngineOperations = {
 	access: (absolutePath) => access(absolutePath, constants.R_OK | constants.W_OK),
 	readFile: (absolutePath) => readFile(absolutePath, "utf-8"),
 	writeFile: (absolutePath, content) => writeFile(absolutePath, content, "utf-8"),
@@ -87,13 +87,13 @@ export function detectLineEnding(content: string): "\r\n" | "\n" {
 	return crlfIdx < lfIdx ? "\r\n" : "\n";
 }
 
-export function normalizeToLF(text: string): string {
+function normalizeToLF(text: string): string {
 	// Fast path: most files have no \r at all.
 	if (text.indexOf("\r") === -1) return text;
 	return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 }
 
-export function restoreLineEndings(text: string, ending: "\r\n" | "\n"): string {
+function restoreLineEndings(text: string, ending: "\r\n" | "\n"): string {
 	return ending === "\r\n" ? text.replace(/\n/g, "\r\n") : text;
 }
 
@@ -136,7 +136,7 @@ export function normalizeForFuzzyMatch(text: string): string {
 		.replaceAll(RIGHT_DOUBLE_CURLY_QUOTE, '"');
 }
 
-export function stripBom(content: string): { bom: string; text: string } {
+function stripBom(content: string): { bom: string; text: string } {
 	return content.startsWith("\uFEFF") ? { bom: "\uFEFF", text: content.slice(1) } : { bom: "", text: content };
 }
 
