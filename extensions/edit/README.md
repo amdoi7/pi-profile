@@ -83,10 +83,15 @@ diff」完全相同。
 
 ## Failures
 
-服务对象是 LLM agent：错误正文只传增量（事实 + 必要定位/原因），修复协议已在
-promptGuidelines/schema 中声明，不重复传递：
+服务对象是 LLM agent：错误正文传事实 + 引引下一步，不重复 promptGuidelines/schema
+里的完整协议；但引擎手上已有的字节必须随错误交回——扣着不给只换来一次往返：
 
-- `NOT_FOUND`：`oldText was not found.`——模型自会 fetch/copy/retry，不传任何诊断或指令
+- `NOT_FOUND`：定位 + 文件原文。先逐字指认第一处分歧
+  （`L287 col 56: file "、" U+3001 ≠ oldText "," U+002C`），再跟带行号的原文区域
+  （≤ 8 行，单行 ≤ 100 字符）；文件里没有相近文本时明说 `no similar text in the file`，
+  不编行号。实现在 `nearest-text.ts`：按行暴力对齐，无索引无相似搜索（只走失败路径，
+  8MB/20 万行 × 21 行锚 = 153ms）。依据（2026-08-27 全量语料）：913 次 NOT_FOUND 之后
+  模型 70% 立刻重读同一个文件（bash 59% + read 11%）、5% 逐字节原样重发。
 - `DUPLICATE_MATCH`：匹配行号
 - `NO_CHANGE`：`newText` 归一化后等于 `oldText`（替换不产生任何变化）
 - 重叠：`replacement N overlaps replacement M`
@@ -117,7 +122,7 @@ handler 改信封；写在 execute 返回值里会被静默丢弃。
 失败（`rejected` = 零写入，`partial` = 部分留在盘上）：
 
 ```json
-{"status":"rejected","written":[],"failed":[{"path":"b.py","kind":"NOT_FOUND","message":"replacement 2: oldText was not found."}]}
+{"status":"rejected","written":[],"failed":[{"path":"b.py","kind":"NOT_FOUND","message":"replacement 2: oldText was not found; L88 col 5: file 4 spaces ≠ oldText 2 spaces; copy from the file:\n88|    return compute()"}]}
 ```
 
 `written` 是磁盘现状（仍被改动的文件），模型据此决定重发整批还是只修失败点。

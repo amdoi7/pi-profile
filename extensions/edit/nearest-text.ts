@@ -129,7 +129,9 @@ function divergenceOf(lines: string[], anchorLines: string[], start: number): st
 		if (fileText.length > MAX_QUOTED_DIVERGENCE || anchorText.length > MAX_QUOTED_DIVERGENCE) {
 			return undefined;
 		}
-		return `L${start + index + 1} col ${match.offset + prefix + 1}: file ${describeText(fileText)}`
+		// 列号按码位数（CJK/emoji 各算一列），不是 UTF-16 单元。
+		const column = [...fileLine.slice(0, match.offset + prefix)].length + 1;
+		return `L${start + index + 1} col ${column}: file ${describeText(fileText)}`
 			+ ` ≠ oldText ${describeText(anchorText)}`;
 	}
 	return undefined;

@@ -44,6 +44,15 @@ test("the file's real lines come back verbatim with their line numbers", () => {
 	assert.match(error.message, /U\+002C/);
 });
 
+test("the reported column counts codepoints, not UTF-16 units", () => {
+	// 前置 4 个汉字 + 1 个 emoji（代理对）：分歧字符在第 6 列，而非第 7 个单元。
+	const content = ["定位基准🌟A", ""].join("\n");
+	const error = failureOf(content, [{ oldText: "定位基准🌟B", newText: "x" }]);
+
+	assert.match(error.message, /L1 col 6:/);
+	assert.match(error.message, /file "A" U\+0041 ≠ oldText "B" U\+0042/);
+});
+
 test("a rewritten line comes back as the file has it", () => {
 	const content = [
 		"function total(items) {",

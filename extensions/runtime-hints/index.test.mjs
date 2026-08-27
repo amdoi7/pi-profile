@@ -112,6 +112,11 @@ test("sed -i on a scratch file is not the mutation the contract is about", () =>
   assert.equal(hints.length, 0);
 });
 
+test("sed -i touching both a source file and a scratch file still yields the hint", () => {
+  const hints = matchAll(bashEvent("sed -i '' 's/x/y/' src/a.ts /tmp/b.ts", "", false));
+  assert.equal(hints.length, 1);
+});
+
 test("sed -i yields the mutation-contract hint", () => {
   const hints = matchAll(bashEvent("sed -i.bak 's/a/b/' file.ts", "", false));
   assert.equal(hints.length, 1);

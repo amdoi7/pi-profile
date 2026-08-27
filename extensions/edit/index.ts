@@ -37,7 +37,7 @@ export default function (pi: ExtensionAPI) {
 			"For edit, intent is one line naming the change (\"split ToolCtx into PullCtx/ActCtx\"); files[].hint is an optional short note on that file's role.",
 			"For edit, oldText must match the file's current content exactly, including whitespace, and must match exactly once — add surrounding context to disambiguate, or set replaceAll to true to replace every occurrence.",
 			"For edit, each edits[].oldText is matched against that file's original content, not after earlier edits; do not emit overlapping or nested edits — merge nearby changes into one edit. Keep oldText short (1-3 lines).",
-			"For edit, status \"rejected\" means nothing was written: read the files named in failed[], fix those anchors, and resend the batch; do not retry the same guess.",
+			"For edit, status \"rejected\" means nothing was written: each failed[] entry carries the file's own text at the nearest location — rebuild those anchors from it and resend the batch, and re-read the file only when the entry says no similar text was found.",
 		],
 		parameters: editRequestParameters,
 		prepareArguments: parseEditRequest,

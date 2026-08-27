@@ -94,7 +94,15 @@ function mutationTargets(command: string): string[] {
 			if (inlineTarget !== "") targets.push(inlineTarget);
 		}
 	}
-	if (SED_IN_PLACE.test(head) && tokens.length > 0) targets.push(tokens[tokens.length - 1]!);
+	if (SED_IN_PLACE.test(head)) {
+		// sed -i 的文件参数在子句末尾且可能不止一个：从尾收，遇脚本/开关即停。
+		// 只取最后一个会把 `sed -i '' 's/x/y/' src/a.ts /tmp/b.ts` 当成纯草稿。
+		for (let index = tokens.length - 1; index >= 0; index -= 1) {
+			const token = tokens[index]!;
+			if (token.startsWith("-") || token.startsWith("'") || token.startsWith('"') || token.includes("s/")) break;
+			targets.push(token);
+		}
+	}
 	return targets;
 }
 
