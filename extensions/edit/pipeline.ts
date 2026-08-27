@@ -19,6 +19,7 @@ import {
 	type RecoverableEditErrorKind,
 } from "./edit-engine.ts";
 import { normalizeEditInput } from "./input-normalize.ts";
+import { rememberEdited, wasEditedThisSession } from "./session-edits.ts";
 
 const editOperationSchema = Type.Object(
 	{
@@ -78,7 +79,13 @@ export type FileOutcome = { path: string; hint?: string } & (
 			truncated: boolean;
 			firstChangedLine?: number;
 	  }
-	| { status: "failed"; error: string; errorKind?: RecoverableEditErrorKind }
+	/** editedEarlierThisSession：本 session 自己改过它，锚多半抄自改动之前。 */
+	| {
+			status: "failed";
+			error: string;
+			errorKind?: RecoverableEditErrorKind;
+			editedEarlierThisSession?: true;
+	  }
 	/** 匹配无误但未落盘；restored=true 表示写过又被回滚。 */
 	| { status: "notWritten"; restored: boolean }
 );
@@ -262,6 +269,7 @@ export async function executeEditBatch(
 			const source = request.files[index]!;
 			const identity = { path: source.path, ...(source.hint !== undefined ? { hint: source.hint } : {}) };
 			if (fileResult.status === "applied") {
+				rememberEdited(canonicalPaths[index]!);
 				return {
 					...identity,
 					status: "applied",
@@ -279,6 +287,7 @@ export async function executeEditBatch(
 					status: "failed",
 					error: fileResult.error,
 					...(fileResult.errorKind !== undefined ? { errorKind: fileResult.errorKind } : {}),
+					...(wasEditedThisSession(canonicalPaths[index]!) ? { editedEarlierThisSession: true as const } : {}),
 				};
 			}
 			return { ...identity, status: "notWritten", restored: fileResult.restored };
@@ -313,6 +322,7 @@ export function buildOutcomeAgentContent(outcome: BatchOutcome): string {
 			.map((file) => ({
 				path: file.path,
 				...(file.errorKind !== undefined ? { kind: file.errorKind } : {}),
+				...(file.editedEarlierThisSession === true ? { editedEarlierThisSession: true } : {}),
 				message: file.error,
 			})),
 	});

@@ -101,6 +101,11 @@ diff」完全相同。
   传输中被截断，原样重发」。依据：实测语料里这两种形状几乎全是参数截断，
   而非模型搞错 schema；报错说错原因会把模型送去改一个本来就对的东西。
 
+失败条目另带一个因：`editedEarlierThisSession`——本 session 已经用 edit 改过这个文件，
+锚多半抄自改动之前。依据：913 次 NOT_FOUND 里 638 次（69%）属于这一类。这个事实不需
+内容指纹也不需 mtime（见 `session-edits.ts`）；只记 edit 自己的落盘，因为只有它的
+路径是算出来的而不是猜出来的——错的因比没有因更坏。
+
 `path` 独立保存在结果字段和 UI 文件行中，不在错误正文重复。单个文件内的首个
 replacement 不显示内部数组下标；后续 replacement 显示为 `replacement N`。
 
