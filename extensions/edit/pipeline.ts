@@ -23,10 +23,13 @@ import { rememberEdited, wasEditedThisSession } from "./session-edits.ts";
 
 const editOperationSchema = Type.Object(
 	{
-		// 语料 2026-08-27：475 个可复核的失败锚里 89% 是重构而非复制（部分行对 58%
-		// + 整段不在 31%）——锚的来源比锚的长短重要得多（1 行 2.8% vs 13+ 行 5.9%）。
+		// 两条规则都挂在这个字段上，因为它们都只管这个字段（语料 2026-08-27）：
+		// 来源——475 个可复核失败锚里 89% 是重构而非复制；
+		// 长度——54% 的锚超过 3 行，第 4 行之后的部分占全部 oldText 字节的 63%
+		// （4.68M 字符 ≈ 1.34M token），不承担任何定位工作；且相邻性幻觉只发生在长锚上。
 		oldText: Type.String({
-			description: "Exact text currently in the file to replace. Copy it from tool output, not from memory.",
+			description: "Exact text currently in the file to replace. Copy it from tool output, not from memory,"
+				+ " and keep it short — 1-3 lines is usually enough to be unique.",
 		}),
 		newText: Type.String({ description: "Replacement text. Use an empty string to delete oldText." }),
 		replaceAll: Type.Optional(Type.Boolean({
