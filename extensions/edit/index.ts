@@ -37,12 +37,12 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Apply one intent as an atomic batch of exact text replacements; every file the intent touches goes in the same call.",
 		promptSnippet: "Exact file edits",
+		// 只留 schema 与错误文本说不出的两条：事务边界与匹配基准。
+		// 其余四条（intent/hint 含义、唯一匹配与 replaceAll、锚要短、rejected 后怎么办）
+		// 都已在 parameters 描述或失败载荷里，重说一遍只是每轮都付的 token。
 		promptGuidelines: [
 			"For edit, one call carries one intent: put every file that intent touches in files[], each with its own edits[]; never split an intent across calls or emit parallel edit calls for one change.",
-			"For edit, intent is one line naming the change (\"split ToolCtx into PullCtx/ActCtx\"); files[].hint is an optional short note on that file's role.",
-			"For edit, oldText must match the file's current content exactly, including whitespace, and must match exactly once — add surrounding context to disambiguate, or set replaceAll to true to replace every occurrence.",
-			"For edit, each edits[].oldText is matched against that file's original content, not after earlier edits; do not emit overlapping or nested edits — merge nearby changes into one edit. Keep oldText short (1-3 lines).",
-			"For edit, status \"rejected\" means nothing was written: each failed[] entry carries the file's own text at the nearest location — rebuild those anchors from it and resend the batch, and re-read the file only when the entry says no similar text was found.",
+			"For edit, each edits[].oldText is matched against that file's original content, not against the result of earlier edits in the same call.",
 		],
 		parameters: editRequestParameters,
 		prepareArguments: parseEditRequest,
