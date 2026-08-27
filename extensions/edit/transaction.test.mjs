@@ -530,3 +530,16 @@ test("two fuzzy variants of a straight-quote anchor are a duplicate, not repaire
 		/matched 2 locations/,
 	);
 });
+
+// DUPLICATE_MATCH 的行号列表有上限（8 处 + 省略号）：5000 处命中的消息是 34KB
+// token 噪声，而下一步（加长锚）不依赖完整列表。NOT_FOUND 的窗口有上限，这里对称。
+test("duplicate-match location list is capped", () => {
+	try {
+		const big = Array.from({ length: 5000 }, (_, i) => `row ${i}`).join("\n");
+		applyEditsToNormalizedContent(big + "\n", [{ oldText: "row", newText: "y" }]);
+		assert.fail("expected throw");
+	} catch (error) {
+		assert.match(error.message, /matched 5000 locations \(L1, L2, L3, L4, L5, L6, L7, L8, …\)/);
+		assert.ok(error.message.length < 200, `message should be short, got ${error.message.length}`);
+	}
+});

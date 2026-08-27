@@ -143,8 +143,15 @@ function getNotFoundError(editIndex: number, content: string, oldText: string): 
 	);
 }
 
+/** 列出行号的上限：超出后「加长锚」的下一步已经明确，列表只是 token 噪声。 */
+const MAX_LISTED_LOCATIONS = 8;
+
 function getDuplicateError(editIndex: number, occurrences: number, lineNumbers: number[]): EditToolError {
-	const locations = lineNumbers.length > 0 ? ` (L${lineNumbers.join(", L")})` : "";
+	const listed = lineNumbers.slice(0, MAX_LISTED_LOCATIONS);
+	const more = lineNumbers.length - listed.length;
+	const locations = listed.length > 0
+		? ` (L${listed.join(", L")}${listed.length < lineNumbers.length ? ", …" : ""})`
+		: "";
 	return editError(
 		`${replacementPrefix(editIndex)}oldText matched ${occurrences} locations${locations}`,
 		"DUPLICATE_MATCH",
