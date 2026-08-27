@@ -16,7 +16,7 @@
 import { test } from "vitest";
 import assert from "node:assert/strict";
 
-import { applyEditsToNormalizedContent } from "./edit-engine.ts";
+import { applyEditsToNormalizedContent } from "./match.ts";
 
 test("a halfwidth comma in the anchor matches the file's ideographic comma", () => {
 	// 本次对话的第一个失败(时序制约与前置边.md L287)。

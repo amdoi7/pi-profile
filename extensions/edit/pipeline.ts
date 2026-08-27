@@ -1,10 +1,14 @@
 /**
- * pipeline.ts —— edit 的适配层：参数契约 → 事务执行 → agent/UI payload。
+ * pipeline.ts —— edit 的输入契约与适配层：容错归一 → 校验 → 合并 → 事务执行
+ * → agent/UI payload。输入形状的全部 owner 在这一个文件。
  *
  * 契约核心：一个意图 = 一次调用 = 一个事务。`intent` 是这批修改存在的理由，
  * `files[]` 是这个意图触碰的全部文件；整批要么全部落盘，要么一个字节都不落
- * （engine 保证）。模型因此不需要在「多次单文件调用」之间自己维护一致性，
+ * （transaction 保证）。模型因此不需要在「多次单文件调用」之间自己维护一致性，
  * 也不会在半应用状态上重试。
+ *
+ * 容错归一只接受语义无歧义的形状（JSON 字符串退化、内置单文件形状、flat 形状）；
+ * `intent` 从不代为编造，其余形状原样留给校验响亮拒绝。
  */
 
 import * as fs from "node:fs";
@@ -17,8 +21,7 @@ import {
 	executeBatchEdits,
 	type FileEditOperation,
 	type RecoverableEditErrorKind,
-} from "./edit-engine.ts";
-import { normalizeEditInput } from "./input-normalize.ts";
+} from "./transaction.ts";
 
 const editOperationSchema = Type.Object(
 	{
@@ -205,6 +208,79 @@ function parseEditOperations(rawEdits: unknown, filePath: string): FileEditOpera
 			...(entry.replaceAll !== undefined ? { replaceAll: entry.replaceAll } : {}),
 		};
 	});
+}
+
+function parseJsonArray(value: unknown): unknown {
+	if (typeof value !== "string") return value;
+	try {
+		const parsed = JSON.parse(value);
+		return Array.isArray(parsed) ? parsed : value;
+	} catch {
+		// fall through to the validation error for a non-array value
+		return value;
+	}
+}
+
+/**
+ * 单文件形状（内置 edit / 旧契约）→ files[0]；flat oldText/newText 同理。
+ *
+ * 抬升只看形状不看值是否合法：edits 是一段坏文本时也要抬，否则它会留在顶层
+ * 被当成未知键，报出「path must be removed」——把模型指向删掉唯一正确的字段。
+ */
+function liftSingleFileShape(request: Record<string, unknown>): void {
+	if (typeof request.path !== "string") return;
+
+	const hasFlatReplacement = typeof request.oldText === "string" && typeof request.newText === "string";
+	if (typeof request.edits === "string") {
+		if (request.files !== undefined) return;
+		request.files = [{ path: request.path, edits: request.edits }];
+		delete request.path;
+		delete request.edits;
+		return;
+	}
+
+	const edits = Array.isArray(request.edits) ? request.edits : [];
+	if (hasFlatReplacement) {
+		edits.push({
+			oldText: request.oldText,
+			newText: request.newText,
+			...(typeof request.replaceAll === "boolean" ? { replaceAll: request.replaceAll } : {}),
+		});
+	}
+	if (edits.length === 0) return;
+
+	const file: Record<string, unknown> = { path: request.path, edits };
+	if (typeof request.hint === "string") file.hint = request.hint;
+	request.files = [file, ...(Array.isArray(request.files) ? request.files : [])];
+	delete request.path;
+	delete request.edits;
+	delete request.oldText;
+	delete request.newText;
+	delete request.replaceAll;
+	delete request.hint;
+}
+
+export function normalizeEditInput(input: unknown): unknown {
+	if (!isRecord(input)) {
+		return input;
+	}
+	const request = { ...input };
+
+	request.files = parseJsonArray(request.files);
+	request.edits = parseJsonArray(request.edits);
+	if (request.files === undefined) delete request.files;
+	if (request.edits === undefined) delete request.edits;
+
+	liftSingleFileShape(request);
+
+	if (Array.isArray(request.files)) {
+		request.files = request.files.map((entry) =>
+			isRecord(entry) && entry.edits !== undefined
+				? { ...entry, edits: parseJsonArray(entry.edits) }
+				: entry
+		);
+	}
+	return request;
 }
 
 /**

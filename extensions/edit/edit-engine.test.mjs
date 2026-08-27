@@ -6,10 +6,8 @@ import path from "node:path";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { generateFinalDiff, serializeDisplayDiff } from "../_shared/final-diff.ts";
 
-import {
-	applyEditsToNormalizedContent,
-	executeBatchEdits,
-} from "./edit-engine.ts";
+import { applyEditsToNormalizedContent } from "./match.ts";
+import { executeBatchEdits } from "./transaction.ts";
 
 async function writeTempFile(prefix, name, content) {
 	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), prefix));

@@ -9,7 +9,7 @@
 import { test } from "vitest";
 import assert from "node:assert/strict";
 
-import { applyEditsToNormalizedContent } from "./edit-engine.ts";
+import { applyEditsToNormalizedContent } from "./match.ts";
 
 function failureOf(content, edits) {
 	try {

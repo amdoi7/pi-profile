@@ -149,8 +149,10 @@ handler 改信封；写在 execute 返回值里会被静默丢弃。
 
 - `index.ts`：tool 注册入口（schema/guidelines/execute/render 装配）
 - `pipeline.ts`：参数契约与校验、canonical 去重、批次执行、agent/UI payload
-- `input-normalize.ts`：模型输入容错（单文件形状 → 批次）
-- `edit-engine.ts`：匹配、替换、事务（多锁 + 解析闸门 + 回滚）
+- `pipeline.ts`：输入契约的全部 owner——容错归一（单文件形状 → 批次）、校验、
+  重复 path 合并、事务执行、agent/UI payload
+- `match.ts`：纯匹配核心（内容 + 锚 → spans + 新内容），零 IO；事务与全部匹配测试共用
+- `transaction.ts`：多文件原子事务（多锁 + 解析闸门 + 提交 + 回滚）
 - `span-diff.ts`：已知 span → 展示 diff（规模 = 编辑规模）
 - `ui.ts`：call/result render
 - `*.test.mjs`：行为测试

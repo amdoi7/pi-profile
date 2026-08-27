@@ -23,7 +23,7 @@ import {
 	type DisplayDiffRow,
 	type FinalDiff,
 } from "../_shared/final-diff.ts";
-import type { MatchedEditSpan } from "./edit-engine.ts";
+import type { MatchedEditSpan } from "./match.ts";
 
 /** 窗口内的 span（偏移已换算到窗口切片坐标）。 */
 type WindowSpan = { matchIndex: number; matchLength: number; newText: string };

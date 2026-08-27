@@ -4,10 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import {
-	executeBatchEdits,
-	MAX_EDIT_FILE_SIZE_BYTES,
-} from "./edit-engine.ts";
+import { MAX_EDIT_FILE_SIZE_BYTES, executeBatchEdits } from "./transaction.ts";
 import { buildOutcomeAgentContent, executeEditBatch } from "./pipeline.ts";
 import { generateFinalDiff, serializeDisplayDiff } from "../_shared/final-diff.ts";
 

@@ -2,7 +2,7 @@ import { test } from "vitest";
 import assert from "node:assert/strict";
 
 import { generateFinalDiff, serializeDisplayDiff } from "../_shared/final-diff.ts";
-import { applyEditsToNormalizedContent } from "./edit-engine.ts";
+import { applyEditsToNormalizedContent } from "./match.ts";
 import { diffFromSpans } from "./span-diff.ts";
 
 const CONTEXT = 4;
