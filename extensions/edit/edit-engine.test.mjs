@@ -477,3 +477,40 @@ test("preview keeps unchanged lines as context inside a replaced block", () => {
 	assert.doesNotMatch(rendered, /^- 4/m);
 	assert.ok((preview.firstChangedLine ?? 0) > 0);
 });
+
+// 失败优先级：empty anchor 与解析失败同一通道聚合，重叠不掩盖解析失败——
+// 一次性报全是文件头的既定不变式，任何一类失败都不该被另一类掩盖。
+test("empty oldText aggregates with other failures instead of short-circuiting", () => {
+	try {
+		applyEditsToNormalizedContent("alpha\n", [
+			{ oldText: "missing-anchor", newText: "x" },
+			{ oldText: "", newText: "y" },
+		]);
+		assert.fail("expected throw");
+	} catch (error) {
+		assert.match(error.message, /2 of 2/);
+		assert.match(error.message, /not found/);
+		assert.match(error.message, /must not be empty/);
+	}
+});
+
+test("overlap aggregates with recoverable failures instead of being masked", () => {
+	try {
+		applyEditsToNormalizedContent("abcdefghij\n", [
+			{ oldText: "zzzz", newText: "q" },
+			{ oldText: "bcd", newText: "X" },
+			{ oldText: "def", newText: "Y" },
+		]);
+		assert.fail("expected throw");
+	} catch (error) {
+		assert.match(error.message, /not found/);
+		assert.match(error.message, /overlaps/);
+	}
+});
+
+test("single empty anchor keeps its exact structured message", () => {
+	assert.throws(
+		() => applyEditsToNormalizedContent("alpha\n", [{ oldText: "", newText: "y" }]),
+		/^Error: oldText must not be empty\.$/,
+	);
+});

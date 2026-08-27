@@ -275,14 +275,6 @@ function applyRepairedMarks(newText: string, marks: ReadonlyMap<string, string> 
 }
 
 export function applyEditsToNormalizedContent(normalizedContent: string, edits: FileEditOperation[]): AppliedEditsResult {
-	// Validate edit invariants upfront before any allocation.
-	for (let index = 0; index < edits.length; index += 1) {
-		const edit = edits[index]!;
-		if (edit.oldText.length === 0) {
-			throw getEmptyOldTextError(index);
-		}
-	}
-
 	// Lazily normalize content for fuzzy matching — computed at most once
 	// regardless of how many edits fall through to the fuzzy path.
 	let fuzzyContentCache: { content: string } | undefined;
@@ -302,6 +294,11 @@ export function applyEditsToNormalizedContent(normalizedContent: string, edits: 
 		const edit = edits[index]!;
 		const oldText = normalizeToLF(edit.oldText);
 		const newText = normalizeToLF(edit.newText);
+		// empty anchor 与其他失败同一通道收集：一次性报全，不让模型逐个失败逐个重试。
+		if (oldText.length === 0) {
+			failures.push(editError(`${replacementPrefix(index)}oldText must not be empty.`, "NO_CHANGE"));
+			continue;
+		}
 		let resolvedMatches: ResolvedMatch[];
 		try {
 			resolvedMatches = resolveEditMatches(
@@ -330,20 +327,12 @@ export function applyEditsToNormalizedContent(normalizedContent: string, edits: 
 			});
 		}
 	}
-	if (failures.length === 1) {
-		throw failures[0]!;
-	}
-	if (failures.length > 1) {
-		throw editError(
-			`edit failed (${failures.length} of ${edits.length}):\n${failures.map((failure) => `  ${failure.message}`).join("\n")}`,
-			failures[0]!.kind,
-		);
-	}
-
 	// Sort only when there are multiple edits — single-edit is already sorted.
 	if (matchedEdits.length > 1) {
 		matchedEdits.sort((left, right) => left.matchIndex - right.matchIndex);
 	}
+	// 重叠检查与解析失败同一通道：全部失败一次性报全（聚合 throw 会掩盖重叠，
+	// 重叠 throw 会掩盖解析失败——都是让模型多付一次往返）。
 	for (let index = 1; index < matchedEdits.length; index += 1) {
 		const previous = matchedEdits[index - 1]!;
 		const current = matchedEdits[index]!;
@@ -352,11 +341,22 @@ export function applyEditsToNormalizedContent(normalizedContent: string, edits: 
 			const span = (edit: MatchedEdit): string =>
 				`L${lineNumberAt(normalizedContent, edit.matchIndex)}`
 				+ `-L${lineNumberAt(normalizedContent, edit.matchIndex + edit.matchLength - 1)}`;
-			throw new Error(
+			failures.push(editError(
 				`replacement ${current.editIndex + 1} (${span(current)}) overlaps`
 				+ ` replacement ${previous.editIndex + 1} (${span(previous)}); merge them into one edit`,
-			);
+				"NO_CHANGE",
+			));
+			break;
 		}
+	}
+	if (failures.length === 1) {
+		throw failures[0]!;
+	}
+	if (failures.length > 1) {
+		throw editError(
+			`edit failed (${failures.length} of ${edits.length}):\n${failures.map((failure) => `  ${failure.message}`).join("\n")}`,
+			failures[0]!.kind,
+		);
 	}
 
 	// Apply edits forward, collecting segments, then join once.
