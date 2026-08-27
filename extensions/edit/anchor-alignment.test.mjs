@@ -21,27 +21,26 @@ function failureOf(content, edits) {
 }
 
 test("the file's real lines come back verbatim with their line numbers", () => {
-	// 真实语料(Dangwu 时序制约与前置边.md L287):文件是顿号,锚写成半角逗号。
+	// 真实语料(Dangwu 架构.md):模型把两段真文本拼成了不相邻的一段。
+	// 这一类标点等价类救不了，也不应该救——它必须大声失败并交回原文。
 	const content = [
 		"# 标题",
 		"",
-		"的 (mode, status) 表消费:同一 `at_risk` 事实,gate 出导航卡、hard 出拒绝、",
-		"guide 出引导卡、hint 出提醒。",
+		"维护面,需要时再拆。",
+		"",
+		"**默认假设**:产品先行,包纪律保持。",
 		"",
 	].join("\n");
-	const anchor = "gate 出导航卡、hard 出拒绝,\nguide 出引导卡、hint 出提醒。";
+	const anchor = "维护面,需要时再拆。\n\n## 一、分层与依赖法则";
 
 	const error = failureOf(content, [{ oldText: anchor, newText: "x" }]);
 
 	assert.equal(error.kind, "NOT_FOUND");
 	assert.match(error.message, /^oldText was not found;/);
 	// 权威原文按行带回：模型下一步是复制，不是再读一遍文件。
-	assert.match(error.message, /3\|的 \(mode, status\) 表消费:同一 `at_risk` 事实,gate 出导航卡、hard 出拒绝、/);
-	assert.match(error.message, /4\|guide 出引导卡、hint 出提醒。/);
-	// 肉眼不可辨的差异必须指名到码位。
-	assert.match(error.message, /L3 col \d+/);
-	assert.match(error.message, /U\+3001/);
-	assert.match(error.message, /U\+002C/);
+	assert.match(error.message, /3\|维护面,需要时再拆。/);
+	assert.match(error.message, /5\|\*\*默认假设\*\*:产品先行,包纪律保持。/);
+	assert.match(error.message, /L\d+/);
 });
 
 test("the reported column counts codepoints, not UTF-16 units", () => {

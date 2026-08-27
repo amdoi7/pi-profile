@@ -2,7 +2,7 @@ import { constants } from "node:fs";
 import { access, readFile, stat, writeFile } from "node:fs/promises";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import type { ChangeStats, DisplayDiff } from "../_shared/final-diff.ts";
-import { nearestText } from "./nearest-text.ts";
+import { explainMissingAnchor, repairAnchor } from "./anchor-alignment.ts";
 import { diffFromSpans } from "./span-diff.ts";
 
 /** preview 的 context 行数（与共享 diff 引擎默认一致）。 */
@@ -61,6 +61,8 @@ type MatchedEdit = MatchedEditSpan & {
 type ResolvedMatch = {
 	matchIndex: number;
 	actualOldText: string;
+	/** 仅存在于修复路径：把 newText 里的同类标记翻回文件的写法。 */
+	marks?: ReadonlyMap<string, string>;
 };
 
 const LEFT_SINGLE_CURLY_QUOTE = "‘";
@@ -96,6 +98,28 @@ export function restoreLineEndings(text: string, ending: "\r\n" | "\n"): string 
 	return ending === "\r\n" ? text.replace(/\n/g, "\r\n") : text;
 }
 
+/**
+ * 定位用的字符等价类。
+ *
+ * 守的不变式：排印形式的差异（弯引号、全角/半角）不应让一次改写失败——
+ * 它们是转写噪声，不是意图。模型无需知道这一层存在。
+ * 何时装的：弯引号 2026-08 既有；全角族 2026-08-27。
+ * 立项证据：92 个可修复失败锚里 17 个是 1-2 字符漂移，其中 `,`↔`，` 占 4 例；
+ * 本对话两例 `,`↔`、`。成本侧：零 token、零模型注意力，所以不适用「省多少轮」那套门槛。
+ * 失效条件：折叠开始产生真实歧义（语料里 DUPLICATE_MATCH 里出现因折叠而多命中的
+ * 案例），或出现因折叠而改错位置的事故。
+ *
+ * 不入等价类（证据上就不是同一回事，折了就是改错地方）：
+ * - 汉字形近误写（骨→骰、绕→绍）——语料里它们是失败锚的一大类，必须继续失败；
+ * - 漏字（`**` 丢掉）——同上；
+ * - 破折号 `—`/`–` 与 `-`：`---` 在 Markdown 里是 frontmatter/分割线，折叠有真碰撞面，
+ *   且无证据；
+ * - 缩进类空白：Python 里缩进就是语义。全角空格 U+3000 例外（它是 ASCII 空格的
+ *   全角形式，不作缩进）。
+ *
+ * 硬约束：映射必须是 **1 字符 → 1 字符**。下游 applyIntentOntoFileBytes 靠
+ * 「折叠后与原文等长」来对齐下标；破坏这个不变式会写错位置。
+ */
 export function normalizeForFuzzyMatch(text: string): string {
 	// Fast path: most source files contain no curly quotes at all.
 	if (
@@ -160,7 +184,7 @@ function lineNumbersAt(content: string, indices: number[]): number[] {
 /** 只在失败路径计算：错误必须带回文件原文，否则模型只能重读或重试。 */
 function getNotFoundError(editIndex: number, content: string, oldText: string): EditToolError {
 	return editError(
-		`${replacementPrefix(editIndex)}oldText was not found; ${nearestText(content, oldText)}`,
+		`${replacementPrefix(editIndex)}oldText was not found; ${explainMissingAnchor(content, oldText)}`,
 		"NOT_FOUND",
 	);
 }
@@ -201,6 +225,14 @@ function resolveEditMatches(
 	const normalizedOldText = normalizeForFuzzyMatch(oldText);
 	const fuzzyMatches = findAllMatchIndices(fuzzyContent, normalizedOldText);
 	if (fuzzyMatches.length === 0) {
+		// 正常路径都没命中 → 看失败原因：若只是同标记的排印变体，拿文件真字节
+		// 修好锚，再跑一次普通的精确匹配。它不拓宽全局匹配语义，只作用于这一次失败。
+		// replaceAll 不进修复：“每一处”里各处的字节形式可能不同，修成一种会漏掉其余。
+		const repair = replaceAll ? undefined : repairAnchor(content, oldText);
+		const repairedMatches = repair === undefined ? [] : findAllMatchIndices(content, repair.text);
+		if (repair !== undefined && repairedMatches.length === 1) {
+			return [{ matchIndex: repairedMatches[0]!, actualOldText: repair.text, marks: repair.marks }];
+		}
 		throw getNotFoundError(editIndex, content, oldText);
 	}
 	if (!replaceAll && fuzzyMatches.length > 1) {
@@ -277,6 +309,14 @@ function preserveQuoteStyle(oldText: string, actualOldText: string, newText: str
 	return result;
 }
 
+/** 修复路径交回的方言表：把 newText 里的同类标记翻回文件的写法。 */
+function applyRepairedMarks(newText: string, marks: ReadonlyMap<string, string> | undefined): string {
+	if (marks === undefined || marks.size === 0) return newText;
+	let result = "";
+	for (const character of newText) result += marks.get(character) ?? character;
+	return result;
+}
+
 export function applyEditsToNormalizedContent(normalizedContent: string, edits: FileEditOperation[]): AppliedEditsResult {
 	// Validate edit invariants upfront before any allocation.
 	for (let index = 0; index < edits.length; index += 1) {
@@ -326,7 +366,10 @@ export function applyEditsToNormalizedContent(normalizedContent: string, edits: 
 				editIndex: index,
 				matchIndex: resolvedMatch.matchIndex,
 				matchLength: resolvedMatch.actualOldText.length,
-				newText: preserveQuoteStyle(oldText, resolvedMatch.actualOldText, newText),
+				newText: applyRepairedMarks(
+					preserveQuoteStyle(oldText, resolvedMatch.actualOldText, newText),
+					resolvedMatch.marks,
+				),
 			});
 		}
 	}
