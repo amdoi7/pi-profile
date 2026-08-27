@@ -237,7 +237,7 @@ test("not-found diagnostics omit the known path and first replacement index", as
 
 	assert.equal(result.status, "rejected");
 	assert.equal(result.files[0].errorKind, "NOT_FOUND");
-	assert.match(result.files[0].error, /^oldText was not found\.$/);
+	assert.match(result.files[0].error, /^oldText was not found; /);
 	assert.doesNotMatch(result.files[0].error, /story\.txt|edits\[0\]/);
 	assert.equal(await fs.promises.readFile(file, "utf-8"), original);
 });
@@ -255,7 +255,7 @@ test("not-found diagnostics identify a later replacement without repeating the p
 			assert.equal(error.kind, "NOT_FOUND");
 			assert.match(
 				error.message,
-				/^replacement 2: oldText was not found\.$/
+				/^replacement 2: oldText was not found; /
 			);
 			assert.doesNotMatch(error.message, /story\.txt|edits\[/);
 			return true;
@@ -278,7 +278,7 @@ test("one file's edits report every failure in one message", () => {
 			// 批量失败聚合：每个失败都带 next 指令（replacement 编号前缀）。
 			assert.match(
 				error.message,
-				/^edit failed \(2 of 3\):\n  oldText was not found\.\n  replacement 3: oldText was not found\.$/
+				/^edit failed \(2 of 3\):\n  oldText was not found;[^\n]+\n  replacement 3: oldText was not found;[^\n]+$/
 			);
 			return true;
 		},

@@ -2,6 +2,7 @@ import { constants } from "node:fs";
 import { access, readFile, stat, writeFile } from "node:fs/promises";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import type { ChangeStats, DisplayDiff } from "../_shared/final-diff.ts";
+import { nearestText } from "./nearest-text.ts";
 import { diffFromSpans } from "./span-diff.ts";
 
 /** preview 的 context 行数（与共享 diff 引擎默认一致）。 */
@@ -156,8 +157,12 @@ function lineNumbersAt(content: string, indices: number[]): number[] {
 	return [...new Set(indices.map((index) => lineNumberAt(content, index)))];
 }
 
-function getNotFoundError(editIndex: number): EditToolError {
-	return editError(`${replacementPrefix(editIndex)}oldText was not found.`, "NOT_FOUND");
+/** 只在失败路径计算：错误必须带回文件原文，否则模型只能重读或重试。 */
+function getNotFoundError(editIndex: number, content: string, oldText: string): EditToolError {
+	return editError(
+		`${replacementPrefix(editIndex)}oldText was not found; ${nearestText(content, oldText)}`,
+		"NOT_FOUND",
+	);
 }
 
 function getDuplicateError(editIndex: number, occurrences: number, lineNumbers: number[]): EditToolError {
@@ -196,7 +201,7 @@ function resolveEditMatches(
 	const normalizedOldText = normalizeForFuzzyMatch(oldText);
 	const fuzzyMatches = findAllMatchIndices(fuzzyContent, normalizedOldText);
 	if (fuzzyMatches.length === 0) {
-		throw getNotFoundError(editIndex);
+		throw getNotFoundError(editIndex, content, oldText);
 	}
 	if (!replaceAll && fuzzyMatches.length > 1) {
 		throw getDuplicateError(editIndex, fuzzyMatches.length, lineNumbersAt(content, fuzzyMatches));

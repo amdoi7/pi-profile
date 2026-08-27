@@ -257,6 +257,37 @@ test("rejected batch says nothing was written and marks the untouched files", as
 	assert.match(output, /oldText was not found/);
 });
 
+// NOT_FOUND 现在带回文件原文（多行）：TUI 是第二个消费者，续行不能顶格。
+test("the multi-line not-found payload keeps every line under the rail", async () => {
+	initTheme("dark");
+	const tool = await loadRegisteredEditTool();
+	const error = [
+		"oldText was not found; L287 col 56: file \"、\" U+3001 ≠ oldText \",\" U+002C; copy from the file:",
+		"287|gate 出导航卡、hard 出拒绝、",
+		"288|guide 出引导卡、hint 出提醒。",
+	].join("\n");
+	const output = renderText(tool.renderResult(
+		buildAgentResult([{ path: "docs/design.md", status: "failed", error }], { status: "rejected" }),
+		{ expanded: true },
+		createTheme(),
+		createRenderContext(),
+	));
+
+	const lines = output.split("\n");
+	const pathIndex = lines.findIndex((line) => line.includes("docs/design.md"));
+	const indent = (line) => line.length - line.trimStart().length;
+	const headIndex = lines.findIndex((line) => line.includes("oldText was not found; L287 col 56"));
+	const firstRegion = lines.findIndex((line) => line.includes("287|gate 出导航卡"));
+	const secondRegion = lines.findIndex((line) => line.includes("288|guide 出引导卡"));
+
+	assert.equal(headIndex, pathIndex + 1, output);
+	assert.ok(firstRegion > headIndex && secondRegion === firstRegion + 1, output);
+	// 折行与区域行一律在 rail 下：层级契约在每一行上都成立。
+	for (const index of [headIndex + 1, firstRegion, secondRegion]) {
+		assert.equal(indent(lines[index] ?? ""), indent(lines[headIndex] ?? ""), output);
+	}
+});
+
 test("a rolled-back file says it was restored, not merely skipped", async () => {
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();

@@ -85,11 +85,17 @@ test("rejected outcome reports the disk state and every failure to the agent", a
 	);
 
 	assert.equal(outcome.status, "rejected");
-	assert.deepEqual(JSON.parse(buildOutcomeAgentContent(outcome)), {
-		status: "rejected",
-		written: [],
-		failed: [{ path: stale, kind: "NOT_FOUND", message: "oldText was not found." }],
-	});
+	const payload = JSON.parse(buildOutcomeAgentContent(outcome));
+	const [failure] = payload.failed;
+	assert.deepEqual(
+		{ ...payload, failed: payload.failed.length },
+		{ status: "rejected", written: [], failed: 1 },
+	);
+	assert.deepEqual(
+		{ path: failure.path, kind: failure.kind },
+		{ path: stale, kind: "NOT_FOUND" },
+	);
+	assert.match(failure.message, /^oldText was not found; /);
 	assert.equal(await fs.promises.readFile(good, "utf-8"), "const a = 1;\n");
 });
 
