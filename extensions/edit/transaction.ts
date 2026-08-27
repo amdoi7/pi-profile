@@ -57,45 +57,19 @@ function throwIfAborted(signal?: AbortSignal): void {
 	}
 }
 
-export type EditEngineOperations = {
+/** 事务的文件系统端口：测试用内存实现替换它（唯一消费者是 executeBatchEdits）。 */
+export type TransactionOperations = {
 	access: (absolutePath: string) => Promise<void>;
 	readFile: (absolutePath: string) => Promise<string>;
 	writeFile: (absolutePath: string, content: string) => Promise<void>;
 	stat: (absolutePath: string) => Promise<{ size: number }>;
 };
 
-export const defaultEditEngineOperations: EditEngineOperations = {
+export const defaultTransactionOperations: TransactionOperations = {
 	access: (absolutePath) => access(absolutePath, constants.R_OK | constants.W_OK),
 	readFile: (absolutePath) => readFile(absolutePath, "utf-8"),
 	writeFile: (absolutePath, content) => writeFile(absolutePath, content, "utf-8"),
 	stat: (absolutePath) => stat(absolutePath),
-};
-
-export type BatchFileEditRequest = {
-	/** 已 canonicalize 的绝对路径；同一 batch 内必须互不相同（pipeline 去重）。 */
-	absolutePath: string;
-	edits: FileEditOperation[];
-};
-
-export type FileDiffPreview = {
-	previewDisplay: DisplayDiff;
-	previewStartLine?: number;
-	previewTruncated: boolean;
-	changeStats: ChangeStats;
-};
-
-export type BatchFileOutcome =
-	/** 落盘完成（batch status=partial 时表示回滚失败、内容仍留在盘上）。 */
-	| { status: "applied"; preview: FileDiffPreview }
-	| { status: "failed"; error: string; errorKind?: RecoverableEditErrorKind }
-	/** 匹配无误但整批被拒，未落盘；restored=true 表示写过又被回滚。 */
-	| { status: "notWritten"; restored: boolean };
-
-export type BatchEditResult = {
-	/** applied=全部落盘；rejected=一个字节都没落；partial=部分留在盘上且无法回滚。 */
-	status: "applied" | "rejected" | "partial";
-	/** 与输入同序同长。 */
-	files: BatchFileOutcome[];
 };
 
 type PreparedFile = {
@@ -201,7 +175,7 @@ function toFailure(error: unknown): PreparedFileResult {
  */
 async function prepareFileEdit(
 	request: BatchFileEditRequest,
-	operations: EditEngineOperations,
+	operations: TransactionOperations,
 	signal: AbortSignal | undefined,
 ): Promise<PreparedFileResult> {
 	throwIfAborted(signal);
@@ -287,7 +261,7 @@ function computePreview(file: PreparedFile): FileDiffPreview {
 export async function executeBatchEdits(
 	files: readonly BatchFileEditRequest[],
 	signal?: AbortSignal,
-	operations: EditEngineOperations = defaultEditEngineOperations,
+	operations: TransactionOperations = defaultTransactionOperations,
 ): Promise<BatchEditResult> {
 	return withAllFileMutationQueues(files.map((file) => file.absolutePath), async () => {
 		throwIfAborted(signal);

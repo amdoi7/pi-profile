@@ -342,7 +342,7 @@ export function buildCallToolViewModel(args: unknown): CallRenderViewModel {
 }
 
 /**
- * 执行整批：canonical path 去重后交给 engine 的事务。
+ * 执行整批：canonical path 去重后交给 transaction 的事务。
  * 文件级失败进 outcome（软失败）；abort 与别名路径等硬失败上抛。
  */
 export async function executeEditBatch(
