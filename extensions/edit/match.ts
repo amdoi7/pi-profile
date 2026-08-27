@@ -24,7 +24,7 @@ export type AppliedEditsResult = {
 	matchedSpans: MatchedEditSpan[];
 };
 
-export const EDIT_TOOL_ERROR_KINDS = ["NOT_FOUND", "DUPLICATE_MATCH", "NO_CHANGE"] as const;
+export const EDIT_TOOL_ERROR_KINDS = ["NOT_FOUND", "DUPLICATE_MATCH", "NO_CHANGE", "INVALID_ANCHOR", "OVERLAP"] as const;
 export type RecoverableEditErrorKind = (typeof EDIT_TOOL_ERROR_KINDS)[number];
 
 export interface EditToolError extends Error {
@@ -293,7 +293,7 @@ export function applyEditsToNormalizedContent(normalizedContent: string, edits: 
 		const newText = normalizeToLF(edit.newText);
 		// empty anchor 与其他失败同一通道收集：一次性报全，不让模型逐个失败逐个重试。
 		if (oldText.length === 0) {
-			failures.push(editError(`${replacementPrefix(index)}oldText must not be empty.`, "NO_CHANGE"));
+			failures.push(editError(`${replacementPrefix(index)}oldText must not be empty.`, "INVALID_ANCHOR"));
 			continue;
 		}
 		let resolvedMatches: ResolvedMatch[];
@@ -341,7 +341,7 @@ export function applyEditsToNormalizedContent(normalizedContent: string, edits: 
 			failures.push(editError(
 				`replacement ${current.editIndex + 1} (${span(current)}) overlaps`
 				+ ` replacement ${previous.editIndex + 1} (${span(previous)}); merge them into one edit`,
-				"NO_CHANGE",
+				"OVERLAP",
 			));
 			break;
 		}
