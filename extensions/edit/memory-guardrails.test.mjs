@@ -6,7 +6,6 @@ import path from "node:path";
 
 import { MAX_EDIT_FILE_SIZE_BYTES, executeBatchEdits } from "./transaction.ts";
 import { buildOutcomeAgentContent, executeEditBatch } from "./pipeline.ts";
-import { generateFinalDiff, serializeDisplayDiff } from "../_shared/final-diff.ts";
 
 async function writeTempFile(prefix, name, content) {
 	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), prefix));
@@ -170,40 +169,4 @@ test("a cross-file anchor that only exists in another file's new content rejects
 		await fs.promises.readFile(path.join(dir, "provider.ts"), "utf-8"),
 		"const old = 1;\n",
 	);
-});
-
-test("shared final diff produces only the changed window, not the whole file", () => {
-	const lines = Array.from({ length: 100 }, (_, i) => `line${i + 1}`);
-	const oldContent = lines.join("\n") + "\n";
-	const newLines = [...lines];
-	newLines[49] = "CHANGED";
-	const newContent = newLines.join("\n") + "\n";
-
-	const result = generateFinalDiff(oldContent, newContent, 4);
-	const rendered = serializeDisplayDiff(result.display);
-
-	assert.match(rendered, /CHANGED/);
-	assert.doesNotMatch(rendered, /\bline1\b/);
-	assert.doesNotMatch(rendered, /\bline100\b/);
-	const previewLineCount = result.display.rows.length;
-	assert.ok(previewLineCount < 20, `expected small preview, got ${previewLineCount} lines`);
-});
-
-test("shared final diff produces separate windows for edits far apart in the file", () => {
-	const lines = Array.from({ length: 200 }, (_, i) => `line${i + 1}`);
-	const oldContent = lines.join("\n") + "\n";
-	const newLines = [...lines];
-	newLines[9] = "EDIT_TOP";
-	newLines[189] = "EDIT_BOTTOM";
-	const newContent = newLines.join("\n") + "\n";
-
-	const result = generateFinalDiff(oldContent, newContent, 4);
-	const rendered = serializeDisplayDiff(result.display);
-
-	assert.match(rendered, /EDIT_TOP/);
-	assert.match(rendered, /EDIT_BOTTOM/);
-	assert.match(rendered, /\.\.\./);
-	const previewLineCount = result.display.rows.length;
-	assert.ok(previewLineCount < 30, `expected two small windows, got ${previewLineCount} lines`);
-	assert.doesNotMatch(rendered, /\bline100\b/);
 });

@@ -72,21 +72,6 @@ export const defaultTransactionOperations: TransactionOperations = {
 	stat: (absolutePath) => stat(absolutePath),
 };
 
-type PreparedFile = {
-	absolutePath: string;
-	/** 原始字节（含 BOM / 原行尾）——回滚按 verbatim 还原，不经归一化往返。 */
-	rawContent: string;
-	bom: string;
-	lineEnding: "\r\n" | "\n";
-	normalizedContent: string;
-	newContent: string;
-	matchedSpans: MatchedEditSpan[];
-};
-
-type PreparedFileResult =
-	| { kind: "prepared"; prepared: PreparedFile }
-	| { kind: "failed"; error: string; errorKind?: RecoverableEditErrorKind };
-
 function formatAccessError(error: unknown): Error {
 	if (error instanceof Error) {
 		const errorWithCode = error as Error & { code?: string };

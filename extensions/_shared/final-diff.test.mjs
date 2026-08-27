@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
 
-import { degradeToUnlocated, displayDiffFromLines, generateFinalDiff, isChangeStats, isDisplayDiff } from "./final-diff.ts";
+import { degradeToUnlocated, displayDiffFromLines, generateFinalDiff, isChangeStats, isDisplayDiff, serializeDisplayDiff } from "./final-diff.ts";
 
 test("change stats validator enforces the generated stats invariant", () => {
 	assert.equal(isChangeStats({ additions: 2, deletions: 1, changedLines: 3 }), true);
@@ -339,4 +339,40 @@ test("word refinement still runs on normal-length low-whitespace lines", () => {
 	assert.ok(removeRow.highlights.length >= 1, "refinement produced word-level highlights");
 	const spanned = removeRow.highlights.reduce((sum, range) => sum + range.end - range.start, 0);
 	assert.ok(spanned < removeRow.content.length, "highlights are narrower than the whole row");
+});
+
+test("final diff produces only the changed window, not the whole file", () => {
+	const lines = Array.from({ length: 100 }, (_, i) => `line${i + 1}`);
+	const oldContent = lines.join("\n") + "\n";
+	const newLines = [...lines];
+	newLines[49] = "CHANGED";
+	const newContent = newLines.join("\n") + "\n";
+
+	const result = generateFinalDiff(oldContent, newContent, 4);
+	const rendered = serializeDisplayDiff(result.display);
+
+	assert.match(rendered, /CHANGED/);
+	assert.doesNotMatch(rendered, /\bline1\b/);
+	assert.doesNotMatch(rendered, /\bline100\b/);
+	const previewLineCount = result.display.rows.length;
+	assert.ok(previewLineCount < 20, `expected small preview, got ${previewLineCount} lines`);
+});
+
+test("final diff produces separate windows for edits far apart in the file", () => {
+	const lines = Array.from({ length: 200 }, (_, i) => `line${i + 1}`);
+	const oldContent = lines.join("\n") + "\n";
+	const newLines = [...lines];
+	newLines[9] = "EDIT_TOP";
+	newLines[189] = "EDIT_BOTTOM";
+	const newContent = newLines.join("\n") + "\n";
+
+	const result = generateFinalDiff(oldContent, newContent, 4);
+	const rendered = serializeDisplayDiff(result.display);
+
+	assert.match(rendered, /EDIT_TOP/);
+	assert.match(rendered, /EDIT_BOTTOM/);
+	assert.match(rendered, /\.\.\./);
+	const previewLineCount = result.display.rows.length;
+	assert.ok(previewLineCount < 30, `expected two small windows, got ${previewLineCount} lines`);
+	assert.doesNotMatch(rendered, /\bline100\b/);
 });
