@@ -126,13 +126,13 @@ describe("pi_peer 工具", () => {
 			{ identity: identity({ sessionId: "target-e2e", name: "audit" }), deliver: async (m) => void got.push(m) },
 		]);
 		const res = await exec({ action: "send", to: "audit", text: "schema 迁移完成,tenant_id 已落" });
-		assert.ok(res.content[0].text.includes("accepted by audit"), res.content[0].text);
-		assert.ok(res.content[0].text.includes("injection is asynchronous"), "两阶段投递语义进文案");
+		// 结果只说新事实（谁接收了）；异步语义在工具描述里，不在每次成功里重复。
+		assert.equal(res.content[0].text, "accepted by audit");
 		assert.equal(got[0].text, "schema 迁移完成,tenant_id 已落");
 		assert.equal(got[0].from.name, "main");
 		assert.equal(got[0].mode, "followUp", "缺省 followUp");
-		const steer = await exec({ action: "send", to: "audit", text: "先停一下,看这个", mode: "steer" });
-		assert.ok(steer.content[0].text.includes("injected into current turn"), "文案区分");
+		await exec({ action: "send", to: "audit", text: "先停一下,看这个", mode: "steer" });
+		// mode 是模型自己传的，回读给它没价值；该测的是线协议真的带了 mode。
 		assert.equal(got[1].mode, "steer", "mode=steer 线协议直传");
 		close();
 	});

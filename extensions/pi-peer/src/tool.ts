@@ -124,11 +124,13 @@ export function registerPeerTool(pi: ExtensionAPI, getRt: () => PeerRuntime | un
 				// 送达成功才记账:失败尝试不烧配额、不刷新同文基线,重试可放行
 				rt.quota.commit(`${rt.self.sessionId}→${target.peer.sessionId}`, msg.text, now);
 			}
+			// 结果只说新事实：谁接收了。模式是模型自己传的，异步投递与回执语义已写在
+			// 工具描述里（每请求一份）——在每次成功里再背一遍是重复付费。
 			return {
 				content: [
 					{
 						type: "text",
-						text: `accepted by ${target.peer.name ?? target.peer.sessionId.slice(0, 8)} (${p.mode === "quiet" ? "silent, no wake" : p.mode === "steer" ? "injected into current turn, no queue" : "peer woken"}); injection is asynchronous — a delivery failure returns as a peer-message receipt; reply (if any) returns as a peer message.`,
+						text: `accepted by ${target.peer.name ?? target.peer.sessionId.slice(0, 8)}`,
 					},
 				],
 				details: { to: target.peer.sessionId, mode: p.mode ?? "followUp" },
