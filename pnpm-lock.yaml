@@ -106,12 +106,6 @@ importers:
         specifier: ^3.2.7
         version: 3.2.7(@types/node@26.2.0)(jiti@2.7.0)(yaml@2.9.0)
 
-  extensions/runtime-hints:
-    devDependencies:
-      vitest:
-        specifier: ^3.2.4
-        version: 3.2.7(@types/node@26.2.0)(jiti@2.7.0)(yaml@2.9.0)
-
   extensions/uv:
     devDependencies:
       vitest:
