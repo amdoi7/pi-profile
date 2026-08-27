@@ -22,7 +22,11 @@ import { normalizeEditInput } from "./input-normalize.ts";
 
 const editOperationSchema = Type.Object(
 	{
-		oldText: Type.String({ description: "Exact text currently in the file to replace." }),
+		// 语料 2026-08-27：475 个可复核的失败锚里 89% 是重构而非复制（部分行对 58%
+		// + 整段不在 31%）——锚的来源比锚的长短重要得多（1 行 2.8% vs 13+ 行 5.9%）。
+		oldText: Type.String({
+			description: "Exact text currently in the file to replace. Copy it from tool output, not from memory.",
+		}),
 		newText: Type.String({ description: "Replacement text. Use an empty string to delete oldText." }),
 		replaceAll: Type.Optional(Type.Boolean({
 			description: "Replace every occurrence of oldText instead of requiring a unique match.",
