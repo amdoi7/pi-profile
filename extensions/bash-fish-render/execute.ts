@@ -121,6 +121,13 @@ type ExecuteShared = {
  * apply_patch 命令的守卫执行主体。返回与内置 execute 同形（content/details）；
  * 错误分支抛与内置同文案的 Error。
  */
+/**
+ * 守卫只为一个目的:把补丁落盘前后的快照变成可看的真 diff。
+ *
+ * 文件改写的 owner 是 edit（一个意图一个事务），路由面已不再指向这条路;它留着只服务
+ * 人直接调用遗留 CLI 时的渲染。因此它不约束也不改写模型行为，不进机制账;
+ * 当遗留 CLI 不再被人使用时，整条守卫路径随它一起退役。
+ */
 export async function executeApplyPatchGuarded(
 	command: string,
 	cwd: string,
