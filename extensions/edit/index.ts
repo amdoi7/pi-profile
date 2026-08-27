@@ -17,7 +17,6 @@ import {
 	executeEditBatch,
 	parseEditRequest,
 } from "./pipeline.ts";
-import { forgetSessionEdits } from "./session-edits.ts";
 import {
 	isBatchUiDetails,
 	renderCallViewModel,
@@ -26,10 +25,6 @@ import {
 } from "./ui.ts";
 
 export default function (pi: ExtensionAPI) {
-	pi.on("session_start", () => {
-		forgetSessionEdits();
-	});
-
 	pi.registerTool({
 		name: "edit",
 		label: "edit",

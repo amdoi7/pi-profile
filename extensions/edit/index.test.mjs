@@ -64,63 +64,6 @@ test("a rejected batch flips the tool result envelope to isError", async () => {
 	);
 });
 
-// 语料 2026-08-27：913 次 NOT_FOUND 里 638 次(69%)发生在本 session 自己已经改过的
-// 文件上——锚是改之前抄的。这个因不需要指纹也不需要 mtime，引擎知道自己写过什么。
-test("a failure on a file this session already edited names that cause", async () => {
-	const { tool, handlers } = captureExtension();
-	handlers.get("session_start")?.();
-	const file = await writeTempFile("target.ts", "const x = 1;\n");
-
-	const applied = await run(tool, {
-		intent: "renumber the constant",
-		files: [{ path: file, edits: [{ oldText: "const x = 1;", newText: "const x = 2;" }] }],
-	});
-	assert.equal(JSON.parse(applied.content[0].text).status, "applied");
-
-	const stale = await run(tool, {
-		intent: "edit again from the pre-edit text",
-		files: [{ path: file, edits: [{ oldText: "const x = 1;", newText: "const x = 3;" }] }],
-	});
-	const payload = JSON.parse(stale.content[0].text);
-
-	assert.equal(payload.status, "rejected");
-	assert.equal(payload.failed[0].editedEarlierThisSession, true);
-});
-
-test("a failure on an untouched file makes no such claim", async () => {
-	const { tool, handlers } = captureExtension();
-	handlers.get("session_start")?.();
-	const file = await writeTempFile("target.ts", "const x = 1;\n");
-
-	const result = await run(tool, {
-		intent: "anchor that never existed",
-		files: [{ path: file, edits: [{ oldText: "const y = 9;", newText: "const y = 8;" }] }],
-	});
-	const payload = JSON.parse(result.content[0].text);
-
-	assert.equal(payload.failed[0].editedEarlierThisSession, undefined);
-});
-
-test("session_start forgets what an earlier session edited", async () => {
-	const { tool, handlers } = captureExtension();
-	handlers.get("session_start")?.();
-	const file = await writeTempFile("target.ts", "const x = 1;\n");
-
-	await run(tool, {
-		intent: "renumber the constant",
-		files: [{ path: file, edits: [{ oldText: "const x = 1;", newText: "const x = 2;" }] }],
-	});
-	handlers.get("session_start")?.();
-
-	const stale = await run(tool, {
-		intent: "edit again from the pre-edit text",
-		files: [{ path: file, edits: [{ oldText: "const x = 1;", newText: "const x = 3;" }] }],
-	});
-	const payload = JSON.parse(stale.content[0].text);
-
-	assert.equal(payload.failed[0].editedEarlierThisSession, undefined);
-});
-
 test("an applied batch and other tools leave the envelope untouched", async () => {
 	const { tool, handlers } = captureExtension();
 	const onToolResult = handlers.get("tool_result");
