@@ -14,7 +14,6 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import type { ChangeStats, DisplayDiff } from "../_shared/final-diff.ts";
 import {
-	type BatchFileEditRequest,
 	executeBatchEdits,
 	type FileEditOperation,
 	type RecoverableEditErrorKind,
