@@ -38,7 +38,10 @@
 - 未设置 `replaceAll` 时，`oldText` 必须只匹配一个位置
 - `replaceAll: true` 时，替换该文件内的全部匹配
 - 每个 `edits[].oldText` 都针对该文件的原始内容匹配，不按前一个 replacement 增量匹配
-- 同一物理文件只能出现一次（同名或 canonical 相同都拒绝）：第二份 edits 会针对已改内容匹配，语义不成立
+- 同一 `path` 字面重复出现 → 合并进首次出现的条目（包装错误，每个条目自己的
+  `edits[]` 都被完整保留，合并保留首个 path/hint 写法）——不必打回重发
+- 不同 entry 别名到同一物理文件（`./` 前缀、symlink、canonical 相同）→ 拒绝：
+  合并会隐式选定一个 path 写法并丢弃另一个的意图，语义不成立
 
 ### 输入容错
 
@@ -96,6 +99,8 @@ diff」完全相同。
 - `NO_CHANGE`：`newText` 归一化后等于 `oldText`（替换不产生任何变化）
 - 重叠：`replacement N overlaps replacement M`
 - 参数校验失败：带字段路径（`files[1].edits[0].oldText must be a string`）
+- 别名路径：`files[1].path is an alias of files[0].path (<canonical>); merge
+  their edits into one entry`
 - 参数残缺：报残缺本身，不报成形状错误——`edits` 缺失说「这一项只写了
   path，重发」；`edits` 到达时是不合法 JSON 文本则带上 parser 原因并说「很可能在
   传输中被截断，原样重发」。依据：实测语料里这两种形状几乎全是参数截断，

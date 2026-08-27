@@ -150,14 +150,16 @@ test("parseEditRequest keeps a lifted single file ahead of explicitly listed fil
 	assert.deepEqual(request.files.map((file) => file.path), ["a.ts", "b.ts"]);
 });
 
-test("parseEditRequest rejects the same path listed twice", () => {
-	assert.throws(
-		() => parseEditRequest(batch([
-			{ path: "a.ts", edits: [makeEdit("foo", "alpha")] },
-			{ path: "a.ts", edits: [makeEdit("bar", "beta")] },
-		])),
-		/files\[1\]\.path repeats a\.ts; merge its edits into one entry/,
-	);
+test("parseEditRequest merges a repeated path into one entry", () => {
+	const request = parseEditRequest(batch([
+		{ path: "a.ts", hint: "left side", edits: [makeEdit("foo", "alpha")] },
+		{ path: "a.ts", edits: [makeEdit("bar", "beta")] },
+	]));
+
+	assert.equal(request.files.length, 1);
+	assert.equal(request.files[0].path, "a.ts");
+	assert.equal(request.files[0].hint, "left side");
+	assert.deepEqual(request.files[0].edits, [makeEdit("foo", "alpha"), makeEdit("bar", "beta")]);
 });
 
 test("parseEditRequest rejects unknown edit properties with the field path", () => {

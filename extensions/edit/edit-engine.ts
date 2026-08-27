@@ -18,7 +18,6 @@ export type AppliedEditsResult = {
 	newContent: string;
 	matchedSpans: MatchedEditSpan[];
 };
-
 export type MatchedEditSpan = {
 	matchIndex: number;
 	matchLength: number;
@@ -415,10 +414,7 @@ export function applyEditsToNormalizedContent(normalizedContent: string, edits: 
 	segments.push(normalizedContent.substring(cursor));
 	const newContent = segments.join("");
 	if (newContent === normalizedContent) {
-		throw editError(
-			"No change: newText normalizes to oldText",
-			"NO_CHANGE",
-		);
+		throw editError("No change: newText normalizes to oldText", "NO_CHANGE");
 	}
 	// matchedEdits already has matchIndex/matchLength/newText — reuse as MatchedEditSpan[].
 	return { newContent, matchedSpans: matchedEdits };
@@ -623,6 +619,7 @@ export async function executeBatchEdits(
 			if (resolution.kind !== "prepared") throw new Error("unreachable: unresolved batch entry");
 			return resolution.prepared;
 		});
+
 		// 提交点：此后不再检查 abort，事务走完，避免半写状态。
 		throwIfAborted(signal);
 

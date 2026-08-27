@@ -126,7 +126,7 @@ test("applied agent payload lists one entry per file with stats and location", a
 	});
 });
 
-test("the same physical file twice in one batch is rejected before any write", async () => {
+test("the same physical file twice under different path spellings is rejected before any write", async () => {
 	const file = await writeTempFile("pi-contract-dup-", "target.ts", "const x = 1;\n");
 
 	await assert.rejects(
@@ -140,9 +140,39 @@ test("the same physical file twice in one batch is rejected before any write", a
 			},
 			process.cwd(),
 		),
-		/same file; merge their edits/,
+		/is an alias of files\[0\]\.path.*merge their edits into one entry/s,
 	);
 	assert.equal(await fs.promises.readFile(file, "utf-8"), "const x = 1;\n");
+});
+
+// 跨文件锚悬空在解析面就是 files[1] 的 NOT_FOUND（软失败）：整批 rejected、
+// 零写入，错误带逐字指认——不需要单独的跨文件检查。
+test("a cross-file anchor that only exists in another file's new content rejects the batch with NOT_FOUND", async () => {
+	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-contract-cross-"));
+	await fs.promises.writeFile(path.join(dir, "provider.ts"), "const old = 1;\n", "utf-8");
+	await fs.promises.writeFile(path.join(dir, "consumer.ts"), "import { x } from './y';\n", "utf-8");
+
+	const outcome = await executeEditBatch(
+		{
+			intent: "rename in provider, then reference the new name",
+			files: [
+				{ path: "provider.ts", edits: [{ oldText: "const old = 1;", newText: "const brandNewName = 1;" }] },
+				{ path: "consumer.ts", edits: [{ oldText: "brandNewName", newText: "renamed" }] },
+			],
+		},
+		dir,
+	);
+
+	assert.equal(outcome.status, "rejected");
+	assert.deepEqual(
+		outcome.files.map((file) => file.status),
+		["notWritten", "failed"],
+	);
+	assert.match(outcome.files[1].status === "failed" ? outcome.files[1].error : "", /NOT_FOUND|not found/);
+	assert.equal(
+		await fs.promises.readFile(path.join(dir, "provider.ts"), "utf-8"),
+		"const old = 1;\n",
+	);
 });
 
 test("shared final diff produces only the changed window, not the whole file", () => {

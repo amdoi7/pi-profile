@@ -14,6 +14,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import type { ChangeStats, DisplayDiff } from "../_shared/final-diff.ts";
 import {
+	type BatchFileEditRequest,
 	executeBatchEdits,
 	type FileEditOperation,
 	type RecoverableEditErrorKind,
@@ -46,7 +47,9 @@ const fileEditsSchema = Type.Object(
 		})),
 		edits: Type.Array(editOperationSchema, {
 			minItems: 1,
-			description: "Targeted replacements for this file, each matched against the file's original content.",
+			description: "Targeted replacements for this file, each matched against the file's original content.\n"
+				+ "This is the only entry allowed for this path: a later entry with the same path is merged into this one,\n"
+				+ "keeping the first path/hint spelling.",
 		}),
 	},
 	{ additionalProperties: false },
@@ -61,7 +64,9 @@ const editRequestSchema = Type.Object(
 		}),
 		files: Type.Array(fileEditsSchema, {
 			minItems: 1,
-			description: "Every file this intent touches; the whole batch applies atomically or not at all.",
+			description: "Every file this intent touches; the whole batch applies atomically or not at all.\n"
+				+ "One entry per file: a repeated path is merged into the first entry — different files must not alias to"
+				+ " the same physical file (symlink/./ prefix), that is rejected.",
 		}),
 	},
 	{ additionalProperties: false },
@@ -121,6 +126,32 @@ function invalidEditRequest(message: string): never {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * 同一 path 的字面重复是模型的包装错误：合并进首次出现的条目，而不是打回
+ * 重发——每个条目自己的 edits[] 都被完整保留，合并语义无歧义。合并保留首个
+ * path/hint 写法；别名（./a.ts vs a.ts、symlink）不在字符串层判定，由
+ * executeEditBatch 在 canonicalize 之后响亮拒绝（合并会隐式选定一个写法
+ * 并丢弃另一个的意图，模型知道 path 才能修对）。
+ */
+function mergeDuplicatePathEntries(
+	files: Array<{ path: string; hint?: string; edits: FileEditOperation[] }>,
+): Array<{ path: string; hint?: string; edits: FileEditOperation[] }> {
+	const merged: Array<{ path: string; hint?: string; edits: FileEditOperation[] }> = [];
+	const firstIndexByPath = new Map<string, number>();
+	for (const file of files) {
+		const firstIndex = firstIndexByPath.get(file.path);
+		if (firstIndex === undefined) {
+			firstIndexByPath.set(file.path, merged.length);
+			merged.push(file);
+			continue;
+		}
+		const first = merged[firstIndex]!;
+		first.edits = [...first.edits, ...file.edits];
+		if (first.hint === undefined && file.hint !== undefined) first.hint = file.hint;
+	}
+	return merged;
 }
 
 /** 报错要带当前值：“must be a string” 不告诉模型它实际发了什么。 */
@@ -195,7 +226,6 @@ export function parseEditRequest(input: unknown): EditRequest {
 	if (!Array.isArray(normalized.files)) invalidEditRequest("files must be an array");
 	if (normalized.files.length === 0) invalidEditRequest("files must not be empty");
 
-	const seenPaths = new Set<string>();
 	const files = normalized.files.map((entry, index) => {
 		if (!isRecord(entry)) invalidEditRequest(`files[${index}] must be an object`);
 		for (const key of Object.keys(entry)) {
@@ -209,18 +239,15 @@ export function parseEditRequest(input: unknown): EditRequest {
 		if (entry.hint !== undefined && typeof entry.hint !== "string") {
 			invalidEditRequest(`files[${index}].hint must be a string`);
 		}
-		if (seenPaths.has(entry.path)) {
-			invalidEditRequest(`files[${index}].path repeats ${entry.path}; merge its edits into one entry`);
-		}
-		seenPaths.add(entry.path);
 		return {
 			path: entry.path,
 			...(entry.hint !== undefined ? { hint: entry.hint } : {}),
 			edits: parseEditOperations(entry.edits, `files[${index}]`),
 		};
 	});
+	const mergedFiles = mergeDuplicatePathEntries(files);
 
-	return { intent, files };
+	return { intent, files: mergedFiles };
 }
 
 export function buildCallToolViewModel(args: unknown): CallRenderViewModel {
@@ -244,20 +271,25 @@ export function buildCallToolViewModel(args: unknown): CallRenderViewModel {
  * 执行整批：canonical path 去重后交给 engine 的事务。
  * 文件级失败进 outcome（软失败）；abort 与重复路径等硬失败上抛。
  */
+/**
+ * 执行整批：canonical path 去重后交给 engine 的事务。
+ * 文件级失败进 outcome（软失败）；abort 与别名路径等硬失败上抛。
+ */
 export async function executeEditBatch(
 	request: EditRequest,
 	cwd: string,
 	signal?: AbortSignal,
 ): Promise<BatchOutcome> {
 	const canonicalPaths = request.files.map((file) => canonicalizePath(file.path, cwd));
-	// 同一物理文件出现两次 → 事务会自锁，且第二份 edits 会针对已改内容匹配：
-	// 结构上不可执行，响亮拒绝而不是猜测合并顺序。
+	// 字面重复已在 parseEditRequest 合并；这里挡住 canonical 别名（./a.ts、
+	// symlink、大小写不敏感盘上的变体），带两个下标响亮拒绝。在读盘前拒绝：
+	// 此时合并会隐式选定一个 path/hint 写法并丢弃另一个的意图，语义不无歧义。
 	const firstIndexByPath = new Map<string, number>();
 	canonicalPaths.forEach((canonicalPath, index) => {
 		const first = firstIndexByPath.get(canonicalPath);
 		if (first !== undefined) {
 			invalidEditRequest(
-				`files[${index}].path and files[${first}].path are the same file; merge their edits into one entry`,
+				`files[${index}].path is an alias of files[${first}].path (${canonicalPath}); merge their edits into one entry`,
 			);
 		}
 		firstIndexByPath.set(canonicalPath, index);
