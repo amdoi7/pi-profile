@@ -121,6 +121,19 @@ test("a widely drifted block still comes back verbatim — that is what the mode
 	assert.match(error.message, /3\|step three: project the surfaces/);
 });
 
+// 语料 2026-08-27：edit 的参数/契约类错误 169 次，最大一类就是 overlaps(66)。
+// 旧文案只说哪两处重叠，不说重叠在哪、也不说该怎么办——而引擎手里两个 span 都有。
+test("an overlap names both spans by line and the way out", () => {
+	const content = ["alpha one", "beta two", "gamma three", ""].join("\n");
+	const error = failureOf(content, [
+		{ oldText: "alpha one\nbeta two", newText: "x" },
+		{ oldText: "beta two\ngamma three", newText: "y" },
+	]);
+
+	assert.match(error.message, /replacement 2 \(L2-L3\) overlaps replacement 1 \(L1-L2\)/);
+	assert.match(error.message, /merge them into one edit/);
+});
+
 test("the replacement prefix and path silence of the diagnostic are unchanged", () => {
 	const error = failureOf(
 		"first\n",

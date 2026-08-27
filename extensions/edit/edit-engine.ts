@@ -348,7 +348,14 @@ export function applyEditsToNormalizedContent(normalizedContent: string, edits: 
 		const previous = matchedEdits[index - 1]!;
 		const current = matchedEdits[index]!;
 		if (previous.matchIndex + previous.matchLength > current.matchIndex) {
-			throw new Error(`replacement ${current.editIndex + 1} overlaps replacement ${previous.editIndex + 1}`);
+			// 两个 span 的位置引擎手里就有，不报等于让模型再去找一遍。
+			const span = (edit: MatchedEdit): string =>
+				`L${lineNumberAt(normalizedContent, edit.matchIndex)}`
+				+ `-L${lineNumberAt(normalizedContent, edit.matchIndex + edit.matchLength - 1)}`;
+			throw new Error(
+				`replacement ${current.editIndex + 1} (${span(current)}) overlaps`
+				+ ` replacement ${previous.editIndex + 1} (${span(previous)}); merge them into one edit`,
+			);
 		}
 	}
 

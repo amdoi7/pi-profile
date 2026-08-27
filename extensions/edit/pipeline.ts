@@ -130,6 +130,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/** 报错要带当前值：“must be a string” 不告诉模型它实际发了什么。 */
+function describeType(value: unknown): string {
+	if (value === null) return "null";
+	if (Array.isArray(value)) return "array";
+	return typeof value;
+}
+
 /**
  * edits 以文本到达 = normalize 已经试过 JSON.parse 并失败（或解出非数组）。
  * 重新 parse 一次取回那个被丢弃的原因：实测语料里这里几乎都是传输截断，
@@ -161,8 +168,12 @@ function parseEditOperations(rawEdits: unknown, filePath: string): FileEditOpera
 				invalidEditRequest(`${filePath}.edits[${index}].${key} must be removed`);
 			}
 		}
-		if (typeof entry.oldText !== "string") invalidEditRequest(`${filePath}.edits[${index}].oldText must be a string`);
-		if (typeof entry.newText !== "string") invalidEditRequest(`${filePath}.edits[${index}].newText must be a string`);
+		if (typeof entry.oldText !== "string") {
+			invalidEditRequest(`${filePath}.edits[${index}].oldText must be a string, got ${describeType(entry.oldText)}`);
+		}
+		if (typeof entry.newText !== "string") {
+			invalidEditRequest(`${filePath}.edits[${index}].newText must be a string, got ${describeType(entry.newText)}`);
+		}
 		if (entry.replaceAll !== undefined && typeof entry.replaceAll !== "boolean") {
 			invalidEditRequest(`${filePath}.edits[${index}].replaceAll must be boolean`);
 		}
@@ -199,7 +210,9 @@ export function parseEditRequest(input: unknown): EditRequest {
 				invalidEditRequest(`files[${index}].${key} must be removed`);
 			}
 		}
-		if (typeof entry.path !== "string") invalidEditRequest(`files[${index}].path must be a string`);
+		if (typeof entry.path !== "string") {
+			invalidEditRequest(`files[${index}].path must be a string, got ${describeType(entry.path)}`);
+		}
 		if (entry.hint !== undefined && typeof entry.hint !== "string") {
 			invalidEditRequest(`files[${index}].hint must be a string`);
 		}

@@ -187,7 +187,19 @@ test("buildCallToolViewModel reports a missing oldText", () => {
 	const viewModel = buildCallToolViewModel(batch([{ path: "a.ts", edits: [{ newText: "foo" }] }]));
 
 	assert.equal(viewModel.kind, "invalid");
-	assert.match(viewModel.message, /files\[0\]\.edits\[0\]\.oldText must be a string/);
+	assert.match(viewModel.message, /files\[0\]\.edits\[0\]\.oldText must be a string, got undefined/);
+});
+
+// 报的是实际到达的类型，不是某个 fixture 的特例。
+test("a wrong-typed oldText names the type that arrived", () => {
+	const number = buildCallToolViewModel(batch([{ path: "a.ts", edits: [{ oldText: 7, newText: "foo" }] }]));
+	assert.match(number.message, /oldText must be a string, got number/);
+
+	const list = buildCallToolViewModel(batch([{ path: "a.ts", edits: [{ oldText: ["a"], newText: "foo" }] }]));
+	assert.match(list.message, /oldText must be a string, got array/);
+
+	const missing = buildCallToolViewModel(batch([{ path: 3, edits: [makeEdit("foo", "bar")] }]));
+	assert.match(missing.message, /files\[0\]\.path must be a string, got number/);
 });
 
 test("buildCallToolViewModel rejects a missing path", () => {
