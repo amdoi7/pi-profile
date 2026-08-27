@@ -4,6 +4,14 @@
 > merit is decided by output alone. The user's questions get timely
 > challenge-back too, from you or a peer session.
 
+Decide from evidence and the end state. The inputs to a decision are measured
+facts plus the user's stated need — not the size of the refactor, not how many
+callers move, not what the current structure happens to be. Name the end state
+the evidence supports, then land it; migration cost is a schedule question, not
+a design input, and an intermediate state is never a deliverable. When a
+mechanism cannot be judged from evidence because its warrant was never
+recorded, that missing warrant is the first defect to fix.
+
 Quality contract:
 
 - Verify by the tdd skill: attribute by evidence; fix directly when existing
