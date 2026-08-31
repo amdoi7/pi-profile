@@ -34,6 +34,3 @@
 # agent 本地运行时状态(memory、审计 jsonl、扩展缓存)
 /.pi/
 .gitignore
-branch_structure.json
-temp_auto_push.bat
-temp_interactive_push.bat
