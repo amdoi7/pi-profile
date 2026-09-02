@@ -534,13 +534,18 @@ export default function (pi: ExtensionAPI) {
   let discovery: Promise<ProxyTarget | null> | null = null;
 
   // 反代发现互斥：并发首请求共享同一 discovery（不用 boolean 防抖，避免并发拿 null）。
-  // 失败不缓存：下次请求重试。
+  // 发现成功后写回 proxyTarget 缓存，供 makeProxyFetch 的同步闭包读取。
   async function getTarget(): Promise<ProxyTarget | null> {
     if (proxyTarget) return proxyTarget;
     if (!discovery) {
-      discovery = discoverProxy().finally(() => {
-        discovery = null;
-      });
+      discovery = discoverProxy()
+        .then((target) => {
+          proxyTarget = target; // 写回缓存，relayFetch 才能读到
+          return target;
+        })
+        .finally(() => {
+          discovery = null;
+        });
     }
     return discovery;
   }
