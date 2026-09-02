@@ -8,7 +8,7 @@
 
 ### Runtime
 
-- `mirasim.ts` — Mirasim 本地反代 provider：模型白名单本地构造，每次请求动态发现反代会话（ps/lsof 探测 + 路径/token 校验），注入 claude CLI 特征后直连；不保存凭据，会话失效自动重发现。
+- `mirasim.ts` — Mirasim 本地反代 provider：模型白名单本地构造，每请求动态发现反代会话（ps/lsof 探测 + 路径/token 校验）并注入 claude CLI 特征直连；无反代时回退自动刷新的 access token（Keychain 解密 setting.json，过期自动 refresh 并写回 auth.json/setting.json），provider 始终已配置。
 - `context-ui/` — `/context` 统计与 HUD：上下文用量分析、overlay 渲染（自 memory 剥离，独立演进）。
 - `_shared/` — sibling extensions 共用 helper；非 extension 入口；结构化 diff 为纯 TS 引擎：公共前后缀剥离 + 无共享行 fast path（整体/核心段，O(N)）+ `jsdiff` Myers（250ms tripwire）分流出 located hunk；展示保持 unified 块形态（不重排），配对仅在预算内（65536 对 / 2M cells）计算词级高亮，未配对整行高亮；可证明 whole rewrite 走 O(N) rewrite path；计算在每进程一个长期 worker 中串行执行（batch 提交、5s 超时 watchdog、崩溃/超时自动重建），主线程零阻塞。
 
