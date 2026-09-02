@@ -8,13 +8,15 @@
 
 ### Runtime
 
+- `mirasim.ts` — Mirasim 本地反代 provider：模型白名单本地构造，每次请求动态发现反代会话（ps/lsof 探测 + 路径/token 校验），注入 claude CLI 特征后直连；不保存凭据，会话失效自动重发现。
 - `context-ui/` — `/context` 统计与 HUD：上下文用量分析、overlay 渲染（自 memory 剥离，独立演进）。
 - `_shared/` — sibling extensions 共用 helper；非 extension 入口；结构化 diff 为纯 TS 引擎：公共前后缀剥离 + 无共享行 fast path（整体/核心段，O(N)）+ `jsdiff` Myers（250ms tripwire）分流出 located hunk；展示保持 unified 块形态（不重排），配对仅在预算内（65536 对 / 2M cells）计算词级高亮，未配对整行高亮；可证明 whole rewrite 走 O(N) rewrite path；计算在每进程一个长期 worker 中串行执行（batch 提交、5s 超时 watchdog、崩溃/超时自动重建），主线程零阻塞。
 
 ### Tool ownership
 
 - `edit/` — grouped exact edits；按文件分组，单文件原子，多文件隔离，并与 built-in `write` 共用 SDK file mutation queue。
-- `bash-ui/` — `bash` 工具通用 UI：普通命令 fish 式语义高亮（theme syntax token + 命令存在性检查）；canonical standalone `apply_patch` 语法作为特例走 patch 视图（ephemeral before/after snapshots 与 CLI-confirmed grouped final diff）；原样委托 command execution，不改 CLI stdout/stderr/exit code 或 tool result contract。
+- `bash-fish-render/` — `bash` 工具通用 UI：普通命令 fish 式语义高亮（theme syntax token + 命令存在性检查）；canonical standalone `apply_patch` 语法作为特例走 patch 视图（ephemeral before/after snapshots 与 CLI-confirmed grouped final diff）；原样委托 command execution，不改 CLI stdout/stderr/exit code 或 tool result contract。
+- `bash-output-budget/` — bash 结果输出预算：超预算时保留头尾、中段挪进溢出文件；只做转换不拦截（isError 语义原样）。
 - `command-policy/` — `bash` / `run_experiment` 的唯一 `tool_call` mutation owner；依次执行 uv Python normalization 与 package-manager deny。
 - `uv/` — uv/Python pure rewrite 与 deny policy；不再直接注册 runtime hook。
 
@@ -27,8 +29,8 @@
 ### UI polish
 
 - `custom-footer/` — 两行网格状态栏：左列 `cwd:`/`ctx:` 标签对齐，右列 model（含 think 级别）与订阅额度；行1 显示 cwd、model、git branch（静态），行2 显示 ctx 用量、token 流量（`↑in ↓out Rw Ww CH%`）、会话成本与额度窗口（5h / Weekly 用量条）；额度只随当前模型 provider 显示（claude/codex/kimi），按量付费 provider（如 deepseek）不显示；宽 <72 退化三行流式布局。
-- `whimsical/` — streaming working-indicator variants；按 tool 类别切换 working message。
 - `escape-rewind/` — early-ESC prompt rewind；assistant 尚未开始回复时，第二次 Esc 回填刚提交 prompt。
+- `code-tagger/` — 渲染前为无标签代码围栏自动补语言标签（只改显示，不污染会话文本）。
 
 ## 已配置之 package 资源
 
