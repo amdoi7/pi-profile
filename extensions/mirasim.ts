@@ -355,16 +355,22 @@ async function isProxyPort(base: string, pathPrefix: string, token: string): Pro
   }
 }
 
-/** 从运行中的 claude 会话 argv 解析反代会话（端口 + 会话路径 + token 三件套）。 */
+/** 从运行中的 claude 会话解析反代会话（端口 + 会话路径 + token 三件套）。 */
 async function findMirasimSessions(): Promise<ProxyTarget[]> {
   try {
-    const { stdout } = await execFileAsync("ps", ["-axo", "command="], { timeout: 5000 });
+    // ps eww 带环境变量；反代三件套可能以 argv（--settings 内联 JSON）或 env
+    // 形式存在，两种都匹配。同一行里 BASE_URL 与 AUTH_TOKEN 分别提取，
+    // 避免依赖两者顺序。
+    const { stdout } = await execFileAsync("ps", ["eww", "-axo", "command="], { timeout: 5000 });
     const targets: ProxyTarget[] = [];
     for (const line of stdout.split("\n")) {
       const m = line.match(
-        /ANTHROPIC_BASE_URL":\s*"http:\/\/127\.0\.0\.1:(\d+)\/([^"]+)"[^]*?ANTHROPIC_AUTH_TOKEN":\s*"([^"]+)"/,
+        /ANTHROPIC_BASE_URL[":=]\s*"?http:\/\/127\.0\.0\.1:(\d+)\/([^"\s]+)/,
       );
-      if (m) targets.push({ base: `http://127.0.0.1:${m[1]}`, pathPrefix: `/${m[2]}`, key: m[3] });
+      const t = line.match(/ANTHROPIC_AUTH_TOKEN[":=]\s*"?([^"\s]+)/);
+      if (m && t) {
+        targets.push({ base: `http://127.0.0.1:${m[1]}`, pathPrefix: `/${m[2]}`, key: t[1] });
+      }
     }
     return targets;
   } catch {
