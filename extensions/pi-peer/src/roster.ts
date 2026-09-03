@@ -4,6 +4,7 @@ import { queryPeer, socketDir, type PeerIdentity } from "./transport.ts";
 
 /**
  * 名册 = socket 目录本身,零缓存:发现即 readdir + 并行 who。
+ * 目录按 cwd 分区,所以「只和同目录会话通信」是结构保证,这里没有过滤逻辑。
  * 身份永远来自活进程(新鲜性不需要维护);连接拒绝的 .sock 是尸体文件,
  * 即扫即清(内核真相:活进程的 socket 不会拒连,不存在误杀)。
  *
@@ -11,17 +12,17 @@ import { queryPeer, socketDir, type PeerIdentity } from "./transport.ts";
  * 没应答——删它才是错的。也不计数上报:「几个 socket 没应答」对调用方零可行动性，
  * 那是作者向遥测，不该走模型通道。
  */
-
 export async function discoverPeers(
 	selfId: string,
+	cwd: string,
 	query: typeof queryPeer = queryPeer,
 ): Promise<PeerIdentity[]> {
-	const dir = socketDir();
+	const dir = socketDir(cwd);
 	let entries: string[];
 	try {
 		entries = readdirSync(dir).filter((f) => f.endsWith(".sock"));
 	} catch {
-		return []; // 目录不存在 = 从未有 peer 上线
+		return []; // 目录不存在 = 本目录从未有 peer 上线
 	}
 	const alive: PeerIdentity[] = [];
 	await Promise.all(
@@ -39,21 +40,16 @@ export async function discoverPeers(
 	return alive;
 }
 
-/** name/sessionId → 唯一活 peer。同 cwd 优先(同目录协作是主场景);歧义报候选。 */
+/** sessionId(或其前缀)→ 唯一活 peer;前缀撞多个就报候选,不替调用方猜。 */
 export function resolvePeer(
 	peers: PeerIdentity[],
 	to: string,
-	selfCwd: string,
 ): { ok: true; peer: PeerIdentity } | { ok: false; reason: string } {
-	const matches = peers.filter((p) => p.name === to || p.sessionId === to || p.sessionId.startsWith(to));
-	if (matches.length === 0) {
-		return { ok: false, reason: `no live peer matching “${to}”; use action=list to see online sessions` };
+	const matches = peers.filter((p) => p.sessionId.startsWith(to));
+	if (matches.length === 0) return { ok: false, reason: `no live peer matching “${to}”` };
+	if (matches.length > 1) {
+		const list = matches.map((p) => p.sessionId.slice(0, 8)).join(", ");
+		return { ok: false, reason: `“${to}” is ambiguous, candidates: ${list}` };
 	}
-	const sameCwd = matches.filter((p) => p.cwd === selfCwd);
-	const candidates = sameCwd.length > 0 ? sameCwd : matches;
-	if (candidates.length > 1) {
-		const list = candidates.map((p) => `${p.name ?? "(unnamed)"}(${p.sessionId.slice(0, 8)} cwd=${p.cwd})`).join("; ");
-		return { ok: false, reason: `“${to}” is ambiguous, candidates: ${list}; specify sessionId to disambiguate` };
-	}
-	return { ok: true, peer: candidates[0] };
+	return { ok: true, peer: matches[0]! };
 }

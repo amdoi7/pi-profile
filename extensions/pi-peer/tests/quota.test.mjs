@@ -3,11 +3,11 @@ import assert from "node:assert/strict";
 
 import { WindowQuota } from "../src/quota.ts";
 
-/** pi_peer 生产配置:10/5min,同文窗 60s。 */
+/** peer_send 生产配置:10/5min,同文窗 60s。 */
 const peerQuota = () => new WindowQuota({ max: 10, windowMs: 300_000, repeatWindowMs: 60_000 });
 const T = 1_800_000_000_000;
 
-describe("WindowQuota(pi_peer 发送配额判定内核)", () => {
+describe("WindowQuota(peer_send 配额判定内核)", () => {
 	test("check 只判定不记账:失败(不 commit)不消耗额度,同文重试放行(发送失败≠loop)", () => {
 		const q = peerQuota();
 		// 尝试失败(未 commit):同文立即重试不被 repeat 拦截

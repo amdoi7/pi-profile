@@ -10,14 +10,13 @@ import { isPeerMessage, probeSocket, queryPeer, sendPeerMessage, socketPathFor, 
 process.env.PI_PEER_DIR = mkdtempSync(join(tmpdir(), "pi-peer-tr-"));
 
 const msg = (text, over = {}) => ({
-	from: { sessionId: "sender-1", name: "sender", cwd: "/repo" },
+	from: "sender-1",
 	text,
-	mode: "followUp",
 	ts: 1,
 	...over,
 });
 
-const who = (over = {}) => ({ sessionId: "srv-srv-srv", name: "srv", cwd: "/repo", startedAt: 1, ...over });
+const who = (over = {}) => ({ sessionId: "srv-srv-srv", startedAt: 1, ...over });
 /** 缺省 handlers:身份固定,消息丢弃;单测按需覆盖 */
 const handlers = (over = {}) => ({ who: () => who(), deliver: async () => {}, ...over });
 const sockPath = () => join(mkdtempSync(join(tmpdir(), "pi-peer-t-")), "s.sock");
@@ -30,7 +29,7 @@ describe("transport(窄协议 NDJSON:deliver 投递→接管→ack / who 实时�
 		await sendPeerMessage(path, msg("同步语义"));
 		assert.equal(got.length, 1);
 		assert.equal(got[0].text, "同步语义");
-		assert.equal(got[0].from.name, "sender");
+		assert.equal(got[0].from, "sender-1");
 		srv.close();
 	});
 
@@ -45,16 +44,16 @@ describe("transport(窄协议 NDJSON:deliver 投递→接管→ack / who 实时�
 		srv.close();
 	});
 
-	test("who:身份实时求值——改名后再问即变(新鲜性不需要维护)", async () => {
+	test("who:身份实时求值——会话文件晚到也即刻可见(新鲜性不需要维护)", async () => {
 		const path = sockPath();
-		let name = "before";
-		const srv = await startPeerServer(path, handlers({ who: () => who({ name }) }));
+		let sessionFile;
+		const srv = await startPeerServer(path, handlers({ who: () => who({ sessionFile }) }));
 		const first = await queryPeer(path);
 		assert.equal(first.status, "ok");
-		assert.equal(first.who.name, "before");
-		name = "after";
+		assert.equal(first.who.sessionFile, undefined);
+		sessionFile = "/s/late.jsonl";
 		const second = await queryPeer(path);
-		assert.equal(second.who.name, "after");
+		assert.equal(second.who.sessionFile, "/s/late.jsonl");
 		srv.close();
 	});
 
@@ -107,21 +106,23 @@ describe("transport(窄协议 NDJSON:deliver 投递→接管→ack / who 实时�
 		assert.equal(await probeSocket(path), false, "close 后 socket 移除");
 	});
 
-	test("isPeerMessage 形状校验:缺字段/mode 非法拒绝(形状即契约)", () => {
+	test("isPeerMessage 形状校验:缺字段拒绝(形状即契约)", () => {
 		assert.ok(isPeerMessage(msg("x")));
-		assert.ok(isPeerMessage(msg("x", { mode: "steer" })));
-		assert.ok(isPeerMessage(msg("x", { mode: "quiet" })));
-		assert.ok(!isPeerMessage({ ...msg("x"), mode: "bogus" }));
-		assert.ok(!isPeerMessage({ from: { sessionId: "a" }, text: "x" })); // 缺 mode
-		assert.ok(!isPeerMessage({ from: { sessionId: "a" }, mode: "followUp" })); // 缺 text
+		assert.ok(!isPeerMessage({ from: "a" })); // 缺 text
+		assert.ok(!isPeerMessage({ text: "x" })); // 缺 from
+		assert.ok(!isPeerMessage({ from: "", text: "x" })); // 空 from
 		assert.ok(!isPeerMessage(null));
 	});
 
 	test("socketPathFor:sun_path 104 上限内;同毫秒 UUIDv7(长公共前缀)不同 id 不碰撞", () => {
 		// UUIDv7 前 12 hex 是时间戳:同毫秒创建的两个会话只差尾部随机位。
 		// 裸前缀截断会撞路径 → 后启动方假退让 → 收信静默失联;哈希消歧锁死此洞。
-		const a = socketPathFor("01a00180-8a4b-7cb9-90a3-01c1b4aa3375");
-		const b = socketPathFor("01a00180-8a4b-7cb9-90a3-01c1b4aa3376");
+		// 预算按生产基址量(tmpdir/pi-peer-<uid>/<cwd 摘要>),不是测试临时目录
+		const override = process.env.PI_PEER_DIR;
+		delete process.env.PI_PEER_DIR;
+		const a = socketPathFor("01a00180-8a4b-7cb9-90a3-01c1b4aa3375", "/Users/amdoi7/Desktop/ai4x/Dangwu");
+		const b = socketPathFor("01a00180-8a4b-7cb9-90a3-01c1b4aa3376", "/Users/amdoi7/Desktop/ai4x/Dangwu");
+		process.env.PI_PEER_DIR = override;
 		assert.ok(a.length < 104, `路径过长: ${a}`);
 		assert.notEqual(a, b, "同前缀不同 id 必须映射到不同 socket 路径");
 	});

@@ -1,6 +1,6 @@
 /**
- * 滑动窗配额 + 同文重复抑制:pi_peer 发送配额的判定内核。
- * quiet 旁路在调用方(不占额),本类只管计数与判定;verdict 只带 kind,文案归调用方。
+ * 滑动窗配额 + 同文重复抑制:peer_send 配额的判定内核。
+ * 本类只管计数与判定;verdict 只带 kind,文案归调用方。
  * 判定语义(repeat 与 quota 都不计数——丢弃/降级不算一次成功发送):
  * - repeat:同 key 同文本在 repeatWindowMs 内重发 = loop 信号;
  * - quota:窗口内成功发送数达 max。
