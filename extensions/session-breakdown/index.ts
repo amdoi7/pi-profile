@@ -113,11 +113,18 @@ interface ParsedSession {
 	tod: TodKey;
 	modelsUsed: Set<ModelKey>;
 	messages: number;
+	/** 官方五桶：input/output/cacheRead/cacheWrite（totalTokens = 四者和）。 */
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
 	tokens: number;
 	totalCost: number;
 	costByModel: Map<ModelKey, number>;
 	messagesByModel: Map<ModelKey, number>;
 	tokensByModel: Map<ModelKey, number>;
+	/** 按角色分计的 message 数：assistant/toolResult/user（互斥，和为 messages）。 */
+	roleMessages: { assistant: number; toolResult: number; user: number };
 }
 
 interface DayAgg {
@@ -125,7 +132,14 @@ interface DayAgg {
 	dayKeyLocal: string;
 	sessions: number;
 	messages: number;
+	/** 按 role 分计的 message 数。 */
+	roleMessages: { assistant: number; toolResult: number; user: number };
 	tokens: number;
+	/** 官方五桶累计。 */
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
 	totalCost: number;
 	costByModel: Map<ModelKey, number>;
 	sessionsByModel: Map<ModelKey, number>;
@@ -150,7 +164,14 @@ interface RangeAgg {
 	dayByKey: Map<string, DayAgg>;
 	sessions: number;
 	totalMessages: number;
+	/** 按 role 分计的 message 数（总和 = totalMessages）。 */
+	totalRoleMessages: { assistant: number; toolResult: number; user: number };
 	totalTokens: number;
+	/** 官方五桶累计（总和 = totalTokens）。 */
+	totalInput: number;
+	totalOutput: number;
+	totalCacheRead: number;
+	totalCacheWrite: number;
 	totalCost: number;
 	modelCost: Map<ModelKey, number>;
 	modelSessions: Map<ModelKey, number>; // number of sessions where model was used
@@ -211,6 +232,17 @@ interface BreakdownData {
 
 const SESSION_ROOT = path.join(os.homedir(), ".pi", "agent", "sessions");
 const RANGE_DAYS = [7, 30, 90] as const;
+
+/**
+ * 扫描根：默认官方 `~/.pi/agent/sessions`；可经环境变量 `PI_SESSION_DIRS`
+ * （冒号分隔的目录列表）追加项目内会话目录（如 `<proj>/.pi/worker-sessions`）。
+ * 空/非法条目忽略；列表去重。
+ */
+function resolveSessionRoots(): string[] {
+	const extra = (process.env.PI_SESSION_DIRS ?? "").split(":").map((s) => s.trim()).filter(Boolean);
+	const roots = [SESSION_ROOT, ...extra];
+	return [...new Set(roots)];
+}
 
 type MeasurementMode = "sessions" | "messages" | "tokens";
 
@@ -455,15 +487,6 @@ function extractTokensTotal(usage: any): number {
 	// - { tokens: number | { total } }
 	if (!usage) return 0;
 
-	const readNum = (v: any): number => {
-		if (typeof v === "number") return Number.isFinite(v) ? v : 0;
-		if (typeof v === "string") {
-			const n = Number(v);
-			return Number.isFinite(n) ? n : 0;
-		}
-		return 0;
-	};
-
 	let total = 0;
 	// direct totals
 	total =
@@ -493,13 +516,39 @@ function extractTokensTotal(usage: any): number {
 	return sum > 0 ? sum : 0;
 }
 
+function readNum(v: unknown): number {
+	if (typeof v === "number") return Number.isFinite(v) ? v : 0;
+	if (typeof v === "string") {
+		const n = Number(v);
+		return Number.isFinite(n) ? n : 0;
+	}
+	return 0;
+}
+
 async function walkSessionFiles(
-	root: string,
+	roots: string[],
 	startCutoffLocal: Date,
 	signal?: AbortSignal,
 	onFound?: (found: number) => void,
 ): Promise<string[]> {
 	const out: string[] = [];
+	const seen = new Set<string>();
+	for (const root of roots) {
+		if (seen.has(root)) continue;
+		seen.add(root);
+		await walkOneRoot(root, startCutoffLocal, signal, onFound, out);
+	}
+	onFound?.(out.length);
+	return out;
+}
+
+async function walkOneRoot(
+	root: string,
+	startCutoffLocal: Date,
+	signal?: AbortSignal,
+	onFound?: (found: number) => void,
+	out: string[] = [],
+): Promise<void> {
 	const stack: string[] = [root];
 	while (stack.length) {
 		if (signal?.aborted) break;
@@ -542,8 +591,6 @@ async function walkSessionFiles(
 			}
 		}
 	}
-	onFound?.(out.length);
-	return out;
 }
 
 async function parseSessionFile(filePath: string, signal?: AbortSignal): Promise<ParsedSession | null> {
@@ -555,8 +602,13 @@ async function parseSessionFile(filePath: string, signal?: AbortSignal): Promise
 
 	const modelsUsed = new Set<ModelKey>();
 	let messages = 0;
+	let input = 0;
+	let output = 0;
+	let cacheRead = 0;
+	let cacheWrite = 0;
 	let tokens = 0;
 	let totalCost = 0;
+	const roleMessages = { assistant: 0, toolResult: 0, user: 0 };
 	const costByModel = new Map<ModelKey, number>();
 	const messagesByModel = new Map<ModelKey, number>();
 	const tokensByModel = new Map<ModelKey, number>();
@@ -627,10 +679,32 @@ async function parseSessionFile(filePath: string, signal?: AbortSignal): Promise
 			messages += 1;
 			messagesByModel.set(mk, (messagesByModel.get(mk) ?? 0) + 1);
 
+			const role = obj?.message?.role;
+			if (role === "assistant") roleMessages.assistant += 1;
+			else if (role === "toolResult") roleMessages.toolResult += 1;
+			else if (role === "user") roleMessages.user += 1;
+
+			// 官方五桶：input/output/cacheRead/cacheWrite 分开累计，totalTokens 兼容
+			// 旧会话（无 totalTokens 时 = 四者和，与 pi 解析层 totalTokens 定义一致）。
+			const u = usage ?? {};
+			const i = readNum(u?.input ?? u?.input_tokens);
+			const o = readNum(u?.output ?? u?.output_tokens);
+			const cr = readNum(u?.cacheRead ?? u?.cache_read_input_tokens ?? u?.cached_tokens);
+			const cw = readNum(u?.cacheWrite ?? u?.cache_creation_input_tokens ?? u?.cache_write_tokens);
+			input += i;
+			output += o;
+			cacheRead += cr;
+			cacheWrite += cw;
+
 			const tok = extractTokensTotal(usage);
 			if (tok > 0) {
 				tokens += tok;
 				tokensByModel.set(mk, (tokensByModel.get(mk) ?? 0) + tok);
+			} else if (i + o + cr + cw > 0) {
+				// 旧会话没有 totalTokens：用五桶和（pi 的 totalTokens 定义就是四者和）。
+				const sum = i + o + cr + cw;
+				tokens += sum;
+				tokensByModel.set(mk, (tokensByModel.get(mk) ?? 0) + sum);
 			}
 
 			const cost = extractCostTotal(usage);
@@ -657,11 +731,16 @@ async function parseSessionFile(filePath: string, signal?: AbortSignal): Promise
 		tod,
 		modelsUsed,
 		messages,
+		input,
+		output,
+		cacheRead,
+		cacheWrite,
 		tokens,
 		totalCost,
 		costByModel,
 		messagesByModel,
 		tokensByModel,
+		roleMessages,
 	};
 }
 
@@ -679,7 +758,12 @@ function buildRangeAgg(days: number, now: Date): RangeAgg {
 			dayKeyLocal,
 			sessions: 0,
 			messages: 0,
+			roleMessages: { assistant: 0, toolResult: 0, user: 0 },
 			tokens: 0,
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
 			totalCost: 0,
 			costByModel: new Map(),
 			sessionsByModel: new Map(),
@@ -707,7 +791,12 @@ function buildRangeAgg(days: number, now: Date): RangeAgg {
 		dayByKey,
 		sessions: 0,
 		totalMessages: 0,
+		totalRoleMessages: { assistant: 0, toolResult: 0, user: 0 },
 		totalTokens: 0,
+		totalInput: 0,
+		totalOutput: 0,
+		totalCacheRead: 0,
+		totalCacheWrite: 0,
 		totalCost: 0,
 		modelCost: new Map(),
 		modelSessions: new Map(),
@@ -738,11 +827,25 @@ function addSessionToRange(range: RangeAgg, session: ParsedSession): void {
 
 	range.sessions += 1;
 	range.totalMessages += session.messages;
+	range.totalRoleMessages.assistant += session.roleMessages.assistant;
+	range.totalRoleMessages.toolResult += session.roleMessages.toolResult;
+	range.totalRoleMessages.user += session.roleMessages.user;
 	range.totalTokens += session.tokens;
+	range.totalInput += session.input;
+	range.totalOutput += session.output;
+	range.totalCacheRead += session.cacheRead;
+	range.totalCacheWrite += session.cacheWrite;
 	range.totalCost += session.totalCost;
 	day.sessions += 1;
 	day.messages += session.messages;
+	day.roleMessages.assistant += session.roleMessages.assistant;
+	day.roleMessages.toolResult += session.roleMessages.toolResult;
+	day.roleMessages.user += session.roleMessages.user;
 	day.tokens += session.tokens;
+	day.input += session.input;
+	day.output += session.output;
+	day.cacheRead += session.cacheRead;
+	day.cacheWrite += session.cacheWrite;
 	day.totalCost += session.totalCost;
 
 	// Sessions-per-model (presence)
@@ -1384,13 +1487,20 @@ function rangeSummary(range: RangeAgg, days: number, mode: MeasurementMode): str
 	const avg = range.sessions > 0 ? range.totalCost / range.sessions : 0;
 	const costPart = range.totalCost > 0 ? `${formatUsd(range.totalCost)} · avg ${formatUsd(avg)}/session` : `$0.0000`;
 
+	// 官方五桶：净输入/输出/缓存读/缓存写（总和 = totalTokens）。口径对齐 pi
+	// usage-totals 与 sqlite session-stats（cached = cacheRead，uncached = input + cacheWrite）。
+	const rolePart =
+		`${range.totalRoleMessages.assistant} asst / ${range.totalRoleMessages.toolResult} tool / ${range.totalRoleMessages.user} user`;
+
 	if (mode === "tokens") {
-		return `Last ${days} days: ${formatCount(range.sessions)} sessions · ${formatCount(range.totalTokens)} tokens · ${costPart}`;
+		return `Last ${days} days: ${formatCount(range.sessions)} sessions · ${formatCount(range.totalTokens)} tokens`
+			+ ` (↑${formatCount(range.totalInput)} ↓${formatCount(range.totalOutput)} R${formatCount(range.totalCacheRead)} W${formatCount(range.totalCacheWrite)})`
+			+ ` · ${rolePart} · ${costPart}`;
 	}
 	if (mode === "messages") {
-		return `Last ${days} days: ${formatCount(range.sessions)} sessions · ${formatCount(range.totalMessages)} messages · ${costPart}`;
+		return `Last ${days} days: ${formatCount(range.sessions)} sessions · ${formatCount(range.totalMessages)} messages (${rolePart}) · ${costPart}`;
 	}
-	return `Last ${days} days: ${formatCount(range.sessions)} sessions · ${costPart}`;
+	return `Last ${days} days: ${formatCount(range.sessions)} sessions · ${rolePart} · ${costPart}`;
 }
 
 async function computeBreakdown(
@@ -1405,7 +1515,7 @@ async function computeBreakdown(
 
 	onProgress?.({ phase: "scan", foundFiles: 0, parsedFiles: 0, totalFiles: 0, currentFile: undefined });
 
-	const candidates = await walkSessionFiles(SESSION_ROOT, start90, signal, (found) => {
+	const candidates = await walkSessionFiles(resolveSessionRoots(), start90, signal, (found) => {
 		onProgress?.({ phase: "scan", foundFiles: found });
 	});
 
