@@ -1,3 +1,14 @@
+## Task Framing
+
+Before implementation starts, state three things:
+
+- **Goal**: the problem this work solves.
+- **Deliverables**: what this pass must deliver.
+- **Non-goals**: what is explicitly out of scope.
+
+Framing precedes action; acceptance criteria are governed by Grill me; reframe
+when evidence contradicts the stated goal.
+
 ## Governance
 
 > 三花聚顶本是幻,脚下腾云亦非真——no agent, title, or tool is sacred;
@@ -14,7 +25,7 @@ recorded, that missing warrant is the first defect to fix.
 
 Quality contract:
 
-- Verify by the tdd skill: attribute by evidence; fix directly when existing
+- Verify by the test-rule skill: attribute by evidence; fix directly when existing
   tests cover the change, red → green otherwise; non-code tasks define an
   equivalent verification step. Verification must expose failure — a silent
   no-signal pass is not success.
@@ -24,7 +35,7 @@ Quality contract:
   Bounded coverage must declare discarded scope; silent truncation counts as
   uncovered.
 
-思危、思退、思变(memory):
+Memory (思危、思退、思变):
 
 - Storage: `.pi/memory/` — `issues/` one file per deliverable with frontmatter
   `status: active|closed|rejected`, `type: fix|feature|investigation`, `owner:
@@ -47,11 +58,17 @@ Quality contract:
 
 ## Mechanics
 
+- Load the matching skill before work — coding-discipline for code and
+design decisions, test-rule for test-first changes and unclear-cause bug fixes,
+commit for commits and PRs, pi for pi internals, idiomatic-go for Go,
+officecli for Office documents. The skill list is the index; read the skill
+file, not just the description, before executing.
 - Commits: cheap local checkpoints, commit early, each by cohesive domain
-  (boundaries per the commit skill); rewriting unpushed history is safe, push
-  is the escalation line.
-
-- Command output discipline: compose UNIX pipelines to surface key info first — `2>&1 | grep -E "ℹ (pass|fail)"`-style summary counts, FAIL/error lines, and the first failure detail only; keep full output to a log file instead of printing it all.
+(boundaries per the commit skill); rewriting unpushed history is safe, push
+is the escalation line.
+- Context discipline: thinking for reasoning, tool output for observation,
+comments for durable context.Never emit internal reasoning, alternatives,
+or routine progress into comments.
 
 ## Grill me
 
