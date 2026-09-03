@@ -1,10 +1,19 @@
 import { describe, expect, test } from "vitest";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { computeCacheWaste } from "./custom-footer-cache.ts";
-import { computeSessionCost, computeTokenFlow } from "./custom-footer-format.ts";
+import { computeCacheWaste } from "./vendor/cache-stats.ts";
+import { addUsageToTotals, createUsageTotals } from "./vendor/usage-totals.ts";
 import { createSessionStats } from "./custom-footer-stats.ts";
 
-const models = { find: () => undefined };
+const models = { getModel: () => undefined };
+
+/** 官方 vendored 五桶加法：测试期望值直接由官方实现算出（不复制逻辑）。 */
+function officialTotals(entries: ReturnType<typeof entryFor>[]) {
+  const totals = createUsageTotals();
+  for (const entry of entries) {
+    if (entry.message?.usage) addUsageToTotals(totals, entry.message.usage);
+  }
+  return totals;
+}
 
 function assistantMessage(usage: AssistantMessage["usage"]): AssistantMessage {
   return {
@@ -45,10 +54,10 @@ function entryFor(message: AssistantMessage) {
 }
 
 describe("custom footer session stats", () => {
-  test("rebuild equals the full-scan functions (flow / cost / waste)", () => {
+  test("rebuild carries cacheRead/cacheWrite into flow and equals the official totals scan", () => {
     const messages = [
       assistantMessage(usage({ input: 5000, output: 200, reasoning: 50, cacheRead: 0, cacheWrite: 0 })),
-      assistantMessage(usage({ input: 1000, output: 300, cacheRead: 4000, cacheWrite: 0 })),
+      assistantMessage(usage({ input: 1000, output: 300, cacheRead: 44000, cacheWrite: 3000 })),
     ];
     const entries = messages.map(entryFor);
 
@@ -56,16 +65,19 @@ describe("custom footer session stats", () => {
     stats.rebuild(entries, models);
     const snapshot = stats.getSnapshot();
 
-    expect(snapshot.flow).toEqual(computeTokenFlow(entries));
-    expect(snapshot.cost).toBe(computeSessionCost(entries));
+    expect(snapshot.flow).toEqual(officialTotals(entries));
+    expect(snapshot.cost).toBe(officialTotals(entries).cost);
     expect(snapshot.waste).toEqual(computeCacheWaste(entries, models));
+    expect(snapshot.flow?.cacheRead).toBe(44000);
+    expect(snapshot.flow?.cacheWrite).toBe(3000);
   });
 
-  test("incremental addMessage equals full scan for a message sequence", () => {
+  test("message_end rebuild equals full scan for a message sequence", () => {
+    // 官方全量语义：message_end 触发 rebuild；逐条递进的最终快照应等于一次全量。
     const messages = [
       // 第一条：大量 input 无缓存 → 建立 prev 基线（5000 prompt tokens）。
       assistantMessage(usage({ input: 1000, output: 200, cacheRead: 4000, cacheWrite: 0 })),
-      // 第二条：应缓存读却被重新计费（cacheRead=0）→ miss = min(5000,4000)-0 = 4000。
+      // 第二条：应缓存读却被重新计费（cacheRead=0）→ miss（官方口径）。
       assistantMessage(usage({ input: 4000, output: 300, cacheRead: 0, cacheWrite: 0 })),
       // 第三条：正常缓存命中 → 无 miss。
       assistantMessage(usage({ input: 1000, output: 150, reasoning: 40, cacheRead: 4000, cacheWrite: 0 })),
@@ -75,12 +87,12 @@ describe("custom footer session stats", () => {
     const stats = createSessionStats();
     stats.rebuild([], models);
     for (const m of messages) {
-      stats.addMessage(m, models);
+      stats.rebuild(entries.slice(0, messages.indexOf(m) + 1), models);
     }
     const snapshot = stats.getSnapshot();
 
-    expect(snapshot.flow).toEqual(computeTokenFlow(entries));
-    expect(snapshot.cost).toBe(computeSessionCost(entries));
+    expect(snapshot.flow).toEqual(officialTotals(entries));
+    expect(snapshot.cost).toBe(officialTotals(entries).cost);
     expect(snapshot.waste).toEqual(computeCacheWaste(entries, models));
   });
 
@@ -105,14 +117,13 @@ describe("custom footer session stats", () => {
     expect(stats.getSnapshot().waste.missCount).toBe(2);
   });
 
-  test("increment continues the prev baseline after rebuild", () => {
+  test("rebuild continues the prev baseline across entries", () => {
     const first = assistantMessage(usage({ input: 1000, output: 200, cacheRead: 4000, cacheWrite: 0 }));
     const second = assistantMessage(usage({ input: 4000, output: 300, cacheRead: 0, cacheWrite: 0 }));
     const entries = [entryFor(first), entryFor(second)];
 
     const stats = createSessionStats();
-    stats.rebuild([entryFor(first)], models);
-    stats.addMessage(second, models);
+    stats.rebuild(entries, models);
 
     expect(stats.getSnapshot().waste).toEqual(computeCacheWaste(entries, models));
     expect(stats.getSnapshot().waste.missCount).toBe(1);
@@ -128,24 +139,29 @@ describe("custom footer session stats", () => {
     });
   });
 
-  test("addMessage ignores non-usage and zero-usage messages like the full scan", () => {
+  test("rebuild ignores zero-usage messages like the full scan", () => {
     const stats = createSessionStats();
     stats.rebuild([], models);
-    stats.addMessage(assistantMessage(undefined), models);
-    stats.addMessage(assistantMessage(usage({ input: 0, output: 0 })), models);
+    stats.rebuild(
+      [
+        { type: "message" as const, message: { role: "assistant" as const, usage: usage({ input: 0, output: 0 }) } },
+        { type: "message" as const, message: { role: "user" as const, content: [] } },
+      ],
+      models,
+    );
 
     expect(stats.getSnapshot().flow).toBeNull();
     expect(stats.getSnapshot().cost).toBe(0);
   });
 
-  test("change hook fires on addMessage and rebuild (commit semantics)", () => {
+  test("change hook fires on rebuild (commit semantics)", () => {
     let changes = 0;
     const stats = createSessionStats();
     stats.onChange(() => {
       changes += 1;
     });
 
-    stats.addMessage(assistantMessage(usage({ input: 10, output: 5 })), models);
+    stats.rebuild([], models);
     expect(changes).toBe(1);
     stats.rebuild([], models);
     expect(changes).toBe(2);
@@ -162,7 +178,7 @@ describe("custom footer session stats", () => {
     });
     off();
 
-    stats.addMessage(assistantMessage(usage({ input: 10, output: 5 })), models);
+    stats.rebuild([], models);
     stats.rebuild([], models);
     expect(changes).toBe(0);
   });

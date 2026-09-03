@@ -168,6 +168,7 @@ describe("custom footer extension statusline", () => {
       model: { id: "test-model" },
       sessionManager: {
         getCwd: () => "/tmp",
+        getSessionId: () => "sess-1234-5678",
         getEntries: () => [],
       },
       ui: {
@@ -188,8 +189,8 @@ describe("custom footer extension statusline", () => {
     );
 
     expect(footer.render(120)).toEqual([
-      `cwd: /tmp${" ".repeat(35)}test-model · think:high`,
-      "ctx: ? ? │ $0.00",
+      `cwd: /tmp${" ".repeat(35)}◈sess-123 test-model · think:high`,
+      "ctx: ? ? $0.00",
       "review running",
       "impl queued",
     ]);
@@ -209,13 +210,15 @@ describe("custom footer extension round metrics wiring", () => {
     customFooterExtension(pi as never);
 
     let footerFactory: any;
+    const sessionEntries: any[] = [];
     const ctx = {
       mode: "tui",
       getContextUsage: () => undefined,
       model: { id: "test-model" },
       sessionManager: {
         getCwd: () => "/tmp",
-        getEntries: () => [],
+        getSessionId: () => "sess-1234-5678",
+        getEntries: () => sessionEntries,
       },
       modelRegistry: { find: () => undefined, getProviderDisplayName: () => "test" },
       ui: {
@@ -239,8 +242,13 @@ describe("custom footer extension round metrics wiring", () => {
     // message_update(首块) → TTFB 点；message_end → 输出累计 + 会话聚合。
     await handlers.get("agent_start")?.({}, ctx);
     await handlers.get("message_update")?.({ message: { role: "assistant" } }, ctx);
+    // 模拟持久化：message_end 前消息已入 entries（真实 sessionManager 同时序）。
+    sessionEntries.push({
+      type: "message",
+      message: { role: "assistant", provider: "test", model: "test-model", usage: { input: 100, output: 200, cost: { total: 0 } } },
+    });
     await handlers.get("message_end")?.(
-      { message: { role: "assistant", usage: { input: 100, output: 200 } } },
+      { message: { role: "assistant", usage: { input: 100, output: 200, cost: { total: 0 } } } },
       ctx,
     );
     await handlers.get("agent_settled")?.({}, ctx);
@@ -274,6 +282,7 @@ describe("custom footer extension live tick", () => {
         model: { id: "test-model" },
         sessionManager: {
           getCwd: () => "/tmp",
+          getSessionId: () => "sess-1234-5678",
           getEntries: () => [],
         },
         modelRegistry: { find: () => undefined, getProviderDisplayName: () => "test" },
@@ -335,6 +344,7 @@ describe("custom footer extension model hook", () => {
       model: { id: "test-model" },
       sessionManager: {
         getCwd: () => "/tmp",
+        getSessionId: () => "sess-1234-5678",
         getEntries: () => [],
       },
       ui: {

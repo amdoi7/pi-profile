@@ -1,9 +1,9 @@
 import { describe, expect, test } from "vitest";
 import {
-	computeSessionCost,
-	computeTokenFlow,
+	cacheHitRate,
 	contextColor,
 	extensionStatusLines,
+	formatCacheHit,
 	formatCacheWaste,
 	formatCompact,
 	formatDuration,
@@ -17,6 +17,7 @@ import {
 	type CacheWaste,
 	type FooterTheme,
 } from "./custom-footer-format.ts";
+import { addUsageToTotals, createUsageTotals, getUsageCostBreakdown } from "./vendor/usage-totals.ts";
 
 const theme: FooterTheme = {
 	fg: (_name, text) => text,
@@ -51,24 +52,47 @@ describe("formatDuration", () => {
 	});
 });
 
-describe("contextColor", () => {
+describe("contextColor (四档双阈值,借鉴 omp)", () => {
 	test("muted without any measurement", () => {
-		expect(contextColor(undefined, undefined)).toBe("muted");
+		expect(contextColor(undefined, undefined, 1_000_000)).toBe("muted");
 	});
-	test("success below tripwires", () => {
-		expect(contextColor(50, undefined)).toBe("success");
-		expect(contextColor(69, undefined)).toBe("success");
-		expect(contextColor(undefined, 100_000)).toBe("success");
-		expect(contextColor(undefined, 399_999)).toBe("success");
+	test("success below the first (absolute-token-derived) tripwire", () => {
+		// 1M 窗口:150k token = 15%,15% 以下皆 success。
+		expect(contextColor(10, undefined, 1_000_000)).toBe("success");
+		expect(contextColor(undefined, 100_000, 1_000_000)).toBe("success");
 	});
-	test("warning between 70 and 84", () => {
-		expect(contextColor(70, undefined)).toBe("warning");
-		expect(contextColor(84, undefined)).toBe("warning");
+	test("warning at the 150k-token equivalent (1M 窗口 = 15%)", () => {
+		expect(contextColor(15, undefined, 1_000_000)).toBe("warning");
 	});
-	test("error at or above tripwires", () => {
-		expect(contextColor(85, undefined)).toBe("error");
-		expect(contextColor(undefined, 400_000)).toBe("error");
-		expect(contextColor(90, 500_000)).toBe("error");
+	test("小窗口 percent 先到,不用绝对 token 换算", () => {
+		// 128k 窗口:150k 超出窗口(117%);warning 由 percent 50 触发。
+		expect(contextColor(55, undefined, 128_000)).toBe("warning");
+	});
+	test("accent (purple→accent) at 270k-token equivalent (1M = 27%)", () => {
+		expect(contextColor(30, undefined, 1_000_000)).toBe("accent");
+		expect(contextColor(undefined, 300_000, 1_000_000)).toBe("accent");
+	});
+	test("error at 500k-token equivalent (1M = 50%)", () => {
+		expect(contextColor(55, undefined, 1_000_000)).toBe("error");
+		expect(contextColor(undefined, 500_000, 1_000_000)).toBe("error");
+		expect(contextColor(60, 600_000, 1_000_000)).toBe("error");
+	});
+});
+
+describe("cacheHitRate / formatCacheHit (omp cache_hit 口径)", () => {
+	test("rate = cacheRead / (cacheRead + cacheWrite + input)", () => {
+		expect(cacheHitRate({ cacheRead: 90, cacheWrite: 5, input: 5 })).toBeCloseTo(90, 5);
+	});
+	test("null without cache activity", () => {
+		expect(cacheHitRate({ cacheRead: 0, cacheWrite: 0, input: 100 })).toBeNull();
+	});
+	test("hit/(hit+miss) 对 DeepSeek 型(cacheWrite=0)成立", () => {
+		// miss 记在 input：命中 80 / 全部 100。
+		expect(cacheHitRate({ cacheRead: 80, cacheWrite: 0, input: 20 })).toBeCloseTo(80, 5);
+	});
+	test("formatCacheHit 显示一位小数(clamped 0..100)", () => {
+		expect(formatCacheHit(theme, 94.2)).toContain("94.2%");
+		expect(formatCacheHit(theme, 150)).toContain("100.0%");
 	});
 });
 
@@ -89,155 +113,106 @@ describe("formatCacheWaste", () => {
 });
 
 describe("formatSessionRow", () => {
-	test("renders context, token flow, cost and tps", () => {
+	const roundFlow = { input: 3_000, output: 400, reasoning: 0, cacheRead: 0, cacheWrite: 0 };
+	const roundFlowThinking = { input: 3_000, output: 400, reasoning: 276, cacheRead: 0, cacheWrite: 0 };
+	const roundFlowZero = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 };
+	const base = {
+		used: 12_000,
+		pct: 52.3,
+		contextWindow: 1_000_000,
+		subscription: false,
+		tps: null,
+		ttfbMs: null,
+		currentElapsedMs: null,
+		turnMs: null,
+		waste: null,
+	};
+
+	test("renders context, session cost, round flow and tps", () => {
 		expect(
-			formatSessionRow(theme, {
-				used: 12_000,
-				pct: 52.3,
-				contextWindow: 1_000_000,
-				cost: 0.1234,
-				tps: 42.4,
-				ttfbMs: null,
-				currentElapsedMs: null,
-				flow: { input: 3_000, output: 400, reasoning: 0 },
-				waste: null,
-			}),
-		).toBe("ctx: 12k/1M 52% │ ↑3k ↓400 $0.12 │ 42 t/s");
+			formatSessionRow(theme, { ...base, sessionCost: 0.1234, roundFlow, tps: 42.4 }),
+		).toBe("ctx: 12k/1M 52% $0.12 │ ↑3k ↓400 │ 42 t/s");
 	});
 	test("shows first-token time (ttfb) next to the tps", () => {
 		expect(
-			formatSessionRow(theme, {
-				used: 12_000,
-				pct: 52.3,
-				contextWindow: 1_000_000,
-				cost: 0.1234,
-				tps: 42.4,
-				ttfbMs: 1_200,
-				currentElapsedMs: null,
-				turnMs: null,
-				flow: null,
-				waste: null,
-			}),
-		).toBe("ctx: 12k/1M 52% │ $0.12 │ 42 t/s ttfb1.2s");
+			formatSessionRow(theme, { ...base, sessionCost: 0.1234, roundFlow: roundFlowZero, tps: 42.4, ttfbMs: 1_200 }),
+		).toBe("ctx: 12k/1M 52% $0.12 │ 42 t/s ttfb1.2s");
 	});
 	test("shows turn duration in the completed dynamic group", () => {
 		expect(
-			formatSessionRow(theme, {
-				used: 12_000,
-				pct: 52.3,
-				contextWindow: 1_000_000,
-				cost: 0.1,
-				tps: 42.4,
-				ttfbMs: null,
-				currentElapsedMs: null,
-				turnMs: 65_000,
-				flow: { input: 3_000, output: 400, reasoning: 276 },
-				waste: null,
-			}),
-		).toBe("ctx: 12k/1M 52% │ ↑3k ↓400 (τ69%) $0.10 │ 42 t/s 本轮1m5s");
+			formatSessionRow(theme, { ...base, sessionCost: 0.1, roundFlow: roundFlowThinking, tps: 42.4, turnMs: 65_000 }),
+		).toBe("ctx: 12k/1M 52% $0.10 │ ↑3k ↓400 (τ69%) │ 42 t/s 本轮1m5s");
 	});
 	test("live round shows same-round tps/ttfb once a message completed", () => {
 		expect(
-			formatSessionRow(theme, {
-				used: 12_000,
-				pct: 52.3,
-				contextWindow: 1_000_000,
-				cost: 0.1,
-				tps: 42.4,
-				ttfbMs: 1_200,
-				currentElapsedMs: 12_000,
-				turnMs: null,
-				flow: null,
-				waste: null,
-			}),
-		).toBe("ctx: 12k/1M 52% │ $0.10 │ 42 t/s ttfb1.2s 本轮12s");
+			formatSessionRow(theme, { ...base, sessionCost: 0.1, roundFlow: roundFlowZero, tps: 42.4, ttfbMs: 1_200, currentElapsedMs: 12_000 }),
+		).toBe("ctx: 12k/1M 52% $0.10 │ 42 t/s ttfb1.2s 本轮12s");
 	});
 	test("live round omits tps/ttfb until the first chunk arrives", () => {
 		expect(
-			formatSessionRow(theme, {
-				used: 12_000,
-				pct: 52.3,
-				contextWindow: 1_000_000,
-				cost: 0.1,
-				tps: null,
-				ttfbMs: null,
-				currentElapsedMs: 5_000,
-				turnMs: null,
-				flow: null,
-				waste: null,
-			}),
-		).toBe("ctx: 12k/1M 52% │ $0.10 │ 本轮5s");
+			formatSessionRow(theme, { ...base, sessionCost: 0.1, roundFlow: roundFlowZero, currentElapsedMs: 5_000 }),
+		).toBe("ctx: 12k/1M 52% $0.10 │ 本轮5s");
 	});
 	test("renders zero cost when the model has no price table", () => {
 		expect(
-			formatSessionRow(theme, { used: 12_000, pct: 52.3, contextWindow: 1_000_000, cost: 0, tps: null, ttfbMs: null, currentElapsedMs: null, turnMs: null, flow: null, waste: null }),
-		).toBe("ctx: 12k/1M 52% │ $0.00");
+			formatSessionRow(theme, { ...base, sessionCost: 0, roundFlow: roundFlowZero }),
+		).toBe("ctx: 12k/1M 52% $0.00");
 	});
 	test("omits cache counters (waste signal lives in the miss segment)", () => {
 		expect(
-			formatSessionRow(theme, {
-				used: 12_000,
-				pct: 52.3,
-				contextWindow: 1_000_000,
-				cost: 0.1,
-				tps: null,
-				ttfbMs: null,
-				currentElapsedMs: null,
-				turnMs: null,
-				flow: { input: 3_000, output: 400, reasoning: 0 },
-				waste: null,
-			}),
-		).toBe("ctx: 12k/1M 52% │ ↑3k ↓400 $0.10");
+			formatSessionRow(theme, { ...base, sessionCost: 0.1, roundFlow }),
+		).toBe("ctx: 12k/1M 52% $0.10 │ ↑3k ↓400");
 	});
 	test("omits cache and flow segments when unavailable", () => {
 		expect(
-			formatSessionRow(theme, {
-				used: 12_000,
-				pct: 52.3,
-				contextWindow: 1_000_000,
-				cost: 0.1234,
-				tps: null,
-				ttfbMs: null,
-				currentElapsedMs: null,
-				turnMs: null,
-				flow: { input: 3_000, output: 400, reasoning: 0 },
-				waste: null,
-			}),
-		).toBe("ctx: 12k/1M 52% │ ↑3k ↓400 $0.12");
+			formatSessionRow(theme, { ...base, sessionCost: 0.1234, roundFlow }),
+		).toBe("ctx: 12k/1M 52% $0.12 │ ↑3k ↓400");
 	});
 	test("renders placeholders and omits tps when unavailable", () => {
 		expect(
-			formatSessionRow(theme, { used: undefined, pct: undefined, contextWindow: 1_000_000, cost: 0, tps: null, ttfbMs: null, currentElapsedMs: null, turnMs: null, flow: null, waste: null }),
-		).toBe("ctx: ? ? │ $0.00");
+			formatSessionRow(theme, { ...base, used: undefined, pct: undefined, sessionCost: 0, roundFlow: null }),
+		).toBe("ctx: ? ? $0.00");
 	});
+
+	test("miss segment hides below cost threshold (噪音不占行,2026-08-27 过载修复)", () => {
+		const flow = { input: 523_000, output: 166_000, reasoning: 58_000, cacheRead: 52_900_000, cacheWrite: 0 };
+		const opts = { ...base, used: 317_000, pct: 32, contextWindow: 1_000_000, sessionCost: 0.13, roundFlow: flow };
+		// 97× 失效但仅 2 分钱：整段不显示。
+		expect(formatSessionRow(theme, { ...opts, waste: { missedTokens: 293_000, missedCost: 0.02, missCount: 97 } })).not.toContain("miss");
+		expect(formatSessionRow(theme, { ...opts, waste: { missedTokens: 293_000, missedCost: 0.02, missCount: 97 } })).not.toContain("R52.9M"); // R/W 段已裁
+		// 真浪费（≥5 分）才显示。
+		const loud = formatSessionRow(theme, { ...opts, waste: { missedTokens: 293_000, missedCost: 0.51, missCount: 97 } });
+		expect(loud).toContain("miss 293k (97×) (+$0.51)");
+		expect(loud).toContain("ℂ99.0%");
+	});
+	test("subscription shows S-prefixed cost (omp spend)", () => {
+		const row = formatSessionRow(theme, { ...base, used: 100, pct: 10, contextWindow: 200_000, subscription: true, sessionCost: 0.75, roundFlow: null });
+		expect(row).toContain("S0.75");
+		expect(row).not.toContain("$0.75");
+	});
+
 });
 
-describe("computeTokenFlow", () => {
-	test("accumulates session totals across assistant messages", () => {
-		const entries = [
-			{ type: "message", message: { role: "assistant", usage: { input: 1_000, output: 100, reasoning: 10, cost: { total: 0.1 } } } },
-			{ type: "message", message: { role: "assistant", usage: { input: 2_000, output: 300, reasoning: 30, cost: { total: 0.2 } } } },
-			{ type: "message", message: { role: "user", usage: { input: 9_999, output: 9_999, reasoning: 9_999 } } },
-		];
-		expect(computeTokenFlow(entries)).toEqual({
-			input: 3_000,
-			output: 400,
-			reasoning: 40,
-		});
+describe("addUsageToTotals (vendored official usage-totals)", () => {
+	test("accumulates five buckets and cost across entries", () => {
+		const totals = createUsageTotals();
+		addUsageToTotals(totals, { input: 1_000, output: 100, cacheRead: 500, cacheWrite: 50, cost: { total: 0.1 } });
+		addUsageToTotals(totals, { input: 2_000, output: 300, cacheRead: 700, cacheWrite: 0, cost: { total: 0.2 } });
+		expect(totals.input).toBe(3_000);
+		expect(totals.output).toBe(400);
+		expect(totals.cacheRead).toBe(1_200);
+		expect(totals.cacheWrite).toBe(50);
+		expect(totals.cost).toBeCloseTo(0.3, 10); // 官方原样浮点加法：0.1+0.2=0.30000000000000004
 	});
-	test("accumulates reasoning tokens as a subset of output", () => {
+	test("getUsageCostBreakdown groups by model and Tools/summaries", () => {
 		const entries = [
-			{ type: "message", message: { role: "assistant", usage: { input: 1_000, output: 400, reasoning: 276 } } },
+			{ type: "message", message: { role: "assistant", provider: "p1", model: "m1", usage: { input: 1_000, output: 100, cacheRead: 0, cacheWrite: 0, cost: { total: 0.5 } } } },
+			{ type: "compaction", usage: { input: 2_000, output: 200, cacheRead: 0, cacheWrite: 0, cost: { total: 0.25 } } },
 		];
-		expect(computeTokenFlow(entries)).toEqual({
-			input: 1_000,
-			output: 400,
-			reasoning: 276,
-		});
-	});
-	test("returns null without assistant usage", () => {
-		expect(computeTokenFlow([])).toBeNull();
-		expect(computeTokenFlow([{ type: "message", message: { role: "user" } }])).toBeNull();
+		expect(getUsageCostBreakdown(entries as never)).toEqual([
+			{ key: "p1/m1", cost: 0.5, tokens: 1_100 },
+			{ key: "Tools/summaries", cost: 0.25, tokens: 2_200 },
+		]);
 	});
 });
 
@@ -313,18 +288,6 @@ describe("thinkingLevelColor", () => {
 	});
 });
 
-describe("computeSessionCost", () => {
-	test("sums assistant message costs and skips other entries", () => {
-		const entries = [
-			{ type: "message", message: { role: "user", usage: { cost: { total: 5 } } } },
-			{ type: "message", message: { role: "assistant", usage: { cost: { total: 0.5 } } } },
-			{ type: "message", message: { role: "assistant", usage: { cost: { total: 0.25 } } } },
-			{ type: "other", message: { role: "assistant", usage: { cost: { total: 99 } } } },
-		];
-		expect(computeSessionCost(entries)).toBeCloseTo(0.75, 5);
-	});
-});
-
 describe("usageBar", () => {
 	test("renders full and empty cells", () => {
 		expect(usageBar(0)).toBe("░░░░░░░░");
@@ -385,6 +348,13 @@ describe("layoutFooter", () => {
 		const [top, bottom] = layoutFooter(120, segments, sessionRow, null, " │ ");
 		expect(bottom).toBe(`ctx: 53k 20%${" ".repeat(28)} │ ↑69k ↓29k │ 11 t/s`);
 		expect(pipeCols(top)).toEqual(pipeCols(bottom));
+	});
+	test("round-less session row stays left-aligned in the grid (空态不崩)", () => {
+		// 会话起始无轮级数据：sessionRow 只有 session 段，网格退化为左对齐单列，
+		// 不允许把空段拼成 `ctx ... │  │ `。
+		const [top, bottom] = layoutFooter(120, segments, "ctx: 53k 20% $0.00", null, " │ ");
+		expect(bottom).toBe("ctx: 53k 20% $0.00");
+		expect(top).toContain("│ ⎇ main");
 	});
 	test("left content longer than the band extends the grid", () => {
 		const long = "cwd: ~/abcdefghijklmnopqrstuvwxyz-0123456789";

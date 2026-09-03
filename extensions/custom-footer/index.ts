@@ -134,10 +134,12 @@ export default function (pi: ExtensionAPI) {
 		const m = event.message as AssistantMessage;
 		// message 级：本条消息完成——速率/ttfb 计算（tps 分子含 thinking）。
 		// user/toolResult 消息也触发 message_end，被 role 过滤。
-		readTps.onMessageEnd(ctx.sessionManager.getCwd(), m.usage?.output ?? 0);
-		// 会话聚合增量（O(1)）：flow/cost/cache-waste 只在消息完成时变化。
-		readStats.addMessage(m, {
-			find: (provider, modelId) => ctx.modelRegistry.find(provider, modelId),
+		readTps.onMessageEnd(ctx.sessionManager.getCwd(), m.usage);
+		// 会话聚合（flow/cost/cache-waste）快照：message_end 触发全量 rebuild（官方
+		// computeCacheWaste 语义），entries 替换（session_start / session_tree /
+		// session_compact）同样全量重建；render 只读快照。
+		readStats.rebuild(ctx.sessionManager.getEntries(), {
+			getModel: (provider, modelId) => ctx.modelRegistry.find(provider, modelId),
 		});
 	}, ["tui"]);
 
@@ -200,26 +202,38 @@ export default function (pi: ExtensionAPI) {
 						? ctx.modelRegistry?.getProviderDisplayName(model.provider) ?? model.id
 						: "no-model";
 					const thinking = pi.getThinkingLevel();
+					const sessionId = ctx.sessionManager.getSessionId();
+					const sessionTag =
+						sessionId && sessionId.length > 0
+							? `${theme.fg("accent", `◈${sessionId.slice(0, 8)}`)} ` // 会话锚：前 8 位，accent 色（omp session 段）
+							: "";
 					const segments = {
-						model: formatModel(theme, providerName, model?.id, thinking),
-						providerOnly: formatModel(theme, providerName, undefined, thinking),
+						model: `${sessionTag}${formatModel(theme, providerName, model?.id, thinking)}`,
+						providerOnly: `${sessionTag}${formatModel(theme, providerName, undefined, thinking)}`,
 						cwd: formatCwd(theme, cwd, homedir()),
 						branch: formatGitSegment(theme, readGitStatus(cwd)),
 					};
 					const usageProvider = detectUsageProvider(model?.provider);
 					const snapshot = readStats.getSnapshot();
+					// 订阅判定：claude/codex/kimi 内置订阅模型（detectUsageProvider
+					// 非 null）→ cost 前缀 S；代理/API-key 提供方为按量 `$`。
+					const subscription = usageProvider !== null;
 					const sessionRow = formatSessionRow(theme, {
 						used: usage?.tokens,
 						pct: usage?.percent,
 						contextWindow: usage?.contextWindow,
-						cost: snapshot.cost,
+						// 成本是 session 级（官方 usageTotals.cost 口径），与 ctx/miss 同段。
+						sessionCost: snapshot.cost,
+						subscription,
 						// 新轮清零后 last* 恒为轮内最近完成消息的值（进行中/完成态同源，无混搭）。
 						tps: readTps.getLast(cwd),
 						ttfbMs: readTps.getLastTtfbMs(cwd),
 						// 进行中：该轮经过时间（每秒增长）；完成态：最近一轮总时长。
 						currentElapsedMs: readTps.getCurrentElapsedMs(cwd),
 						turnMs: readTps.getLastTurnMs(cwd),
-						flow: snapshot.flow,
+						// ctx = session 级（官方 getContextUsage）；roundFlow = 最近一轮
+						// （与 tps 同轮同源，进行中实时 / settled 锁定）；waste = session 累计。
+						roundFlow: readTps.getRoundFlow(cwd),
 						waste: snapshot.waste.missCount > 0 ? snapshot.waste : null,
 					});
 
@@ -257,7 +271,7 @@ export default function (pi: ExtensionAPI) {
 
 	function rebuildStats(ctx: ExtensionContext) {
 		readStats.rebuild(ctx.sessionManager.getEntries(), {
-			find: (provider, modelId) => ctx.modelRegistry.find(provider, modelId),
+			getModel: (provider, modelId) => ctx.modelRegistry.find(provider, modelId),
 		});
 	}
 }

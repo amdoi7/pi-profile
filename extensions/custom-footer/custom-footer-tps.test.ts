@@ -8,7 +8,7 @@ describe("custom footer tps tracker (round rate + per-message ttfb)", () => {
 
     tracker.onAgentStart("/repo");
     nowMs = 2_000;
-    tracker.onMessageEnd("/repo", 100); // 实时源增量
+    tracker.onMessageEnd("/repo", { output: 100 }); // 实时源增量
     nowMs = 3_000;
     // 批量源:120 ≠ 增量 100(模拟 message_end 丢失/失败消息)→ 锁定值用批量源
     tracker.onAgentEnd("/repo", [{ role: "assistant", usage: { output: 120 } }]);
@@ -65,7 +65,7 @@ describe("custom footer tps tracker (round rate + per-message ttfb)", () => {
 
     tracker.onAgentStart("/repo");
     nowMs = 2_000;
-    tracker.onMessageEnd("/repo", 100);
+    tracker.onMessageEnd("/repo", { output: 100 });
     // 实时 tps = 100 / (2000-1000)ms = 100 t/s
     expect(tracker.getLast("/repo")).toBeCloseTo(100, 5);
 
@@ -80,7 +80,7 @@ describe("custom footer tps tracker (round rate + per-message ttfb)", () => {
 
     tracker.onAgentStart("/repo");
     nowMs = 2_000;
-    tracker.onMessageEnd("/repo", 100); // 无首块:分母是墙钟,仍累计
+    tracker.onMessageEnd("/repo", { output: 100 }); // 无首块:分母是墙钟,仍累计
     expect(tracker.getLast("/repo")).toBeCloseTo(100, 5);
   });
 
@@ -100,7 +100,7 @@ describe("custom footer tps tracker (round rate + per-message ttfb)", () => {
     nowMs = 4_000;
     tracker.onAgentStart("/repo");
     nowMs = 5_000;
-    tracker.onMessageEnd("/repo", 50);
+    tracker.onMessageEnd("/repo", { output: 50 });
     nowMs = 6_000;
     tracker.onAgentSettled("/repo");
     expect(tracker.getLast("/repo")).toBeCloseTo(50, 5); // 上轮值保留
@@ -116,7 +116,7 @@ describe("custom footer tps tracker (round rate + per-message ttfb)", () => {
     nowMs = 3_000;
     tracker.onFirstChunk("/repo");
     nowMs = 4_000;
-    tracker.onMessageEnd("/repo", 300);
+    tracker.onMessageEnd("/repo", { output: 300 });
     expect(tracker.getLastTtfbMs("/repo")).toBe(2_000); // 3000-1000
 
     // 消息2:turn_start 5000,首块 5500,end 6000
@@ -125,7 +125,7 @@ describe("custom footer tps tracker (round rate + per-message ttfb)", () => {
     nowMs = 5_500;
     tracker.onFirstChunk("/repo");
     nowMs = 6_000;
-    tracker.onMessageEnd("/repo", 500);
+    tracker.onMessageEnd("/repo", { output: 500 });
     expect(tracker.getLastTtfbMs("/repo")).toBe(500); // 5500-5000,非轮起点
   });
 
@@ -152,13 +152,13 @@ describe("custom footer tps tracker (round rate + per-message ttfb)", () => {
     nowMs = 3_000;
     tracker.onFirstChunk("/repo");
     nowMs = 4_000;
-    tracker.onMessageEnd("/repo", 100);
+    tracker.onMessageEnd("/repo", { output: 100 });
     expect(tracker.getLastTtfbMs("/repo")).toBe(2_000);
 
     nowMs = 5_000;
     tracker.onTurnStart("/repo");
     nowMs = 6_000;
-    tracker.onMessageEnd("/repo", 100); // 无首块:ttfb 不更新
+    tracker.onMessageEnd("/repo", { output: 100 }); // 无首块:ttfb 不更新
     expect(tracker.getLastTtfbMs("/repo")).toBe(2_000);
   });
 
@@ -179,7 +179,7 @@ describe("custom footer tps tracker (round rate + per-message ttfb)", () => {
     nowMs = 5_500;
     tracker.onFirstChunk("/repo");
     nowMs = 6_000;
-    tracker.onMessageEnd("/repo", 100);
+    tracker.onMessageEnd("/repo", { output: 100 });
     nowMs = 7_000;
     tracker.onAgentSettled("/repo");
 
@@ -223,7 +223,7 @@ describe("custom footer tps tracker (round rate + per-message ttfb)", () => {
 
     tracker.onAgentStart("/repo");
     nowMs = 2_000;
-    tracker.onMessageEnd("/repo", 0);
+    tracker.onMessageEnd("/repo", { output: 0 });
     nowMs = 3_000;
     tracker.onAgentSettled("/repo");
 
@@ -239,7 +239,7 @@ describe("custom footer tps tracker (round rate + per-message ttfb)", () => {
     tracker.onAgentStart("/repo");
     tracker.onTurnStart("/repo");
     nowMs = 2_000;
-    tracker.onMessageEnd("/repo", 50);
+    tracker.onMessageEnd("/repo", { output: 50 });
     nowMs = 3_000;
     tracker.onAgentSettled("/repo");
 
@@ -307,7 +307,7 @@ describe("custom footer tps tracker (round rate + per-message ttfb)", () => {
 
     tracker.onAgentStart("/repo");
     nowMs = 2_000;
-    tracker.onMessageEnd("/repo", 100);
+    tracker.onMessageEnd("/repo", { output: 100 });
     nowMs = 3_000;
     tracker.onAgentStart("/repo"); // continue:不重置轮内值
     expect(tracker.getLast("/repo")).toBeCloseTo(50, 5);
@@ -324,7 +324,7 @@ describe("custom footer tps tracker (round rate + per-message ttfb)", () => {
     tracker.onFirstChunk("/repo"); // 流式:节流
     expect(changes).toEqual(["live", "live"]);
     nowMs = 2_000;
-    tracker.onMessageEnd("/repo", 100); // 消息完成:立即
+    tracker.onMessageEnd("/repo", { output: 100 }); // 消息完成:立即
     expect(changes).toEqual(["live", "live", "commit"]);
     nowMs = 3_000;
     tracker.onAgentEnd("/repo", [{ role: "assistant", usage: { output: 100 } }]); // 段批量:立即
@@ -358,5 +358,67 @@ describe("custom footer tps tracker (round rate + per-message ttfb)", () => {
     tracker.onAgentStart("/repo");
     tracker.onAgentSettled("/repo");
     expect(changes).toEqual([]);
+  });
+
+  describe("getRoundFlow (round-level ↑↓τℂ data source)", () => {
+    test("live round returns the incremental (message_end) flow", () => {
+      let nowMs = 1_000;
+      const tracker = createTpsTracker({ getNowMs: () => nowMs });
+
+      tracker.onAgentStart("/repo");
+      tracker.onMessageEnd("/repo", { input: 2_000, output: 400, reasoning: 150, cacheRead: 50_000 });
+
+      expect(tracker.getRoundFlow("/repo")).toEqual({
+        input: 2_000, output: 400, reasoning: 150, cacheRead: 50_000, cacheWrite: 0,
+      });
+    });
+
+    test("settled round locks the batch (agent_end) flow", () => {
+      let nowMs = 1_000;
+      const tracker = createTpsTracker({ getNowMs: () => nowMs });
+
+      tracker.onAgentStart("/repo");
+      // 实时源与批量源不一致时,锁定值取批量源(官方消息源)。
+      tracker.onMessageEnd("/repo", { input: 100, output: 50 });
+      tracker.onAgentEnd("/repo", [
+        { role: "assistant", usage: { input: 5_000, output: 300, reasoning: 200, cacheRead: 90_000, cacheWrite: 1_000 } },
+      ]);
+      tracker.onAgentSettled("/repo");
+
+      expect(tracker.getRoundFlow("/repo")).toEqual({
+        input: 5_000, output: 300, reasoning: 200, cacheRead: 90_000, cacheWrite: 1_000,
+      });
+    });
+
+    test("batch flow accumulates across continue segments", () => {
+      let nowMs = 1_000;
+      const tracker = createTpsTracker({ getNowMs: () => nowMs });
+
+      tracker.onAgentStart("/repo");
+      tracker.onAgentEnd("/repo", [{ role: "assistant", usage: { input: 1_000, output: 100 } }]);
+      tracker.onAgentEnd("/repo", [{ role: "assistant", usage: { input: 2_000, output: 50 } }]);
+      tracker.onAgentSettled("/repo");
+
+      expect(tracker.getRoundFlow("/repo")).toMatchObject({ input: 3_000, output: 150 });
+    });
+
+    test("live round without data falls back to the previous locked round", () => {
+      let nowMs = 1_000;
+      const tracker = createTpsTracker({ getNowMs: () => nowMs });
+
+      tracker.onAgentStart("/repo");
+      tracker.onAgentEnd("/repo", [{ role: "assistant", usage: { input: 5_000, output: 300 } }]);
+      tracker.onAgentSettled("/repo");
+      const locked = tracker.getRoundFlow("/repo");
+
+      // 新轮开始、尚无消息完成:回退上一轮锁定值。
+      tracker.onAgentStart("/repo");
+      expect(tracker.getRoundFlow("/repo")).toEqual(locked);
+    });
+
+    test("returns null without any round data", () => {
+      const tracker = createTpsTracker({ getNowMs: () => 1_000 });
+      expect(tracker.getRoundFlow("/repo")).toBeNull();
+    });
   });
 });

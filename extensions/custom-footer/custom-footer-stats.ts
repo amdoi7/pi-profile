@@ -1,52 +1,46 @@
 /**
- * Session-level aggregate stats (token flow, cost, cache waste) with
- * event-driven incremental updates.
+ * Session-level aggregate stats (token flow, cost, cache waste).
  *
- * 架构：render 不再全量扫 entries（getEntries 本身是 O(n) filter + 三次 O(n)
- * 遍历，流式期间每秒 render 只有"本轮时长"在变）。改为：
- * - `message_end`（assistant）→ addMessage：O(1) 增量（含 cache-waste 的
- *   相邻消息对基线 prev）。
- * - entries 被替换（session_start / session_tree / session_compact，三个
- *   事件在 pi 中均在 entries 更新后触发）→ rebuild：O(n) 全量，唯一 O(n) 点。
- * - render → getSnapshot：O(1) 读。
+ * 架构对齐官方：只有一个更新路径 = `rebuild(entries)`，内部全部走官方算法
+ * （computeCacheWaste 全量 + 五桶累加）。message_end / session_start /
+ * session_tree / session_compact 都触发 rebuild；render 只读快照（O(1)）。
  *
- * 增量与全量共用 format.ts 的 detectMiss/asPreviousRequest 纯函数，算法
- * 逐条等价（见 custom-footer-stats.test.ts 的等价性用例）。
+ * 不保留自造增量：官方 interactive-mode 本身就是每次需要时 computeCacheWaste
+ * 全量（O(n)），本地 O(1) 增量是对官方语义的平行复刻——复刻即漂移源
+ * （2026-08-27 本地复刻丢了 idleMs/modelChanged 归因的真实教训）。
  */
 
-import type { AssistantMessage } from "@earendil-works/pi-ai";
 import {
-  asPreviousRequest,
   computeCacheWaste,
-  detectMiss,
-  type CacheEntry,
-  type CacheWaste,
-  type CacheWasteModels,
-  type PrevRequest,
-} from "./custom-footer-cache.ts";
-import {
-	computeSessionCost,
-	computeTokenFlow,
-	type TokenFlow,
-} from "./custom-footer-format.ts";
+  type CacheWasteTotals,
+  type ModelPriceSource,
+} from "./vendor/cache-stats.ts";
+import { addUsageToTotals, createUsageTotals, type UsageTotals } from "./vendor/usage-totals.ts";
 
-/** 宽 usage 形状：pi-ai Usage 与 cache-waste 的 CacheEntry 共用子集。 */
-type UsageLike = NonNullable<NonNullable<CacheEntry["message"]>["usage"]>;
+/**
+ * 官方 cache-stats 的价格源形状是 { getModel(provider, modelId) }；调用方
+ * （index.ts）手里是 modelRegistry（其 find 即 runtime.getModel 的包装），
+ * 适配器只转字段名，不改变语义。
+ */
+export type CacheWasteModels = ModelPriceSource;
+/** 缓存浪费汇总 = 官方 CacheWasteTotals（missedTokens/missedCost/missCount）。 */
+export type CacheWaste = CacheWasteTotals;
+
+export type RebuildEntries = import("@earendil-works/pi-coding-agent").SessionEntry[];
 
 export type SessionStats = {
-  flow: TokenFlow | null;
+  /** 会话累计 token 流（官方 usage-totals 五桶，无 reasoning——官方无此桶）。 */
+  flow: UsageTotals | null;
   cost: number;
   waste: CacheWaste;
 };
 
 export type SessionStatsHandle = {
-  /** assistant 消息完成（message_end）：O(1) 增量。 */
-  addMessage(message: AssistantMessage, models: CacheWasteModels): void;
-  /** entries 被替换（session_start / session_tree / session_compact）：O(n) 全量重建。 */
-  rebuild(entries: readonly CacheEntry[], models: CacheWasteModels): void;
+  /** entries 被替换/新增（message_end / session_start / session_tree / session_compact）：O(n) 官方全量。 */
+  rebuild(entries: RebuildEntries, models: CacheWasteModels): void;
   /** 当前快照（O(1) 读）。 */
   getSnapshot(): SessionStats;
-  /** 订阅快照变化（渲染 hook，commit 语义）：addMessage/rebuild 后触发。返回退订。 */
+  /** 订阅快照变化（渲染 hook，commit 语义）。返回退订。 */
   onChange(callback: () => void): () => void;
 };
 
@@ -55,64 +49,42 @@ function emptyWaste(): CacheWaste {
 }
 
 export function createSessionStats(): SessionStatsHandle {
-  let flow: TokenFlow = { input: 0, output: 0, reasoning: 0 };
+  let flow: UsageTotals = createUsageTotals();
   let cost = 0;
   let waste = emptyWaste();
-  /** cache-waste 相邻消息对基线；compaction/branch_summary 时重置。 */
-  let prev: PrevRequest | undefined;
   const changeCallbacks = new Set<() => void>();
   const notify = () => {
     for (const callback of changeCallbacks) callback();
   };
 
   return {
-    addMessage(message, models) {
-      const usage = message.usage;
-      if (usage) {
-        accumulateUsage(usage);
-      }
-      const entry = toCacheEntry(message);
-      const miss = detectMiss(prev, entry, models);
-      if (miss) {
-        waste.missedTokens += miss.missedTokens;
-        waste.missedCost += miss.missedCost;
-        waste.missCount += 1;
-      }
-      prev = asPreviousRequest(entry, prev?.reportedCache ?? false) ?? prev;
-      notify();
-    },
-    rebuild(entries, models) {
-      flow = { input: 0, output: 0, reasoning: 0 };
-      cost = 0;
-      waste = emptyWaste();
-      // 循环内使用局部 prev 链，结束再同步到闭包变量
-      // （TS 对捕获变量在循环内的自引用赋值会推断为 never）。
-      let localPrev: PrevRequest | undefined;
+    rebuild(entries: RebuildEntries, models) {
+      // 官方全量：与官方 footer.js 完全同构——遍历全部条目，assistant 消息 +
+      // 带 usage 的 toolResult 消息 + branch_summary/compaction 条目（usage 挂在
+      // entry 上）都入官方五桶；compaction 摘要调用也有 token/cost，漏计是低估。
+      // 不维护自研加法：官方 usage-totals 即加法本身（vendor/usage-totals.ts）。
+      const totals = createUsageTotals();
       for (const entry of entries) {
-        if (entry.type === "compaction" || entry.type === "branch_summary") {
-          localPrev = undefined;
-          continue;
+        if (entry.type === "message" && entry.message.role === "assistant") {
+          addUsageToTotals(totals, entry.message.usage);
+        } else if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.usage) {
+          addUsageToTotals(totals, entry.message.usage);
+        } else if ((entry.type === "branch_summary" || entry.type === "compaction") && entry.usage) {
+          addUsageToTotals(totals, entry.usage);
         }
-        if (entry.type !== "message" || entry.message?.role !== "assistant") continue;
-        const usage = entry.message.usage;
-        if (usage) {
-          accumulateUsage(usage);
-        }
-        const miss = detectMiss(localPrev, entry, models);
-        if (miss) {
-          waste.missedTokens += miss.missedTokens;
-          waste.missedCost += miss.missedCost;
-          waste.missCount += 1;
-        }
-        localPrev = asPreviousRequest(entry, localPrev?.reportedCache ?? false) ?? localPrev;
       }
-      prev = localPrev;
+      flow = totals;
+      cost = totals.cost;
+      waste = computeCacheWaste(entries, models);
       notify();
     },
     getSnapshot() {
       return {
         flow:
-          flow.input === 0 && flow.output === 0 && flow.reasoning === 0 ? null : flow,
+          flow.input === 0 && flow.output === 0
+            && flow.cacheRead === 0 && flow.cacheWrite === 0
+            ? null
+            : flow,
         cost,
         waste,
       };
@@ -124,28 +96,10 @@ export function createSessionStats(): SessionStatsHandle {
       };
     },
   };
-
-  function accumulateUsage(usage: UsageLike): void {
-    if (typeof usage.input === "number") flow.input += usage.input;
-    if (typeof usage.output === "number") flow.output += usage.output;
-    if (typeof usage.reasoning === "number") flow.reasoning += usage.reasoning;
-    cost += usage.cost?.total ?? 0;
-  }
 }
 
-/** message_end 的 assistant 消息 → cache-waste 全量算法的 entry 形状。 */
-function toCacheEntry(message: AssistantMessage): CacheEntry {
-  return {
-    type: "message",
-    message: {
-      role: message.role,
-      provider: message.provider,
-      model: message.model,
-      timestamp: message.timestamp,
-      usage: message.usage,
-    },
-  };
-}
-
-// 供等价性测试使用：全量结果与增量结果对齐的口径。
-export { computeCacheWaste, computeSessionCost, computeTokenFlow };
+// 供等价性测试使用：官方口径的直接入口（cache-waste 与五桶加法均官方 vendored）。
+export { computeCacheWaste } from "./vendor/cache-stats.ts";
+// 官方常量：TTL（测试/诊断引用；NOISE_FLOOR 未由官方导出）。
+export { CACHE_TTL_MS } from "./vendor/cache-stats.ts";
+export { createUsageTotals, addUsageToTotals, type UsageTotals } from "./vendor/usage-totals.ts";

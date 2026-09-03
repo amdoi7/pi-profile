@@ -36,11 +36,33 @@ export type TpsTrackerDeps = {
 /** 变化语义：live = 流式/等待期（节流渲染），commit = 完成态（立即渲染）。 */
 export type TpsChange = "live" | "commit";
 
-/** agent_end 批量源的消息形状:只用 role 与 usage.output。 */
+/** agent_end 批量源的消息形状:只用 role 与 usage 五桶 + cost。 */
 export type TpsBatchMessage = {
   role?: string;
-  usage?: { output?: number };
+  usage?: UsageLike;
 };
+
+/** usage 窄视图（pi Usage 子集）：轮级 flow 聚合只取四桶（cost 是 session 级，不进轮）。 */
+export type UsageLike = {
+  input?: number;
+  output?: number;
+  reasoning?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+};
+
+/** 最近一轮（用户消息 → 不再输出）的 token flow，footer ↑↓τℂ 段的数据源。 */
+export type RoundFlow = {
+  input: number;
+  output: number;
+  reasoning: number;
+  cacheRead: number;
+  cacheWrite: number;
+};
+
+export function emptyRoundFlow(): RoundFlow {
+  return { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 };
+}
 
 export type TpsTracker = {
   /** 一轮（用户消息 → 不再输出）开始：本轮起点；进行中时（continue）幂等不重置。 */
@@ -54,9 +76,9 @@ export type TpsTracker = {
   /** 本条消息首个响应块到达（幂等，后续块不重置）。 */
   onFirstChunk(cwd: string): void;
   /**
-   * 一条 assistant 消息完成:output(含 thinking)累加实时源,记录 TTFB。
+   * 一条 assistant 消息完成:usage 五桶 + cost 累加实时源,记录 TTFB。
    */
-  onMessageEnd(cwd: string, outputTokens: number): void;
+  onMessageEnd(cwd: string, usage: UsageLike | undefined): void;
   /** 最近完成轮的速率（t/s，含 thinking，墙钟口径）；进行中返回实时值。 */
   getLast(cwd: string): number | null;
   /** 最近完成一轮的首字时间（TTFB，毫秒），或 null。 */
@@ -65,6 +87,12 @@ export type TpsTracker = {
   getLastTurnMs(cwd: string): number | null;
   /** 进行中一轮的经过时间（毫秒，每秒增长）；无进行中的轮为 null。 */
   getCurrentElapsedMs(cwd: string): number | null;
+  /**
+   * 最近一轮的 flow（↑↓τℂ 段数据源，与 tps 同轮同源）：进行中返回实时源
+   * （message_end 增量），settled 后返回锁定源（agent_end 批量，官方消息源）。
+   * 无任何轮数据时返回 null（footer 隐藏 ↑↓τℂ 段）。
+   */
+  getRoundFlow(cwd: string): RoundFlow | null;
   /** 订阅数据变化（渲染 hook）：live 节流、commit 立即。返回退订。 */
   onChange(callback: (change: TpsChange) => void): () => void;
 };
@@ -77,9 +105,11 @@ type TpsEntry = {
   /** 本条消息的首个响应块（message_end 后重置）；null = 本条消息尚无输出。 */
   messageFirstChunkMs: number | null;
   /** 实时源：message_end 增量累计（进行中显示）。 */
-  roundLiveOutput: number;
+  roundLiveFlow: RoundFlow;
   /** 批量源：agent_end 段批量累计（settled 锁定）。 */
-  roundBatchOutput: number;
+  roundBatchFlow: RoundFlow;
+  /** 最近完成轮的锁定 flow（跨轮保留，新轮完成时替换）。 */
+  lastRoundFlow: RoundFlow | null;
   lastTurnMs: number | null;
   lastTokPerSec: number | null;
   lastTtfbMs: number | null;
@@ -97,8 +127,9 @@ export function createTpsTracker(deps: TpsTrackerDeps = {}): TpsTracker {
     agentStartMs: null,
     turnStartMs: null,
     messageFirstChunkMs: null,
-    roundLiveOutput: 0,
-    roundBatchOutput: 0,
+    roundLiveFlow: emptyRoundFlow(),
+    roundBatchFlow: emptyRoundFlow(),
+    lastRoundFlow: previous?.lastRoundFlow ?? null,
     lastTurnMs: previous?.lastTurnMs ?? null,
     lastTokPerSec: previous?.lastTokPerSec ?? null,
     lastTtfbMs: previous?.lastTtfbMs ?? null,
@@ -113,8 +144,8 @@ export function createTpsTracker(deps: TpsTrackerDeps = {}): TpsTracker {
         entry.turnStartMs = null;
         entry.messageFirstChunkMs = null;
         // 新轮：双源归零（continue 不清零）。
-        entry.roundLiveOutput = 0;
-        entry.roundBatchOutput = 0;
+        entry.roundLiveFlow = emptyRoundFlow();
+        entry.roundBatchFlow = emptyRoundFlow();
         notify("live");
       }
       entries.set(cwd, entry);
@@ -124,11 +155,16 @@ export function createTpsTracker(deps: TpsTrackerDeps = {}): TpsTracker {
       let batchOutput = 0;
       for (const message of messages) {
         if (message.role !== "assistant") continue;
-        const output = message.usage?.output;
-        if (typeof output === "number" && output > 0) batchOutput += output;
+        const usage = message.usage;
+        if (!usage) continue;
+        batchOutput += usage.output ?? 0;
+        entry.roundBatchFlow.input += usage.input ?? 0;
+        entry.roundBatchFlow.output += usage.output ?? 0;
+        entry.roundBatchFlow.reasoning += usage.reasoning ?? 0;
+        entry.roundBatchFlow.cacheRead += usage.cacheRead ?? 0;
+        entry.roundBatchFlow.cacheWrite += usage.cacheWrite ?? 0;
       }
       if (batchOutput > 0) {
-        entry.roundBatchOutput += batchOutput;
         entries.set(cwd, entry);
         notify("commit");
       }
@@ -138,9 +174,13 @@ export function createTpsTracker(deps: TpsTrackerDeps = {}): TpsTracker {
       if (!entry || entry.agentStartMs === null) return;
       const nowMs = getNowMs();
       entry.lastTurnMs = nowMs - entry.agentStartMs;
-      // 锁定值用批量源（官方消息源，含失败消息 output）；无批量则不覆盖。
-      if (entry.roundBatchOutput > 0) {
-        entry.lastTokPerSec = (entry.roundBatchOutput / (nowMs - entry.agentStartMs)) * 1000;
+      // 锁定 flow：批量源（官方消息源，含失败消息 usage）优先，无批量回退实时源。
+      const batchOutput = entry.roundBatchFlow.output;
+      if (batchOutput > 0) {
+        entry.lastTokPerSec = (batchOutput / (nowMs - entry.agentStartMs)) * 1000;
+        entry.lastRoundFlow = { ...entry.roundBatchFlow };
+      } else if (entry.roundLiveFlow.output > 0) {
+        entry.lastRoundFlow = { ...entry.roundLiveFlow };
       }
       // 本轮结束：清空起点——实时值变 null，显示回退固定总时长。
       entry.agentStartMs = null;
@@ -166,7 +206,7 @@ export function createTpsTracker(deps: TpsTrackerDeps = {}): TpsTracker {
       }
       entries.set(cwd, entry);
     },
-    onMessageEnd(cwd, outputTokens) {
+    onMessageEnd(cwd, usage) {
       const entry = entries.get(cwd) ?? newEntry(undefined);
       const nowMs = getNowMs();
       const firstChunkMs = entry.messageFirstChunkMs;
@@ -178,21 +218,37 @@ export function createTpsTracker(deps: TpsTrackerDeps = {}): TpsTracker {
           entry.lastTtfbMs = firstChunkMs - startMs;
         }
       }
-      // 实时源：分子含 thinking——output 是服务端实际生成的 tokens（吞吐口径）。
-      if (outputTokens > 0) {
-        entry.roundLiveOutput += outputTokens;
+      // 实时源：四桶全量累加（output 含 thinking——服务端实际生成 tokens）。
+      const outputTokens = usage?.output ?? 0;
+      if (outputTokens > 0 || (usage?.input ?? 0) > 0 || (usage?.cacheRead ?? 0) > 0) {
+        entry.roundLiveFlow.input += usage?.input ?? 0;
+        entry.roundLiveFlow.output += outputTokens;
+        entry.roundLiveFlow.reasoning += usage?.reasoning ?? 0;
+        entry.roundLiveFlow.cacheRead += usage?.cacheRead ?? 0;
+        entry.roundLiveFlow.cacheWrite += usage?.cacheWrite ?? 0;
         notify("commit");
       }
       entries.set(cwd, entry);
+    },
+    getRoundFlow(cwd) {
+      const entry = entries.get(cwd);
+      if (!entry) return null;
+      // 进行中：实时源（message_end 增量，含 thinking）；无实时数据回退上一轮锁定值。
+      // 返回拷贝——roundLiveFlow 会被后续 message_end 突变，渲染读到一半的值。
+      if (entry.agentStartMs !== null) {
+        if (entry.roundLiveFlow.output > 0) return { ...entry.roundLiveFlow };
+        return entry.lastRoundFlow ? { ...entry.lastRoundFlow } : null;
+      }
+      return entry.lastRoundFlow ? { ...entry.lastRoundFlow } : null;
     },
     getLast(cwd) {
       const entry = entries.get(cwd);
       if (!entry) return null;
       // 进行中：实时值 = 实时源累计 / 当前经过时间；无累计则回退上一轮锁定值。
       if (entry.agentStartMs !== null) {
-        if (entry.roundLiveOutput > 0) {
+        if (entry.roundLiveFlow.output > 0) {
           const elapsedMs = getNowMs() - entry.agentStartMs;
-          if (elapsedMs > 0) return (entry.roundLiveOutput / elapsedMs) * 1000;
+          if (elapsedMs > 0) return (entry.roundLiveFlow.output / elapsedMs) * 1000;
         }
         return entry.lastTokPerSec;
       }

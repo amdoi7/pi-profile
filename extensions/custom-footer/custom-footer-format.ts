@@ -7,7 +7,8 @@
  */
 
 import type { GitStatusSnapshot } from "./custom-footer-git.ts";
-export type { CacheWaste } from "./custom-footer-cache.ts";
+import type { CacheWaste } from "./custom-footer-stats.ts";
+import type { RoundFlow } from "./custom-footer-tps.ts";
 
 /** Foreground color names actually used by the footer (subset of pi theme). */
 export type FooterColor =
@@ -16,6 +17,7 @@ export type FooterColor =
   | "warning"
   | "error"
   | "success"
+  | "accent"
   | "customMessageLabel"
   | "thinkingOff"
   | "thinkingMinimal"
@@ -42,13 +44,21 @@ export function formatCost(cost: number): string {
   return `$${cost.toFixed(2)}`;
 }
 
+/** 订阅前缀形式（omp spend）：`S12.34`——订阅账单与按量 `$` 区分。 */
+export function formatSubscriptionCost(cost: number): string {
+  return `S${cost.toFixed(2)}`;
+}
+
 // --- cache waste ------------------------------------------------------------
 
 /**
- * 缓存失效汇总：`miss 143k (2×)` — 主指标是本应命中却被重新计费的
- * token 总量，括号内为失效次数；额外成本 ≥1 分时追加金额。
- * 词汇与 pi 内部 computeCacheWaste / Cache miss 对齐。
+ * 缓存浪费段的最低展示成本（美元）：低于此金额不值得占底栏空间。
+ * 2026-08-27 实测过载示例 `miss 293k (97×) (+$0.02)`——97 次失效只花 2 分钱，
+ * 是低频噪音而非信号；5 分以上才是需要人留意的真浪费。
  */
+export const MISS_COST_DISPLAY_THRESHOLD = 0.05;
+
+/** `miss 143k (2×)` — 缓存浪费汇总（omp/官方 cache-stats 口径）。 */
 export function formatCacheWaste(theme: FooterTheme, waste: CacheWaste): string {
   let text = theme.fg("warning", `miss ${formatCompact(waste.missedTokens)} (${waste.missCount}×)`);
   if (waste.missedCost >= 0.01) {
@@ -60,23 +70,65 @@ export function formatCacheWaste(theme: FooterTheme, waste: CacheWaste): string 
 // --- context usage ----------------------------------------------------------
 
 /**
- * Color for the context percent, gradient like usageColor:
- * <70 green, 70-84 orange, >=85 red (or 400k+ tokens, the tripwire
- * beyond normal session sizes).
+ * Context-usage 四档阈值（借鉴 omp status-line context-thresholds，2026-08-27）:
+ * percent 阈值与绝对 token 阈值取严格者——小窗口模型（128k）在 150k 绝对阈值
+ * 下提前一档告警,而不是印象式百分比。
+ *
+ * editorial:normal<50%（或 150k token;两者取先到者）→ warning;
+ * warning→accent(purple,pi 主题无 purple,映射 accent);accent→error。
+ *
+ * 无窗口信息时(used 未知/窗口 0)退化为 percent-only;无上下文数据返回 muted。
  */
-export function contextColor(pct: number | undefined, used: number | undefined): FooterColor {
-  const hasPct = typeof pct === "number";
-  const hasUsed = typeof used === "number";
-  if (!hasPct && !hasUsed) return "muted";
-  if ((hasPct && pct >= 85) || (hasUsed && used >= 400_000)) return "error";
-  if (hasPct && pct >= 70) return "warning";
-  return "success";
+export type ContextUsageLevel = "normal" | "warning" | "accent" | "error";
+
+const CONTEXT_WARNING_PERCENT = 50;
+const CONTEXT_WARNING_TOKENS = 150_000;
+const CONTEXT_ACCENT_PERCENT = 70;
+const CONTEXT_ACCENT_TOKENS = 270_000;
+const CONTEXT_ERROR_PERCENT = 90;
+const CONTEXT_ERROR_TOKENS = 500_000;
+
+function reachesThreshold(
+  pct: number,
+  window: number,
+  pctThreshold: number,
+  tokenThreshold: number,
+): boolean {
+  if (window > 0) {
+    // 双阈值取严格：绝对 token 阈值换算成 percent 后与 percent 阈值比小。
+    const tokenPctThreshold = (tokenThreshold / window) * 100;
+    return pct >= Math.min(pctThreshold, tokenPctThreshold);
+  }
+  return pct >= pctThreshold;
+}
+
+export function getContextUsageLevel(pct: number | undefined, window: number): ContextUsageLevel {
+  if (typeof pct !== "number" || !Number.isFinite(pct) || pct <= 0) return "normal";
+  if (reachesThreshold(pct, window, CONTEXT_ERROR_PERCENT, CONTEXT_ERROR_TOKENS)) return "error";
+  if (reachesThreshold(pct, window, CONTEXT_ACCENT_PERCENT, CONTEXT_ACCENT_TOKENS)) return "accent";
+  if (reachesThreshold(pct, window, CONTEXT_WARNING_PERCENT, CONTEXT_WARNING_TOKENS)) return "warning";
+  return "normal";
+}
+
+export function contextColor(pct: number | undefined, used: number | undefined, contextWindow: number): FooterColor {
+  if (typeof pct !== "number" && typeof used !== "number") return "muted";
+  // pct 缺失但有 used(绝对 token)时,折算成窗口百分比参与同一双阈值判定。
+  let effective = pct;
+  if (typeof pct !== "number" && typeof used === "number" && contextWindow > 0) {
+    effective = (used / contextWindow) * 100;
+  }
+  const level = getContextUsageLevel(effective, contextWindow);
+  return level === "error" ? "error" : level === "accent" ? "accent" : level === "warning" ? "warning" : "success";
 }
 
 /**
- * Session row: context usage, token flow, cache waste, cost and throughput.
- * This is the left column of the footer's second row (`ctx: 153k 15% │ ↑950k
- * ↓487k R201.9M W0 │ miss2× 236k │ $0.87`).
+ * Session row: context usage, token flow, cache hit, cache waste, cost and
+ * throughput. 视角分离（2026-09 用户拍板）：前端是 session 级（ctx 用量、
+ * 累计成本 $、缓存浪费 miss——官方 getContextUsage / usageTotals.cost /
+ * computeCacheWaste 口径），中段是最近一轮的 token 流（↑↓ τ ℂ——与 tps
+ * tracker 同轮同源，进行中实时 / settled 锁定），尾部是同一轮的动态指标
+ * （t/s ttfb 本轮时长）。不混搭——官方 footer 把 session 累计的 ↑↓ 和最后
+ * 一条消息的 CH 并排，正是视角漂移的来源。
  */
 export function formatSessionRow(
   theme: FooterTheme,
@@ -85,7 +137,12 @@ export function formatSessionRow(
     pct: number | undefined;
     /** 上下文窗口容量：`443k/1M`（用量/容量），compact 决策直接可读。 */
     contextWindow: number;
-    cost: number;
+    /** 会话累计成本（官方 usageTotals.cost 口径，含 toolResult/compaction 条目）。 */
+    sessionCost: number;
+    /** 订阅模型（claude/codex/kimi）：cost 前缀 S（see omp spend）。 */
+    subscription: boolean;
+    /** 最近一轮的 token flow：`↑3k ↓400 (τ69%) ℂ99%`，进行中实时、完成态锁定。 */
+    roundFlow: RoundFlow | null;
     /** 最近完成一轮（用户消息 → 不再输出）的平均吞吐；进行中为 null。 */
     tps: number | null;
     /** 进行中一轮的经过时间（毫秒）：`本轮12s`，每秒增长。 */
@@ -94,29 +151,41 @@ export function formatSessionRow(
     turnMs: number | null;
     /** 最近一轮的首字时间（TTFB，毫秒）：`ttfb1.2s`。 */
     ttfbMs: number | null;
-    flow: TokenFlow | null;
+    /** 会话累计缓存浪费（session 级）。 */
     waste: CacheWaste | null;
   },
 ): string {
   const hasPct = typeof opts.pct === "number";
   const hasUsed = typeof opts.used === "number";
-  const color = contextColor(opts.pct, opts.used);
+  const color = contextColor(opts.pct, opts.used, opts.contextWindow);
   const usedText = hasUsed
-    ? `${formatCompact(opts.used)}/${formatCompact(opts.contextWindow)}`
+    ? `${formatCompact(opts.used as number)}/${formatCompact(opts.contextWindow)}`
     : "?";
-  const rows = [
-    `${theme.fg("muted", "ctx:")} ${theme.fg("text", usedText)} ${theme.fg(color, hasPct ? `${opts.pct.toFixed(0)}%` : "?")}`,
+  const pctText = hasPct ? `${(opts.pct as number).toFixed(0)}%` : "?";
+  // 会话级段（前端）：ctx 用量 + 累计成本 + miss——都是 session 累计，同段同源。
+  const sessionParts = [
+    `${theme.fg("muted", "ctx:")} ${theme.fg("text", usedText)} ${theme.fg(color, pctText)}`,
   ];
-  // 会话累计段：token 流 + τ 占比 + miss（浪费）+ 账单——都是会话级，同段。
-  const sessionParts: string[] = [];
-  if (opts.flow !== null) sessionParts.push(formatTokenFlow(theme, opts.flow));
-  if (opts.waste !== null && opts.waste.missCount > 0) {
+  if (opts.waste !== null && opts.waste.missCount > 0 && opts.waste.missedCost >= MISS_COST_DISPLAY_THRESHOLD) {
     sessionParts.push(formatCacheWaste(theme, opts.waste));
   }
-  sessionParts.push(theme.fg("muted", formatCost(opts.cost)));
-  rows.push(sessionParts.join(" "));
-  // 本轮动态段：tps/ttfb/本轮时长。tps/ttfb 恒为最近完成消息的值（跨轮保留，
-  // 新消息完成时替换）；本轮进行中显示实时经过，完成态显示锁定总时长。
+  sessionParts.push(
+    theme.fg("muted", opts.subscription ? formatSubscriptionCost(opts.sessionCost) : formatCost(opts.sessionCost)),
+  );
+  const rows = [sessionParts.join(" ")];
+  // 轮级段（中）：↑↓ (τ%) ℂ——最近一轮的聚合（不是最后一条消息，也不是 session 累计）。
+  const roundParts: string[] = [];
+  if (opts.roundFlow !== null && hasFlowTokens(opts.roundFlow)) {
+    roundParts.push(formatTokenFlow(theme, opts.roundFlow));
+    // 缓存命中率（官方 latestCacheHitRate 口径的轮级化）：rate = cacheRead /
+    // (cacheRead + cacheWrite + input)，分母含 uncached input。
+    const hitRate = cacheHitRate(opts.roundFlow);
+    if (hitRate !== null) roundParts.push(formatCacheHit(theme, hitRate));
+  }
+  if (roundParts.length > 0) rows.push(roundParts.join(" "));
+  // 轮动态段（尾）：tps/ttfb/本轮时长（与 ↑↓τℂ 同一轮）。tps/ttfb 恒为最近
+  // 完成消息的值（跨轮保留，新消息完成时替换）；本轮进行中显示实时经过，
+  // 完成态显示锁定总时长。
   const tail: string[] = [];
   if (opts.tps != null) {
     tail.push(theme.fg("muted", `${Math.round(opts.tps)} t/s`));
@@ -133,46 +202,23 @@ export function formatSessionRow(
   return rows.join(theme.fg("muted", " │ "));
 }
 
+/** 轮级 flow 是否有可显示的 token（全零轮不占底栏空间，与 session flow 同规则）。 */
+function hasFlowTokens(flow: RoundFlow): boolean {
+  return flow.input > 0 || flow.output > 0 || flow.reasoning > 0 || flow.cacheRead > 0 || flow.cacheWrite > 0;
+}
+
 // --- token flow ------------------------------------------------------------
 
 /**
- * 会话累计的输入/输出 tokens 与 thinking 占比。
- * R/W（缓存读写累计）已移除：绝对值无参照系（每轮重复读缓存是常态），
- * 缓存浪费信号由 formatCacheWaste（miss）承载。
- */
-export type TokenFlow = {
-  input: number;
-  output: number;
-  /** 输出中 thinking（reasoning）token 累计；reasoning 是 output 的子集。 */
-  reasoning: number;
-};
-
-/**
- * Accumulate token flow across assistant messages. Returns null when no
- * assistant usage is recorded.
- */
-export function computeTokenFlow(entries: readonly SessionEntry[]): TokenFlow | null {
-  let input = 0;
-  let output = 0;
-  let reasoning = 0;
-  for (const entry of entries) {
-    if (entry.type !== "message" || entry.message?.role !== "assistant") continue;
-    const u = entry.message.usage;
-    if (!u) continue;
-    if (typeof u.input === "number") input += u.input;
-    if (typeof u.output === "number") output += u.output;
-    if (typeof u.reasoning === "number") reasoning += u.reasoning;
-  }
-  if (input === 0 && output === 0 && reasoning === 0) return null;
-  return { input, output, reasoning };
-}
-
-/**
  * `↑3k ↓400 (τ69%)`；输出含 thinking（reasoning > 0）时显示占比
- * （τ = thinking，reasoning 是 output 的子集）。单轮动态字段（tps/ttfb/
- * 思考时长）统一在尾部动态组，不在此处。
+ * （τ = thinking，reasoning 是 output 的子集）。
+ *
+ * R/W 不在此展示：缓存效率由 `ℂ命中率` 承担（见 cacheHitRate）；R/W 绝对值
+ * 无参照系（每轮读缓存是常态），且与命中率重叠。2026-08-27 实测过载示例
+ * `↑523k ↓166k (τ35%) R52.9M W0 ℂ99.0%`——W0 恒零、R 与 ℂ 重复，裁掉后
+ * 底栏短一半且信息不丢。
  */
-export function formatTokenFlow(theme: FooterTheme, flow: TokenFlow): string {
+export function formatTokenFlow(theme: FooterTheme, flow: RoundFlow): string {
   const parts = [
     theme.fg("text", `↑${formatCompact(flow.input)} ↓${formatCompact(flow.output)}`),
   ];
@@ -181,6 +227,24 @@ export function formatTokenFlow(theme: FooterTheme, flow: TokenFlow): string {
     parts[0] = theme.fg("text", `↑${formatCompact(flow.input)} ↓${formatCompact(flow.output)} (τ${thinkingPct.toFixed(0)}%)`);
   }
   return parts.join(" ");
+}
+
+/**
+ * 缓存命中率（官方 latestCacheHitRate 的轮级化）：命中 token 占全部 prompt
+ * token 的比例。返回 0..100；无缓存活动（cacheRead=0）或总 prompt 为 0 时
+ * 返回 null（不显示）。
+ */
+export function cacheHitRate(flow: Pick<RoundFlow, "cacheRead" | "cacheWrite" | "input">): number | null {
+  const total = flow.cacheRead + flow.cacheWrite + flow.input;
+  if (!(flow.cacheRead > 0) || total <= 0) return null;
+  return (flow.cacheRead / total) * 100;
+}
+
+/** `ℂ94.2%` —— 缓存命中率（omp: `cache hit` 图标 + percent）。 */
+export function formatCacheHit(theme: FooterTheme, rate: number): string {
+  const clamped = Math.min(100, Math.max(0, rate));
+  const color: FooterColor = clamped >= 90 ? "success" : clamped >= 70 ? "text" : "warning";
+  return theme.fg(color, `ℂ${clamped.toFixed(1)}%`);
 }
 
 /** 思考时长显示：`42s` / `1m5s` / `1h30m51s`（毫秒输入，≥60m 进位到 h）。 */
@@ -264,34 +328,6 @@ export function formatCwd(theme: FooterTheme, cwd: string, home: string): string
   return `${theme.fg("muted", "cwd:")} ${theme.fg("text", display)}`;
 }
 
-// --- cost -------------------------------------------------------------------
-
-/** Narrow view of one session entry used for cost and token-flow aggregation. */
-type SessionEntry = {
-  type: string;
-  message?: {
-    role?: string;
-    usage?: {
-      input?: number;
-      output?: number;
-      cacheRead?: number;
-      cacheWrite?: number;
-      cost?: { total?: number };
-    };
-  };
-};
-
-/** Total assistant cost across the current session entries. */
-export function computeSessionCost(entries: readonly SessionEntry[]): number {
-  let cost = 0;
-  for (const entry of entries) {
-    if (entry.type === "message" && entry.message?.role === "assistant") {
-      cost += entry.message.usage?.cost?.total ?? 0;
-    }
-  }
-  return cost;
-}
-
 // --- layout -----------------------------------------------------------------
 
 export type FooterSegments = {
@@ -332,7 +368,7 @@ function isWideCode(code: number): boolean {
 /**
  * Two-row dashboard on a shared column grid. With a git branch present
  * (>=100 columns) both rows render as `col1 │ col2 │ col3`: row 1
- * `cwd │ branch │ model`, row 2 `ctx │ flow+cost │ tail`. Each "│" column
+ * `cwd │ branch │ model`, row 2 `ctx+$+miss │ ↑↓τℂ │ 动态段`. Each "│" column
  * is the max display width of the same-position segment across the two rows
  * (padding lands before the "│", row starts stay at column 0), so the
  * separators line up vertically — one formula for both rows (isomorphic),
@@ -360,7 +396,7 @@ export function layoutFooter(
 ): string[] {
   if (width >= 72) {
     // 三列网格(≥100 且有 branch):行1 `cwd │ branch │ model`、行2
-    // `ctx │ flow+cost │ tail`(sessionRow 按分隔符拆段)。"│" 列两行共享:
+    // `ctx+$+miss │ ↑↓τℂ │ 动态段`(sessionRow 按分隔符拆段)。"│" 列两行共享:
     // 每列宽度 = 两行同段 display width 的最大值,短列在 "│" 前补空格。
     const grid = width >= 100 && segments.branch.length > 0;
     if (grid) {
