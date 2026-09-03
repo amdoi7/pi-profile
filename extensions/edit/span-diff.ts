@@ -26,7 +26,9 @@ import {
 import type { MatchedEditSpan } from "./match.ts";
 
 /** 窗口内的 span（偏移已换算到窗口切片坐标）。 */
-type WindowSpan = { matchIndex: number; matchLength: number; newText: string };
+type WindowSpan =
+	| { kind: "replace"; matchIndex: number; matchLength: number; newText: string }
+	| { kind: "insert"; matchIndex: number; newText: string };
 
 type DiffWindow = {
 	oldStart: number;
@@ -86,11 +88,26 @@ function countLines(content: string): number {
 	}
 }
 
+function spanEnd(span: WindowSpan): number {
+	return span.kind === "replace" ? span.matchIndex + span.matchLength : span.matchIndex;
+}
+
+function spanDelta(span: WindowSpan): number {
+	return span.newText.length - (span.kind === "replace" ? span.matchLength : 0);
+}
+
+function spanToWindow(span: MatchedEditSpan): WindowSpan {
+	return span.kind === "replace"
+		? { kind: "replace", matchIndex: span.matchIndex, matchLength: span.matchLength, newText: span.newText }
+		: { kind: "insert", matchIndex: span.matchIndex, newText: span.newText };
+}
+
 /**
  * span（old 坐标）→ 展示窗口：old 侧扩到行边界 + context，重叠的合并；
  * new 侧的边界由 span 增量**映射**得到，而不是独立扩展 —— 窗口首尾都是未改动
  * 文本，映射保证两侧 context 行一一对应（独立扩展会在纯删除时多出一行，
- * 被内层 diff 误当成新增）。
+ * 被内层 diff 误当成新增）。insert 是零宽 span：窗口取插入点所在行，增量来自
+ * 插入文本本身。
  */
 function buildWindows(
 	oldContent: string,
@@ -99,14 +116,17 @@ function buildWindows(
 ): DiffWindow[] {
 	const windows: DiffWindow[] = [];
 	let delta = 0;
-	for (const span of spans) {
+	for (const rawSpan of spans) {
+		const span = spanToWindow(rawSpan);
 		const oldStart = span.matchIndex;
-		const oldEnd = span.matchIndex + span.matchLength;
+		const oldEnd = spanEnd(span);
 		const deltaBefore = delta;
-		delta += span.newText.length - span.matchLength;
+		delta += spanDelta(span);
 
 		const windowOldStart = lineStartBack(oldContent, oldStart, contextLines);
-		const windowOldEnd = lineEndForward(oldContent, Math.max(oldStart, oldEnd - 1), contextLines);
+		// replace 至少 1 字符；insert 是零宽，窗口取插入点所在行。
+		const anchorIndex = span.kind === "replace" ? Math.max(oldStart, oldEnd - 1) : oldStart;
+		const windowOldEnd = lineEndForward(oldContent, anchorIndex, contextLines);
 
 		const previous = windows.at(-1);
 		if (previous !== undefined && windowOldStart <= previous.oldEnd) {
@@ -114,7 +134,7 @@ function buildWindows(
 			// hunk 合并行为一致）。
 			previous.oldEnd = Math.max(previous.oldEnd, windowOldEnd);
 			previous.newEnd = previous.oldEnd + delta;
-			previous.spans.push({ matchIndex: oldStart, matchLength: span.matchLength, newText: span.newText });
+			previous.spans.push(span);
 			continue;
 		}
 		windows.push({
@@ -124,7 +144,7 @@ function buildWindows(
 			// 尾部在最后一个 span 之后 → 用包含该 span 的增量。
 			newStart: windowOldStart + deltaBefore,
 			newEnd: windowOldEnd + delta,
-			spans: [{ matchIndex: oldStart, matchLength: span.matchLength, newText: span.newText }],
+			spans: [span],
 		});
 	}
 	return windows;
@@ -134,6 +154,8 @@ function buildWindows(
 function windowIsWholeRewrite(window: DiffWindow): boolean {
 	let cursor = window.oldStart;
 	for (const span of window.spans) {
+		// insert 是零宽：不推进 cursor；仅 replace 覆盖未改动字节才算整体重写。
+		if (span.kind !== "replace") continue;
 		if (span.matchIndex > cursor) return false;
 		cursor = Math.max(cursor, span.matchIndex + span.matchLength);
 	}

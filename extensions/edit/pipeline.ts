@@ -62,7 +62,7 @@ const fileEditsSchema = Type.Object(
 const editRequestSchema = Type.Object(
 	{
 		intent: Type.String({
-			description: "One line: the single change this batch delivers, e.g. 'split ToolCtx into PullCtx/ActCtx'.",
+			description: "The intent for this batch of edits.",
 		}),
 		files: Type.Array(fileEditsSchema, {
 			minItems: 1,

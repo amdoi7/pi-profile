@@ -12,7 +12,7 @@ import {
 	linkSharedPackages,
 	packageFileUrl,
 	resolvePiPackageDir,
-} from "../test-helpers/runtime-paths.mjs";
+} from "../../test-helpers/runtime-paths.mjs";
 
 const piPackageDir = resolvePiPackageDir("@earendil-works/pi-coding-agent");
 const { ToolExecutionComponent } = await import(packageFileUrl(piPackageDir, "dist/index.js"));
@@ -28,14 +28,12 @@ async function loadRegisteredEditTool() {
 	const tempSharedDir = path.join(tempExtensionDir, "_shared");
 	await fs.promises.cp(sourceDir, tempEditDir, {
 		recursive: true,
-		filter: (source) => path.basename(source) !== "node_modules",
+		// 临时扩展只需要运行时文件：node_modules 由 linkPiPackages 重建，tests 用不上。
+		filter: (source) => !["node_modules", "tests"].includes(path.basename(source)),
 	});
-	// edit 不再依赖 diff worker：共享文件只剩渲染与 diff 构造链。
-	// edit 不再依赖 diff worker：共享文件只剩渲染与 diff 构造链。
 	await copySharedFiles(tempSharedDir, ["file-link.ts", "code-preview.ts", "final-diff.ts", "diff-view.ts", "file-mutation-view.ts", "file-result.ts"]);
 	await linkPiPackages(tempExtensionDir, { tui: true });
 	await linkSharedPackages(tempExtensionDir);
-	// edit 自己的顶层依赖（typebox）也要可达：从扩展根向上找不到 edit/node_modules。
 	for (const dep of ["typebox"]) {
 		await fs.promises.mkdir(path.join(tempExtensionDir, "node_modules"), { recursive: true });
 		await fs.promises.symlink(
@@ -59,10 +57,10 @@ async function loadRegisteredEditTool() {
 	return registeredTool;
 }
 
-const INTENT = "narrow the ctx type";
+const REASONING = "align settlement field names";
 
-function makeBatchArgs(files, intent = INTENT) {
-	return { intent, files };
+function makeArgs(entries) {
+	return { note: REASONING, edits: entries };
 }
 
 function createTheme() {
@@ -142,9 +140,9 @@ function contextDisplay(entries) {
 	};
 }
 
-function appliedFile(filePath, display, overrides = {}) {
+function appliedEntry(filePath, display, overrides = {}) {
 	return {
-		path: filePath,
+		edit: { path: filePath, op: "replace" },
 		status: "applied",
 		changeStats: { additions: 1, deletions: 1, changedLines: 2 },
 		display,
@@ -154,43 +152,43 @@ function appliedFile(filePath, display, overrides = {}) {
 	};
 }
 
-/** execute 的真实结果形状：compact JSON content + 批次 details。 */
-function buildAgentResult(files, { status = "applied", cwd = process.cwd(), intent = INTENT } = {}) {
+/** execute 的真实结果形状：compact JSON content + 条目 details。 */
+function buildAgentResult(entries, { status = "applied", cwd = process.cwd() } = {}) {
 	return {
 		content: [{ type: "text", text: JSON.stringify({ status }) }],
-		isError: status !== "applied",
-		details: { status, intent, cwd, files },
+		isError: status === "rejected",
+		details: { status, note: REASONING, cwd, entries },
 	};
 }
 
-test("pending render shows the intent and the planned files without any diff text", async () => {
+test("pending render shows the route and the planned entries without any diff text", async () => {
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
 	const output = renderText(
 		tool.renderCall(
-			makeBatchArgs([
-				{ path: "src/example.ts", hint: "call site", edits: [{ oldText: "before", newText: "after" }] },
-				{ path: "src/other.ts", edits: [{ oldText: "left", newText: "right" }] },
+			makeArgs([
+				{ path: "src/example.ts", op: "replace", old_str: "before", new_str: "after" },
+				{ path: "src/other.ts", op: "insert", insert_line: 1, new_str: "right" },
 			]),
 			createTheme(),
 			createRenderContext({ executionStarted: false, argsComplete: true, isPartial: false }),
 		),
 	);
 
-	assertAppearsInOrder(output, [INTENT, "src/example.ts", "src/other.ts"]);
-	assert.match(output, /call site/);
-	assert.doesNotMatch(output, /before|after/);
+	assertAppearsInOrder(output, ["edit", "src/example.ts", "src/other.ts"]);
+	assert.match(output, /before → after/);
+	assert.doesNotMatch(output, /-1 |\+1 /);
 });
 
-test("applied result attributes the tool once in the intent header", async () => {
+test("applied result attributes the tool once and lists one line per entry", async () => {
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
 	const output = renderText(tool.renderResult(
 		buildAgentResult([
-			appliedFile("src/example.ts", replacementDisplay(1, "before", "after"), {
+			appliedEntry("src/example.ts", replacementDisplay(1, "before", "after"), {
 				changeStats: { additions: 2, deletions: 1, changedLines: 3 },
 			}),
-			appliedFile("src/other.ts", replacementDisplay(1, "left", "right")),
+			appliedEntry("src/other.ts", replacementDisplay(1, "left", "right")),
 		]),
 		{ expanded: true },
 		createTheme(),
@@ -198,22 +196,7 @@ test("applied result attributes the tool once in the intent header", async () =>
 	));
 
 	assert.equal(countOccurrences(output, "edit"), 1, output);
-	assertAppearsInOrder(output, [`edit ${INTENT}`, "src/example.ts · +2 -1", "src/other.ts · +1 -1"]);
-});
-
-test("per-file hint rides on the file line", async () => {
-	initTheme("dark");
-	const tool = await loadRegisteredEditTool();
-	const output = renderText(tool.renderResult(
-		buildAgentResult([
-			appliedFile("src/example.ts", replacementDisplay(1, "before", "after"), { hint: "compile site" }),
-		]),
-		{ expanded: true },
-		createTheme(),
-		createRenderContext(),
-	));
-
-	assert.match(output, /src\/example\.ts · \+1 -1 · compile site/);
+	assertAppearsInOrder(output, ["edit", "src/example.ts · +2 -1", "src/other.ts · +1 -1"]);
 });
 
 test("production result renderer uses Pi native diff rendering", async () => {
@@ -221,7 +204,7 @@ test("production result renderer uses Pi native diff rendering", async () => {
 	const tool = await loadRegisteredEditTool();
 	const output = renderText(tool.renderResult(
 		buildAgentResult([
-			appliedFile("src/example.ts", replacementDisplay(10, "\tindented", "  indented"), { firstChangedLine: 10 }),
+			appliedEntry("src/example.ts", replacementDisplay(10, "\tindented", "  indented"), { firstChangedLine: 10 }),
 		]),
 		{ expanded: true },
 		createTheme(),
@@ -232,11 +215,11 @@ test("production result renderer uses Pi native diff rendering", async () => {
 	assert.match(output, /\+ {3}10 │ {3}indented/);
 });
 
-test("each file header sits directly above its own diff", async () => {
+test("each entry header sits directly above its own diff", async () => {
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
 	const output = renderText(tool.renderResult(
-		buildAgentResult([appliedFile("src/example.ts", replacementDisplay(1, "before", "after"))]),
+		buildAgentResult([appliedEntry("src/example.ts", replacementDisplay(1, "before", "after"))]),
 		{ expanded: true },
 		createTheme(),
 		createRenderContext(),
@@ -248,13 +231,13 @@ test("each file header sits directly above its own diff", async () => {
 	assert.equal(diffIndex - headerIndex, 1, output);
 });
 
-test("rejected batch says nothing was written and marks the untouched files", async () => {
+test("rejected sequence says nothing was written and marks the untouched entries", async () => {
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
 	const output = renderText(tool.renderResult(
 		buildAgentResult([
-			{ path: "src/resolvable.ts", status: "notWritten", restored: false },
-			{ path: "src/stale.ts", status: "failed", error: "oldText was not found." },
+			{ edit: { path: "src/skipped.ts", op: "replace" }, status: "skipped" },
+			{ edit: { path: "src/stale.ts", op: "delete" }, status: "failed", error: "old_str was not found." },
 		], { status: "rejected" }),
 		{ expanded: true },
 		createTheme(),
@@ -262,9 +245,8 @@ test("rejected batch says nothing was written and marks the untouched files", as
 	));
 
 	assert.match(output, /rejected · nothing written/);
-	assert.match(output, /src\/resolvable\.ts · not written/);
-	assert.equal(countOccurrences(output, "src/stale.ts"), 1, output);
-	assert.match(output, /oldText was not found/);
+	assert.match(output, /src\/skipped\.ts · skipped/);
+	assert.match(output, /old_str was not found/);
 });
 
 // NOT_FOUND 现在带回文件原文（多行）：TUI 是第二个消费者，续行不能顶格。
@@ -272,12 +254,12 @@ test("the multi-line not-found payload keeps every line under the rail", async (
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
 	const error = [
-		"oldText was not found; L287 col 56: file \"、\" U+3001 ≠ oldText \",\" U+002C; copy from the file:",
+		"old_str was not found; L287 col 56: file \"、\" U+3001 ≠ old_str \",\" U+002C; copy from the file:",
 		"287|gate 出导航卡、hard 出拒绝、",
 		"288|guide 出引导卡、hint 出提醒。",
 	].join("\n");
 	const output = renderText(tool.renderResult(
-		buildAgentResult([{ path: "docs/design.md", status: "failed", error }], { status: "rejected" }),
+		buildAgentResult([{ edit: { path: "docs/design.md", op: "replace" }, status: "failed", error }], { status: "rejected" }),
 		{ expanded: true },
 		createTheme(),
 		createRenderContext(),
@@ -286,56 +268,39 @@ test("the multi-line not-found payload keeps every line under the rail", async (
 	const lines = output.split("\n");
 	const pathIndex = lines.findIndex((line) => line.includes("docs/design.md"));
 	const indent = (line) => line.length - line.trimStart().length;
-	const headIndex = lines.findIndex((line) => line.includes("oldText was not found; L287 col 56"));
+	const headIndex = lines.findIndex((line) => line.includes("old_str was not found; L287 col 56"));
 	const firstRegion = lines.findIndex((line) => line.includes("287|gate 出导航卡"));
 	const secondRegion = lines.findIndex((line) => line.includes("288|guide 出引导卡"));
 
 	assert.equal(headIndex, pathIndex + 1, output);
 	assert.ok(firstRegion > headIndex && secondRegion === firstRegion + 1, output);
-	// 折行与区域行一律在 rail 下：层级契约在每一行上都成立。
 	for (const index of [headIndex + 1, firstRegion, secondRegion]) {
 		assert.equal(indent(lines[index] ?? ""), indent(lines[headIndex] ?? ""), output);
 	}
 });
 
-test("a rolled-back file says it was restored, not merely skipped", async () => {
+test("partial sequence counts applied and failed entries in the header", async () => {
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
 	const output = renderText(tool.renderResult(
 		buildAgentResult([
-			{ path: "src/first.ts", status: "notWritten", restored: true, hint: "leading change" },
-			{ path: "src/second.ts", status: "failed", error: "EACCES: permission denied" },
-		], { status: "rejected" }),
-		{ expanded: true },
-		createTheme(),
-		createRenderContext(),
-	));
-
-	assert.match(output, /src\/first\.ts · leading change · restored/);
-});
-
-test("partial batch warns that files were left changed", async () => {
-	initTheme("dark");
-	const tool = await loadRegisteredEditTool();
-	const output = renderText(tool.renderResult(
-		buildAgentResult([
-			appliedFile("src/stranded.ts", replacementDisplay(1, "before", "after")),
-			{ path: "src/failed.ts", status: "failed", error: "ENOSPC: no space left on device" },
+			appliedEntry("src/applied.ts", replacementDisplay(1, "before", "after")),
+			{ edit: { path: "src/failed.ts", op: "replace" }, status: "failed", error: "ENOSPC: no space left on device" },
+			{ edit: { path: "src/skipped.ts", op: "replace" }, status: "skipped" },
 		], { status: "partial" }),
 		{ expanded: true },
 		createTheme(),
 		createRenderContext(),
 	));
 
-	assert.match(output, /partial · some files left changed/);
-	assert.match(output, /src\/stranded\.ts · \+1 -1/);
+	assert.match(output, /partial · 1 applied · 1 failed/);
+	assert.match(output, /src\/applied\.ts · \+1 -1/);
 	assert.match(output, /ENOSPC/);
+	assert.match(output, /src\/skipped\.ts · skipped/);
 });
 
 // pi 包装执行前失败(prepareArguments/schema/abort/blocked)时用的信封:
 // createErrorToolResult() => { content:[真实消息], details:{} },且 execute 从未运行。
-// 详见 @earendil-works/pi-agent-core dist/agent-loop.js。details 不是 undefined,
-// 所以渲染分流不能按「details 缺席」判断错误态。
 function harnessErrorResult(message) {
 	return { content: [{ type: "text", text: message }], details: {} };
 }
@@ -344,13 +309,13 @@ test("a pre-execution failure renders the harness message, not a renderer diagno
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
 	const output = renderText(tool.renderResult(
-		harnessErrorResult("files[0].edits must be an array"),
+		harnessErrorResult("edits[0].op must be one of replace | replaceAll | insert | delete"),
 		{ expanded: false },
 		createTheme(),
 		createRenderContext({ isError: true }),
 	));
 
-	assert.match(output, /files\[0\]\.edits must be an array/);
+	assert.match(output, /edits\[0\]\.op must be one of/);
 	assert.doesNotMatch(output, /contract/i);
 });
 
@@ -375,7 +340,7 @@ test("partial stream keeps pending instead of flashing a diagnostic", async () =
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
 	const output = renderText(tool.renderResult(
-		{ content: [], details: { status: "applied", intent: INTENT, cwd: process.cwd(), files: [] } },
+		{ content: [], details: { status: "applied", cwd: process.cwd(), entries: [] } },
 		{ expanded: false, isPartial: true },
 		createTheme(),
 		createRenderContext(),
@@ -387,15 +352,15 @@ test("partial stream keeps pending instead of flashing a diagnostic", async () =
 test("completed tool execution replaces the pending plan with the final diff", async () => {
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
-	const args = makeBatchArgs([
-		{ path: "/tmp/pi-edit-ui-demo/example.ts", edits: [{ oldText: "before", newText: "after" }] },
+	const args = makeArgs([
+		{ path: "/tmp/pi-edit-ui-demo/example.ts", op: "replace", old_str: "before", new_str: "after" },
 	]);
 	const component = createToolExecutionComponent(tool, args);
 	component.setArgsComplete();
 	component.markExecutionStarted();
 	component.updateResult(
 		buildAgentResult([
-			appliedFile("/tmp/pi-edit-ui-demo/example.ts", contextDisplay([
+			appliedEntry("/tmp/pi-edit-ui-demo/example.ts", contextDisplay([
 				[1, "export const value = 1;"],
 				[2, 'export const name = "after";'],
 			])),
@@ -405,23 +370,19 @@ test("completed tool execution replaces the pending plan with the final diff", a
 
 	const output = renderText(component);
 	assert.equal(countOccurrences(output, "/tmp/pi-edit-ui-demo/example.ts"), 1);
-	assertAppearsInOrder(output, [INTENT, "/tmp/pi-edit-ui-demo/example.ts", 'export const name = "after";']);
+	assertAppearsInOrder(output, ["edit", "/tmp/pi-edit-ui-demo/example.ts", 'export const name = "after";']);
 });
 
-// 端到端复现用户报的那一屏：参数残缺的 edit 调用（语料 2026-08-26）走到 pi 的
-// 执行前失败信封，整行结果必须是可行动的校验消息。
+// 端到端：参数残缺的调用走到 pi 的执行前失败信封。
 test("a pre-execution failure shows the message in the live tool row", async () => {
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
-	const component = createToolExecutionComponent(tool, {
-		intent: "route sessions to a branch",
-		files: [{ path: "src/tenancy.py }" }],
-	});
+	const component = createToolExecutionComponent(tool, { edits: [] });
 	component.setArgsComplete();
 	component.markExecutionStarted();
 	component.updateResult(
 		{
-			content: [{ type: "text", text: "files[0].edits is missing: this file entry carries only a path — re-send the call with its edits." }],
+			content: [{ type: "text", text: "edits must not be empty" }],
 			details: {},
 			isError: true,
 		},
@@ -429,37 +390,16 @@ test("a pre-execution failure shows the message in the live tool row", async () 
 	);
 
 	const output = renderText(component);
-	assert.match(output, /files\[0\]\.edits is missing/);
+	assert.match(output, /edits must not be empty/);
 	assert.doesNotMatch(output, /contract/i);
 });
 
-// 批次视图的层级契约：归因只在意图头出现一次，文件行靠缩进归属。
-// 语料 2026-08-25/26：hint 宽度 p90=77 列，接在 path · stats 之后必然折行，
-// 而折行的续行一旦顶格，缩进归属就失效了。
-test("a wrapped file line keeps its indent under the intent header", async () => {
-	initTheme("dark");
-	const tool = await loadRegisteredEditTool();
-	const hint = "replace the false `details: undefined` fixture with the harness's real error envelope";
-	const component = tool.renderResult(
-		buildAgentResult([appliedFile("src/result-file-rendering.test.mjs", contextDisplay([[1, "after"]]), { hint })]),
-		{ expanded: true },
-		createTheme(),
-		createRenderContext(),
-	);
-	const lines = stripTerminalFormatting(component.render(80).join("\n")).split("\n");
-	const pathIndex = lines.findIndex((line) => line.includes("result-file-rendering.test.mjs"));
-	assert.ok(pathIndex >= 0, "file line not found");
-	const continuation = lines[pathIndex + 1] ?? "";
-	assert.match(continuation, /real error envelope/, `expected the hint to wrap, got:\n${lines.join("\n")}`);
-	assert.match(continuation, /^ {2}\S/, `wrapped line lost the rail:\n${lines.join("\n")}`);
-});
-
-test("a failed file puts its message directly under its own line", async () => {
+test("a failed entry puts its message directly under its own line", async () => {
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
 	const output = renderText(tool.renderResult(
 		buildAgentResult(
-			[{ path: "src/a.ts", status: "failed", error: "replacement 2: oldText was not found." }],
+			[{ edit: { path: "src/a.ts", op: "replace" }, status: "failed", error: "old_str was not found." }],
 			{ status: "rejected" },
 		),
 		{ expanded: true },
@@ -469,21 +409,7 @@ test("a failed file puts its message directly under its own line", async () => {
 	const lines = output.split("\n");
 	const pathIndex = lines.findIndex((line) => line.includes("src/a.ts"));
 	assert.ok(pathIndex >= 0);
-	assert.match(lines[pathIndex + 1] ?? "", /oldText was not found/);
-});
-
-test("a wrapped pending file line keeps its indent too", async () => {
-	initTheme("dark");
-	const tool = await loadRegisteredEditTool();
-	const hint = "replace the false `details: undefined` fixture with the harness's real error envelope";
-	const component = tool.renderCall(
-		makeBatchArgs([{ path: "src/result-file-rendering.test.mjs", hint, edits: [{ oldText: "a", newText: "b" }] }]),
-		createTheme(),
-		createRenderContext(),
-	);
-	const lines = stripTerminalFormatting(component.render(80).join("\n")).split("\n");
-	const pathIndex = lines.findIndex((line) => line.includes("result-file-rendering.test.mjs"));
-	assert.match(lines[pathIndex + 1] ?? "", /^ {2}\S/, `wrapped pending line lost the rail:\n${lines.join("\n")}`);
+	assert.match(lines[pathIndex + 1] ?? "", /old_str was not found/);
 });
 
 test("renderResult makes edit path headers clickable file hyperlinks", async () => {
@@ -492,7 +418,7 @@ test("renderResult makes edit path headers clickable file hyperlinks", async () 
 	const cwd = "/tmp/pi-edit-link-demo";
 	const raw = renderRawText(
 		tool.renderResult(
-			buildAgentResult([appliedFile("src/example.ts", contextDisplay([[1, "after"]]))], { cwd }),
+			buildAgentResult([appliedEntry("src/example.ts", contextDisplay([[1, "after"]]))], { cwd }),
 			{ expanded: true },
 			createTheme(),
 			createRenderContext({ cwd }),
