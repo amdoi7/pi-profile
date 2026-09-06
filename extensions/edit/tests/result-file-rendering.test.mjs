@@ -60,7 +60,12 @@ async function loadRegisteredEditTool() {
 const REASONING = "align settlement field names";
 
 function makeArgs(entries) {
-	return { note: REASONING, edits: entries };
+	// 新契约：files[path] = op 链。按 path 分组，去 path 后的条目进链。
+	const files = {};
+	for (const { path: filePath, ...op } of entries) {
+		(files[filePath] ??= []).push(op);
+	}
+	return { note: REASONING, files };
 }
 
 function createTheme() {
@@ -142,7 +147,7 @@ function contextDisplay(entries) {
 
 function appliedEntry(filePath, display, overrides = {}) {
 	return {
-		edit: { path: filePath, op: "replace" },
+		edit: { path: filePath, match: "before" },
 		status: "applied",
 		changeStats: { additions: 1, deletions: 1, changedLines: 2 },
 		display,
@@ -167,15 +172,14 @@ test("pending render shows the route and the planned entries without any diff te
 	const output = renderText(
 		tool.renderCall(
 			makeArgs([
-				{ path: "src/example.ts", op: "replace", old_str: "before", new_str: "after" },
-				{ path: "src/other.ts", op: "insert", insert_line: 1, new_str: "right" },
+				{ path: "src/example.ts", match: "before", new_str: "after" },
 			]),
 			createTheme(),
 			createRenderContext({ executionStarted: false, argsComplete: true, isPartial: false }),
 		),
 	);
 
-	assertAppearsInOrder(output, ["edit", "src/example.ts", "src/other.ts"]);
+	assertAppearsInOrder(output, ["edit", "src/example.ts"]);
 	assert.match(output, /before → after/);
 	assert.doesNotMatch(output, /-1 |\+1 /);
 });
@@ -236,8 +240,8 @@ test("rejected sequence says nothing was written and marks the untouched entries
 	const tool = await loadRegisteredEditTool();
 	const output = renderText(tool.renderResult(
 		buildAgentResult([
-			{ edit: { path: "src/skipped.ts", op: "replace" }, status: "skipped" },
-			{ edit: { path: "src/stale.ts", op: "delete" }, status: "failed", error: "old_str was not found." },
+			{ edit: { path: "src/skipped.ts", match: "x" }, status: "skipped" },
+			{ edit: { path: "src/stale.ts", match: "x" }, status: "failed", error: "match was not found." },
 		], { status: "rejected" }),
 		{ expanded: true },
 		createTheme(),
@@ -246,7 +250,7 @@ test("rejected sequence says nothing was written and marks the untouched entries
 
 	assert.match(output, /rejected · nothing written/);
 	assert.match(output, /src\/skipped\.ts · skipped/);
-	assert.match(output, /old_str was not found/);
+	assert.match(output, /match was not found/);
 });
 
 // NOT_FOUND 现在带回文件原文（多行）：TUI 是第二个消费者，续行不能顶格。
@@ -254,12 +258,12 @@ test("the multi-line not-found payload keeps every line under the rail", async (
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
 	const error = [
-		"old_str was not found; L287 col 56: file \"、\" U+3001 ≠ old_str \",\" U+002C; copy from the file:",
+		"match was not found; L287 col 56: file \"、\" U+3001 ≠ match \",\" U+002C; copy from the file:",
 		"287|gate 出导航卡、hard 出拒绝、",
 		"288|guide 出引导卡、hint 出提醒。",
 	].join("\n");
 	const output = renderText(tool.renderResult(
-		buildAgentResult([{ edit: { path: "docs/design.md", op: "replace" }, status: "failed", error }], { status: "rejected" }),
+		buildAgentResult([{ edit: { path: "docs/design.md", match: "x" }, status: "failed", error }], { status: "rejected" }),
 		{ expanded: true },
 		createTheme(),
 		createRenderContext(),
@@ -268,7 +272,7 @@ test("the multi-line not-found payload keeps every line under the rail", async (
 	const lines = output.split("\n");
 	const pathIndex = lines.findIndex((line) => line.includes("docs/design.md"));
 	const indent = (line) => line.length - line.trimStart().length;
-	const headIndex = lines.findIndex((line) => line.includes("old_str was not found; L287 col 56"));
+	const headIndex = lines.findIndex((line) => line.includes("match was not found; L287 col 56"));
 	const firstRegion = lines.findIndex((line) => line.includes("287|gate 出导航卡"));
 	const secondRegion = lines.findIndex((line) => line.includes("288|guide 出引导卡"));
 
@@ -285,8 +289,8 @@ test("partial sequence counts applied and failed entries in the header", async (
 	const output = renderText(tool.renderResult(
 		buildAgentResult([
 			appliedEntry("src/applied.ts", replacementDisplay(1, "before", "after")),
-			{ edit: { path: "src/failed.ts", op: "replace" }, status: "failed", error: "ENOSPC: no space left on device" },
-			{ edit: { path: "src/skipped.ts", op: "replace" }, status: "skipped" },
+			{ edit: { path: "src/failed.ts", match: "x" }, status: "failed", error: "ENOSPC: no space left on device" },
+			{ edit: { path: "src/skipped.ts", match: "x" }, status: "skipped" },
 		], { status: "partial" }),
 		{ expanded: true },
 		createTheme(),
@@ -309,13 +313,13 @@ test("a pre-execution failure renders the harness message, not a renderer diagno
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
 	const output = renderText(tool.renderResult(
-		harnessErrorResult("edits[0].op must be one of replace | replaceAll | insert | delete"),
+		harnessErrorResult("op must be removed"),
 		{ expanded: false },
 		createTheme(),
 		createRenderContext({ isError: true }),
 	));
 
-	assert.match(output, /edits\[0\]\.op must be one of/);
+	assert.match(output, /op must be removed/);
 	assert.doesNotMatch(output, /contract/i);
 });
 
@@ -353,7 +357,7 @@ test("completed tool execution replaces the pending plan with the final diff", a
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
 	const args = makeArgs([
-		{ path: "/tmp/pi-edit-ui-demo/example.ts", op: "replace", old_str: "before", new_str: "after" },
+		{ path: "/tmp/pi-edit-ui-demo/example.ts", match: "before", new_str: "after" },
 	]);
 	const component = createToolExecutionComponent(tool, args);
 	component.setArgsComplete();
@@ -399,7 +403,7 @@ test("a failed entry puts its message directly under its own line", async () => 
 	const tool = await loadRegisteredEditTool();
 	const output = renderText(tool.renderResult(
 		buildAgentResult(
-			[{ edit: { path: "src/a.ts", op: "replace" }, status: "failed", error: "old_str was not found." }],
+			[{ edit: { path: "src/a.ts", match: "x" }, status: "failed", error: "match was not found." }],
 			{ status: "rejected" },
 		),
 		{ expanded: true },
@@ -409,7 +413,7 @@ test("a failed entry puts its message directly under its own line", async () => 
 	const lines = output.split("\n");
 	const pathIndex = lines.findIndex((line) => line.includes("src/a.ts"));
 	assert.ok(pathIndex >= 0);
-	assert.match(lines[pathIndex + 1] ?? "", /old_str was not found/);
+	assert.match(lines[pathIndex + 1] ?? "", /match was not found/);
 });
 
 test("renderResult makes edit path headers clickable file hyperlinks", async () => {

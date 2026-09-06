@@ -60,7 +60,7 @@ test("uses the SDK mutation queue shared with built-in write", async () => {
 	let editReadStarted = false;
 	const editMutation = runOneEntry(
 		file,
-		{ op: "replace", old_str: "before", new_str: "after" },
+		{ match: "before", new_str: "after" },
 		undefined,
 		{
 			access: async () => {},
@@ -99,8 +99,8 @@ test("the executor takes every target file's lock before reading any of them", a
 	await outerStarted;
 
 	const seq = executeOpEntries([
-		{ absolutePath: first, edit: { path: first, op: "replace", old_str: "one", new_str: "uno" } },
-		{ absolutePath: second, edit: { path: second, op: "replace", old_str: "two", new_str: "dos" } },
+		{ absolutePath: first, edit: { path: first, match: "one", new_str: "uno" } },
+		{ absolutePath: second, edit: { path: second, match: "two", new_str: "dos" } },
 	]);
 
 	await new Promise((resolve) => setTimeout(resolve, 20));
@@ -122,9 +122,9 @@ test("one failed entry applies the earlier ones, names the failure, and stops", 
 	await fs.promises.writeFile(later, "gamma\n", "utf-8");
 
 	const result = await executeOpEntries([
-		{ absolutePath: good, edit: { path: good, op: "replace", old_str: "alpha", new_str: "ALPHA" } },
-		{ absolutePath: stale, edit: { path: stale, op: "replace", old_str: "missing", new_str: "BETA" } },
-		{ absolutePath: later, edit: { path: later, op: "replace", old_str: "gamma", new_str: "GAMMA" } },
+		{ absolutePath: good, edit: { path: good, match: "alpha", new_str: "ALPHA" } },
+		{ absolutePath: stale, edit: { path: stale, match: "missing", new_str: "BETA" } },
+		{ absolutePath: later, edit: { path: later, match: "gamma", new_str: "GAMMA" } },
 	]);
 
 	assert.equal(result.status, "partial");
@@ -144,8 +144,8 @@ test("a failure on the first entry rejects the sequence with nothing written", a
 	);
 
 	const result = await executeOpEntries([
-		{ absolutePath: "/mem/a.txt", edit: { path: "/mem/a.txt", op: "replace", old_str: "missing-a", new_str: "x" } },
-		{ absolutePath: "/mem/b.txt", edit: { path: "/mem/b.txt", op: "replace", old_str: "beta", new_str: "BETA" } },
+		{ absolutePath: "/mem/a.txt", edit: { path: "/mem/a.txt", match: "missing-a", new_str: "x" } },
+		{ absolutePath: "/mem/b.txt", edit: { path: "/mem/b.txt", match: "beta", new_str: "BETA" } },
 	], undefined, operations);
 
 	assert.equal(result.status, "rejected");
@@ -164,9 +164,9 @@ test("a write failure keeps earlier entries applied, stops the sequence, and rep
 	);
 
 	const result = await executeOpEntries([
-		{ absolutePath: "/mem/a.txt", edit: { path: "/mem/a.txt", op: "replace", old_str: "alpha", new_str: "ALPHA" } },
-		{ absolutePath: "/mem/b.txt", edit: { path: "/mem/b.txt", op: "replace", old_str: "beta", new_str: "BETA" } },
-		{ absolutePath: "/mem/c.txt", edit: { path: "/mem/c.txt", op: "replace", old_str: "gamma", new_str: "GAMMA" } },
+		{ absolutePath: "/mem/a.txt", edit: { path: "/mem/a.txt", match: "alpha", new_str: "ALPHA" } },
+		{ absolutePath: "/mem/b.txt", edit: { path: "/mem/b.txt", match: "beta", new_str: "BETA" } },
+		{ absolutePath: "/mem/c.txt", edit: { path: "/mem/c.txt", match: "gamma", new_str: "GAMMA" } },
 	], undefined, operations);
 
 	assert.equal(result.status, "partial");
@@ -188,8 +188,8 @@ test("an applied sequence returns one preview per entry", async () => {
 	await fs.promises.writeFile(second, "const b = 2;\n", "utf-8");
 
 	const result = await executeOpEntries([
-		{ absolutePath: first, edit: { path: first, op: "replace", old_str: "const a = 1;", new_str: "const a = 11;" } },
-		{ absolutePath: second, edit: { path: second, op: "replace", old_str: "const b = 2;", new_str: "const b = 22;" } },
+		{ absolutePath: first, edit: { path: first, match: "const a = 1;", new_str: "const a = 11;" } },
+		{ absolutePath: second, edit: { path: second, match: "const b = 2;", new_str: "const b = 22;" } },
 	]);
 
 	assert.equal(result.status, "applied");
@@ -207,55 +207,12 @@ test("identical entries in one sequence chain on the same file", async () => {
 	await fs.promises.writeFile(file, "one\n", "utf-8");
 
 	const result = await executeOpEntries([
-		{ absolutePath: file, edit: { path: file, op: "replace", old_str: "one", new_str: "two" } },
-		{ absolutePath: file, edit: { path: file, op: "replace", old_str: "two", new_str: "three" } },
+		{ absolutePath: file, edit: { path: file, match: "one", new_str: "two" } },
+		{ absolutePath: file, edit: { path: file, match: "two", new_str: "three" } },
 	]);
 
 	assert.equal(result.status, "applied");
 	assert.equal(await fs.promises.readFile(file, "utf-8"), "three\n");
-});
-
-// ─── create（写全文：新建 / 显式覆写） ──────────────────────────────────────
-
-test("create writes a new file at a missing path", async () => {
-	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-edit-create-"));
-	const file = path.join(dir, "new.py");
-
-	const result = await executeOpEntries([
-		{ absolutePath: file, edit: { path: file, op: "create", file_text: "class New:\n    pass\n" } },
-	]);
-
-	assert.equal(result.status, "applied");
-	assert.equal(await fs.promises.readFile(file, "utf-8"), "class New:\n    pass\n");
-	assert.ok(result.entries[0].changeStats.additions > 0);
-});
-
-test("create refuses an existing file (use write to replace)", async () => {
-	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-edit-create-exists-"));
-	const file = path.join(dir, "lib.py");
-	await fs.promises.writeFile(file, "old\n", "utf-8");
-
-	const result = await executeOpEntries([
-		{ absolutePath: file, edit: { path: file, op: "create", file_text: "new\n" } },
-	]);
-
-	assert.equal(result.status, "rejected");
-	assert.equal(result.entries[0].status, "failed");
-	assert.match(result.entries[0].error, /already exists/);
-	assert.equal(await fs.promises.readFile(file, "utf-8"), "old\n", "existing file stays untouched");
-});
-
-test("write replaces the whole file", async () => {
-	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-edit-create-over-"));
-	const file = path.join(dir, "lib.py");
-	await fs.promises.writeFile(file, "old content\n", "utf-8");
-
-	const result = await executeOpEntries([
-		{ absolutePath: file, edit: { path: file, op: "write", file_text: "new content\n" } },
-	]);
-
-	assert.equal(result.status, "applied");
-	assert.equal(await fs.promises.readFile(file, "utf-8"), "new content\n");
 });
 
 // ─── 匹配语义（applyOpToNormalizedContent） ─────────────────────────────────
@@ -265,7 +222,7 @@ test("quote fallback preserves unrelated typography and replacement quote style"
 
 	const { newContent } = applyOpToNormalizedContent(
 		original,
-		{ op: "replace", old_str: 'message: "old value"\n', new_str: 'message: "new value"\n' },
+		{ match: 'message: "old value"\n', new_str: 'message: "new value"\n' },
 	);
 
 	assert.equal(
@@ -274,82 +231,57 @@ test("quote fallback preserves unrelated typography and replacement quote style"
 	);
 });
 
-test("insert before and after line positions", () => {
-	const { newContent: after } = applyOpToNormalizedContent(
-		"header\nbody\nfooter\n",
-		{ op: "insert", insert_line: 2, new_str: "inserted after\n" },
-	);
-	assert.equal(after, "header\nbody\ninserted after\nfooter\n");
 
-	const { newContent: before } = applyOpToNormalizedContent(
-		"header\nbody\nfooter\n",
-		{ op: "insert", insert_line: 1, new_str: "inserted before\n" },
-	);
-	assert.equal(before, "header\ninserted before\nbody\nfooter\n");
-});
-
-test("insert_line out of range is an invalid parameter, not a guess", () => {
-	assert.throws(
-		() => applyOpToNormalizedContent("dup\ndup\n", { op: "insert", insert_line: 5, new_str: "x" }),
-		/insert_line must be an integer in 0..\d+/,
-	);
-});
 
 test("delete removes the matched text verbatim", () => {
 	const { newContent } = applyOpToNormalizedContent(
 		"keep\ndead_code();\nkeep\n",
-		{ op: "delete", old_str: "dead_code();\n" },
+		{ match: "dead_code();\n" },
 	);
 	assert.equal(newContent, "keep\nkeep\n");
 });
 
-test("replaceAll replaces every exact occurrence and reports a span per hit", () => {
+test("replace replaces every exact occurrence and reports a span per hit", () => {
 	const { newContent, matchedSpans } = applyOpToNormalizedContent(
 		"const oldName = oldName + oldName;\n",
-		{ op: "replaceAll", old_str: "oldName", new_str: "newName" },
+		{ match: "oldName", new_str: "newName" },
 	);
 
 	assert.equal(newContent, "const newName = newName + newName;\n");
 	assert.equal(matchedSpans.length, 3);
 });
 
-test("duplicate matches report their count and recovery", () => {
-	assert.throws(
-		() => applyOpToNormalizedContent("aaaa", { op: "replace", old_str: "aaa", new_str: "bbb" }),
-		(error) => {
-			assert.equal(error.kind, "DUPLICATE_MATCH");
-			assert.equal(error.message, "old_str matched 2 locations (L1); use a longer or more specific match");
-			return true;
-		},
-	);
+test("replace defaults to replacing all matches", () => {
+	const { newContent } = applyOpToNormalizedContent("aaa aaa", { match: "aaa", new_str: "b" });
+	assert.equal(newContent, "b b");
 });
 
 test("exact unique match wins over fuzzy-equivalent quote variants elsewhere", () => {
 	const { newContent } = applyOpToNormalizedContent(
 		'x: “v”\nx: "v"\n',
-		{ op: "replace", old_str: 'x: “v”\n', new_str: 'x: “w”\n' },
+		{ match: 'x: “v”\n', new_str: 'x: “w”\n' },
 	);
 
 	assert.equal(newContent, 'x: “w”\nx: "v"\n');
 });
 
-test("not-found diagnostics omit the known path and name old_str", async () => {
+test("not-found diagnostics omit the known path and name match", async () => {
 	const original = ['title: “keep me”', 'needle   ', 'footer — untouched', ''].join("\n");
 	const file = await writeTempFile("pi-edit-fuzzy-", "story.txt", original);
 
-	const result = await runOneEntry(file, { op: "replace", old_str: 'needle\nfooter - untouched\n', new_str: 'replaced\nfooter - untouched\n' });
+	const result = await runOneEntry(file, { match: 'needle\nfooter - untouched\n', new_str: 'replaced\nfooter - untouched\n' });
 
 	assert.equal(result.status, "rejected");
 	assert.equal(result.entries[0].errorKind, "NOT_FOUND");
-	assert.match(result.entries[0].error, /^old_str was not found; /);
+	assert.match(result.entries[0].error, /^match was not found; /);
 	assert.doesNotMatch(result.entries[0].error, /story\.txt/);
 	assert.equal(await fs.promises.readFile(file, "utf-8"), original);
 });
 
-test("LF old_str matches CRLF file content and preserves the original line endings", async () => {
+test("LF match matches CRLF file content and preserves the original line endings", async () => {
 	const file = await writeTempFile("pi-edit-crlf-", "win.txt", 'alpha\r\nbeta\r\nomega\r\n');
 
-	const result = await runOneEntry(file, { op: "replace", old_str: 'alpha\nbeta\n', new_str: 'alpha\ngamma\n' });
+	const result = await runOneEntry(file, { match: 'alpha\nbeta\n', new_str: 'alpha\ngamma\n' });
 
 	assert.equal(result.status, "applied");
 	assert.equal(await fs.promises.readFile(file, "utf-8"), 'alpha\r\ngamma\r\nomega\r\n');
@@ -361,7 +293,7 @@ test("permission errors omit the known path and name the required access", async
 
 	const result = await runOneEntry(
 		"/tmp/locked.txt",
-		{ op: "replace", old_str: "hello", new_str: "world" },
+		{ match: "hello", new_str: "world" },
 		undefined,
 		{
 			stat: async () => ({ size: 6 }),
@@ -383,7 +315,7 @@ test("missing file diagnostics omit the known path", async () => {
 
 	const result = await runOneEntry(
 		"/tmp/missing.txt",
-		{ op: "replace", old_str: "hello", new_str: "world" },
+		{ match: "hello", new_str: "world" },
 		undefined,
 		{
 			stat: async () => ({ size: 0 }),
@@ -402,31 +334,29 @@ test("missing file diagnostics omit the known path", async () => {
 test("identical replacement fails closed as a structured no-change edit error", async () => {
 	const file = await writeTempFile("pi-edit-no-change-", "target.ts", "const answer = 42;\n");
 
-	const result = await runOneEntry(file, { op: "replace", old_str: "const answer = 42;", new_str: "const answer = 42;" });
+	const result = await runOneEntry(file, { match: "const answer = 42;", new_str: "const answer = 42;" });
 
 	assert.equal(result.status, "rejected");
 	assert.equal(result.entries[0].errorKind, "NO_CHANGE");
 	assert.equal(await fs.promises.readFile(file, "utf-8"), "const answer = 42;\n");
 });
 
-test("an empty old_str is rejected at the boundary", () => {
+test("an empty match is rejected at the boundary", () => {
 	assert.throws(
-		() => applyOpToNormalizedContent("alpha\n", { op: "replace", old_str: "", new_str: "y" }),
-		/^Error: old_str must not be empty\.$/,
+		() => applyOpToNormalizedContent("alpha\n", { match: "", new_str: "y" }),
+		/^Error: match must not be empty\.$/,
 	);
 });
 
 // 匹配阶梯的语义优先级（不是性能优化，是行为承诺）：
 // - exact 命中存在 ⇒ 只用 exact 桶，fuzzy 变体不参与计数或替换；
-// - 全弯引号两处命中直引号 old_str ⇒ fuzzy 层 DUPLICATE_MATCH（修复面不接 replaceAll）。
+// - 全弯引号两处命中直引号 match ⇒ fuzzy 层全部替换（多命中不再报 DUPLICATE_MATCH）。
 test("exact hit suppresses the fuzzy variant of the same text", () => {
-	const { newContent } = applyOpToNormalizedContent("x,y x，y\n", { op: "replace", old_str: "x,y", new_str: "z" });
+	const { newContent } = applyOpToNormalizedContent("x,y x，y\n", { match: "x,y", new_str: "z" });
 	assert.equal(newContent, "z x，y\n");
 });
 
-test("two fuzzy variants of a straight-quote old_str are a duplicate, not repaired", () => {
-	assert.throws(
-		() => applyOpToNormalizedContent("x’y x’y\n", { op: "replace", old_str: "x'y", new_str: "z" }),
-		/matched 2 locations/,
-	);
+test("two fuzzy variants of a straight-quote match are replaced by default", () => {
+	const { newContent } = applyOpToNormalizedContent("x’y x’y\n", { match: "x'y", new_str: "z" });
+	assert.equal(newContent, "z z\n");
 });

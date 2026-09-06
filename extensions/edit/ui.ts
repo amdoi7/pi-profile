@@ -2,7 +2,8 @@
  * ui.ts —— edit 的条目展示：每条目一行（含 diff）。
  *
  * 归因只在工具名出现一次（label="edit"），条目行用缩进 rail 归属到这个调用；
- * 每条目显示 path + op 摘要（note），成功条目的 diff 嵌在行后。
+ * 每条目显示 path + op 摘要（含选择器：occurrence/limit/after/before/regex），
+ * 成功条目的 diff 嵌在行后。
  */
 
 import {
@@ -35,7 +36,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isEntryOutcome(value: unknown): value is EntryOutcome {
 	if (!isRecord(value) || !isRecord(value.edit)) return false;
-	if (typeof value.edit.path !== "string" || typeof value.edit.op !== "string") return false;
+	if (typeof value.edit.path !== "string" || typeof value.edit.match !== "string") return false;
 	if (value.status === "applied") {
 		return isChangeStats(value.changeStats) && isDisplayDiff(value.display);
 	}
@@ -62,21 +63,27 @@ export function renderClearedCallState(context: EditToolRenderContext): Containe
 }
 
 /** 条目摘要：pending 阶段一行说清这一步要做什么（非执行语义）。 */
+function selectorSuffix(entry: EditEntry): string {
+	const parts: string[] = [];
+	if (entry.occurrence !== undefined) parts.push(`#${entry.occurrence}`);
+	if (entry.limit !== undefined) parts.push(`≤${entry.limit}`);
+	if (entry.after !== undefined) parts.push(`after "${truncate(entry.after)}"`);
+	if (entry.before !== undefined) parts.push(`before "${truncate(entry.before)}"`);
+	if (entry.regex === true) parts.push("regex");
+	return parts.length > 0 ? ` [${parts.join(", ")}]` : "";
+}
+
+function truncate(text: string, max = 24): string {
+	return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+/** 条目摘要：pending 阶段一行说清这一步要做什么（非执行语义）。 */
 export function entryLabel(entry: EditEntry): string {
-	switch (entry.op) {
-		case "replace":
-			return `${entry.old_str} → ${entry.new_str}`;
-		case "replaceAll":
-			return `replaceAll ${entry.old_str} → ${entry.new_str}`;
-		case "insert":
-			return `insert after line ${entry.insert_line} "${entry.new_str}"`;
-		case "delete":
-			return `delete "${entry.old_str}"`;
-		case "create":
-			return "create";
-		case "write":
-			return "write";
+	const suffix = selectorSuffix(entry);
+	if (entry.new_str === undefined) {
+		return `delete "${truncate(entry.match)}"${suffix}`;
 	}
+	return `${truncate(entry.match)} → ${truncate(entry.new_str)}${suffix}`;
 }
 
 /** 校验没过：能给用户的唯一真实信息就是这条消息。 */

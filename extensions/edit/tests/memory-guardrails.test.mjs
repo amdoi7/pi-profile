@@ -18,7 +18,7 @@ test("large file exceeding MAX_EDIT_FILE_SIZE_BYTES is rejected without reading 
 	let readCalled = false;
 
 	const result = await executeOpEntries(
-		[{ absolutePath: "/fake/big.ts", edit: { path: "/fake/big.ts", op: "replace", old_str: "x", new_str: "y" } }],
+		[{ absolutePath: "/fake/big.ts", edit: { path: "/fake/big.ts", match: "x", new_str: "y" } }],
 		undefined,
 		{
 			stat: async () => ({ size: MAX_EDIT_FILE_SIZE_BYTES + 1 }),
@@ -43,7 +43,7 @@ test("applied outcome carries structured preview and changeStats per entry", asy
 	const file = await writeTempFile("pi-contract-", "target.ts", "const x = 1;\n");
 
 	const outcome = await executeEditScript(
-		parseEditRequest({ note: "why", edits: [{ path: file, op: "replace", old_str: "const x = 1;", new_str: "const x = 99;" }] }),
+		parseEditRequest({ note: "why", files: { [file]: [{ match: "const x = 1;", new_str: "const x = 99;" }] } }),
 		process.cwd(),
 	);
 
@@ -65,10 +65,10 @@ test("a failed entry reports the disk state and every failure to the agent", asy
 
 	const outcome = await executeEditScript(
 		parseEditRequest({
-			note: "why", edits: [
-				{ path: good, op: "replace", old_str: "const a = 1;", new_str: "const a = 11;" },
-				{ path: stale, op: "delete", old_str: "missing text" },
-			],
+			note: "why", files: {
+				[good]: [{ match: "const a = 1;", new_str: "const a = 11;" }],
+				[stale]: [{ match: "missing text" }],
+			},
 		}),
 		process.cwd(),
 	);
@@ -78,7 +78,7 @@ test("a failed entry reports the disk state and every failure to the agent", asy
 	assert.equal(payload.status, "partial");
 	assert.deepEqual(payload.entries[0].changes, { additions: 1, deletions: 1, changedLines: 2 });
 	assert.equal(payload.entries[1].kind, "NOT_FOUND");
-	assert.match(payload.entries[1].message, /^old_str was not found; /);
+	assert.match(payload.entries[1].message, /^match was not found; /);
 	assert.equal(await fs.promises.readFile(good, "utf-8"), "const a = 11;\n");
 });
 
@@ -91,10 +91,10 @@ test("applied agent payload lists one entry per op with stats and location", asy
 
 	const outcome = await executeEditScript(
 		parseEditRequest({
-			note: "why", edits: [
-				{ path: first, op: "replace", old_str: "const a = 1;", new_str: "const a = 11;" },
-				{ path: second, op: "replace", old_str: "const b = 2;", new_str: "const b = 22;" },
-			],
+			note: "why", files: {
+				[first]: [{ match: "const a = 1;", new_str: "const a = 11;" }],
+				[second]: [{ match: "const b = 2;", new_str: "const b = 22;" }],
+			},
 		}),
 		process.cwd(),
 	);
@@ -102,8 +102,8 @@ test("applied agent payload lists one entry per op with stats and location", asy
 	assert.deepEqual(JSON.parse(buildOutcomeAgentContent(outcome)), {
 		status: "applied",
 		entries: [
-			{ path: first, op: "replace", changes: { additions: 1, deletions: 1, changedLines: 2 }, firstChangedLine: 1 },
-			{ path: second, op: "replace", changes: { additions: 1, deletions: 1, changedLines: 2 }, firstChangedLine: 1 },
+			{ path: first, changes: { additions: 1, deletions: 1, changedLines: 2 }, firstChangedLine: 1 },
+			{ path: second, changes: { additions: 1, deletions: 1, changedLines: 2 }, firstChangedLine: 1 },
 		],
 	});
 });
@@ -114,14 +114,14 @@ test("the same physical file twice under different path spellings is rejected be
 	await assert.rejects(
 		() => executeEditScript(
 			parseEditRequest({
-				note: "why", edits: [
-					{ path: file, op: "replace", old_str: "const x = 1;", new_str: "const x = 2;" },
-					{ path: `./${path.relative(process.cwd(), file)}`, op: "replace", old_str: "const", new_str: "let" },
-				],
+				note: "why", files: {
+					[file]: [{ match: "const x = 1;", new_str: "const x = 2;" }],
+					[`./${path.relative(process.cwd(), file)}`]: [{ match: "const", new_str: "let" }],
+				},
 			}),
 			process.cwd(),
 		),
-		/is an alias of edits\[0\]\.path/,
+		/are aliases of the same file/,
 	);
 	assert.equal(await fs.promises.readFile(file, "utf-8"), "const x = 1;\n");
 });
@@ -135,10 +135,10 @@ test("a cross-file match that relies on another file's new content fails without
 
 	const outcome = await executeEditScript(
 		parseEditRequest({
-			note: "why", edits: [
-				{ path: "provider.ts", op: "replace", old_str: "const old = 1;", new_str: "const brandNewName = 1;" },
-				{ path: "consumer.ts", op: "delete", old_str: "brandNewName" },
-			],
+			note: "why", files: {
+				"provider.ts": [{ match: "const old = 1;", new_str: "const brandNewName = 1;" }],
+				"consumer.ts": [{ match: "brandNewName" }],
+			},
 		}),
 		dir,
 	);

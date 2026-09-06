@@ -18,7 +18,7 @@ function failureOf(content, op) {
 	throw new Error("expected the edit to fail");
 }
 
-const replace = (oldStr, newStr) => ({ op: "replace", old_str: oldStr, new_str: newStr });
+const replace = (oldStr, newStr) => ({ match: oldStr, new_str: newStr });
 
 test("the file's real lines come back verbatim with their line numbers", () => {
 	const content = [
@@ -29,12 +29,12 @@ test("the file's real lines come back verbatim with their line numbers", () => {
 		"**默认假设**:产品先行,包纪律保持。",
 		"",
 	].join("\n");
-	const old_str = "维护面,需要时再拆。\n\n## 一、分层与依赖法则";
+	const needle = "维护面,需要时再拆。\n\n## 一、分层与依赖法则";
 
-	const error = failureOf(content, replace(old_str, "x"));
+	const error = failureOf(content, replace(needle, "x"));
 
 	assert.equal(error.kind, "NOT_FOUND");
-	assert.match(error.message, /^old_str was not found;/);
+	assert.match(error.message, /^match was not found;/);
 	assert.match(error.message, /3\|维护面,需要时再拆。/);
 	assert.match(error.message, /5\|\*\*默认假设\*\*:产品先行,包纪律保持。/);
 	assert.match(error.message, /L\d+/);
@@ -45,7 +45,7 @@ test("the reported column counts codepoints, not UTF-16 units", () => {
 	const error = failureOf(content, replace("定位基准🌟B", "x"));
 
 	assert.match(error.message, /L1 col 6:/);
-	assert.match(error.message, /file "A" U\+0041 ≠ old_str "B" U\+0042/);
+	assert.match(error.message, /file "A" U\+0041 ≠ match "B" U\+0042/);
 });
 
 test("a rewritten line comes back as the file has it", () => {
@@ -56,9 +56,9 @@ test("a rewritten line comes back as the file has it", () => {
 		"}",
 		"",
 	].join("\n");
-	const old_str = "  const sum = items.reduce((acc, item) => acc + item, 0);\n  return sum;";
+	const needle = "  const sum = items.reduce((acc, item) => acc + item, 0);\n  return sum;";
 
-	const error = failureOf(content, replace(old_str, "x"));
+	const error = failureOf(content, replace(needle, "x"));
 
 	assert.match(error.message, /2\|  const sum = items\.reduce\(\(a, b\) => a \+ b, 0\);/);
 	assert.match(error.message, /3\|  return sum;/);
@@ -68,9 +68,9 @@ test("a rewritten line comes back as the file has it", () => {
 
 test("invisible whitespace drift is named, not just shown", () => {
 	const content = ["def run():", "    return compute()", ""].join("\n");
-	const old_str = "        return compute()";
+	const needle = "        return compute()";
 
-	const error = failureOf(content, replace(old_str, "x"));
+	const error = failureOf(content, replace(needle, "x"));
 
 	assert.match(error.message, /2\|    return compute\(\)/);
 	assert.match(error.message, /space/);
@@ -87,9 +87,9 @@ test("mixed whitespace is shown, never miscounted as tabs or spaces", () => {
 
 test("no similar text is said plainly, with no invented location", () => {
 	const content = ["alpha", "beta", "gamma", ""].join("\n");
-	const old_str = "totally unrelated payload that shares nothing";
+	const needle = "totally unrelated payload that shares nothing";
 
-	const error = failureOf(content, replace(old_str, "x"));
+	const error = failureOf(content, replace(needle, "x"));
 
 	assert.equal(error.kind, "NOT_FOUND");
 	assert.match(error.message, /no similar text/);
@@ -103,41 +103,41 @@ test("a widely drifted block still comes back verbatim — that is what the mode
 		"step three: project the surfaces",
 		"",
 	].join("\n");
-	const old_str = [
+	const needle = [
 		"step one: collect every fact from the ledger",
 		"step two: derive the six states",
 		"step three: project all five surfaces of the table",
 	].join("\n");
 
-	const error = failureOf(content, replace(old_str, "x"));
+	const error = failureOf(content, replace(needle, "x"));
 
 	assert.match(error.message, /1\|step one: collect the facts/);
 	assert.match(error.message, /3\|step three: project the surfaces/);
 });
 
-test("the diagnostic asserts the old_str name and stays silent about the path", () => {
+test("the diagnostic asserts the match name and stays silent about the path", () => {
 	const error = failureOf("first\n", replace("missing", "replacement"));
 
 	assert.equal(error.kind, "NOT_FOUND");
-	assert.match(error.message, /^old_str was not found;/);
+	assert.match(error.message, /^match was not found;/);
 	assert.doesNotMatch(error.message, /story\.txt|edits\[/);
 });
 
 test("the payload is bounded: long lines truncate and the window is capped", () => {
 	const content = ["head", `  value = "${"x".repeat(400)}"`, "tail", ""].join("\n");
-	const old_str = `  value = "${"x".repeat(200)}Y${"x".repeat(199)}"`;
+	const needle = `  value = "${"x".repeat(200)}Y${"x".repeat(199)}"`;
 
-	const error = failureOf(content, replace(old_str, "z"));
+	const error = failureOf(content, replace(needle, "z"));
 
 	assert.ok(error.message.length < 400, `payload too long: ${error.message.length}`);
 	assert.match(error.message, /…/);
 });
 
-test("a long old_str reports only the first lines of the region", () => {
+test("a long needle reports only the first lines of the region", () => {
 	const content = Array.from({ length: 40 }, (_, index) => `line ${index + 1} of the file`).join("\n");
-	const old_str = Array.from({ length: 20 }, (_, index) => `line ${index + 1} of the FILE`).join("\n");
+	const needle = Array.from({ length: 20 }, (_, index) => `line ${index + 1} of the FILE`).join("\n");
 
-	const error = failureOf(content, replace(old_str, "x"));
+	const error = failureOf(content, replace(needle, "x"));
 
 	const shown = [...error.message.matchAll(/^\s*(\d+)\|/gm)].map((match) => Number(match[1]));
 	assert.ok(shown.length <= 8, `window not capped: ${shown.length} lines`);

@@ -1,5 +1,5 @@
 /**
- * match.ts —— edit 的词汇（脚本/条目/op）与纯匹配核心：内容字符串 + 单条操作
+ * match.ts —— edit 的词汇（脚本/条目）与纯匹配核心：内容字符串 + 单条操作
  * → spans + 新内容。
  *
  * 零 FS、零 IO。协议同构：一次调用 = 一个编辑脚本，每条目 = 一个原子修改
@@ -7,36 +7,45 @@
  * （上一 op 已生效的字节），失败即停、成功保留。
  */
 
-/** 走匹配面的 op：old_str 在「当前内容」上定位（精确或 fuzzy 等价类）。 */
-type MatchOp =
-	| { op: "replace"; old_str: string; new_str: string }
-	| { op: "replaceAll"; old_str: string; new_str: string }
-	| { op: "delete"; old_str: string };
-
-/** insert 不匹配文本：按行号定位（1-based 第 N 行之后，0 = 文件顶）。 */
-type InsertOp = { op: "insert"; insert_line: number; new_str: string };
+/** 匹配条目：声明「改什么、怎么改」。match 定位，new_str 缺省 = 删除（替换为空）。 */
+export type MatchSelector = {
+	/** 匹配目标（精确文本；regex:true 时为正则）。 */
+	match: string;
+	/** 替换文本；缺省 = 删除（替换为空）。 */
+	new_str?: string;
+	/** 第 N 次出现（1-based）。 */
+	occurrence?: number;
+	/** 只取前 M 个匹配（缺省 = 全部）。 */
+	limit?: number;
+	/** 锚点限定：只匹配 after 之后 / before 之前的区域。 */
+	after?: string;
+	before?: string;
+	/** match 按正则解释。 */
+	regex?: boolean;
+};
 
 /**
- * create/write 不经匹配引擎：都是「写全文」操作，由事务层直接处理。
- * create 拒绝已存在的文件；write 无条件写。
+ * 新建/整篇覆盖不做：模型用 cat heredoc 一步成型更自然；条目只管修改。
  */
-type EditOp = MatchOp | InsertOp
-	| { op: "create"; file_text: string }
-	| { op: "write"; file_text: string };
+type EditOp = MatchSelector;
 
 /**
- * 一个条目 = 一个 op + 它作用的 path。扁平是唯一形状：`op` 是
- * 判别符，它的字段与它平级——模型发什么，执行层就吃什么，中间没有第二种形状。
+ * 一个条目 = 一个 op。扁平是唯一形状：`op` 是判别符，它的字段与它平级——
+ * 模型发什么，执行层就吃什么，中间没有第二种形状。path 在 files 层（index.ts
+ * 校验时投影进 EditRequest.edits）。
  */
-export type EditEntry = { path: string } & EditOp;
+export type EditEntry = EditOp;
 
-/** 一次调用 = 一个编辑脚本：`note` 是它的 why，`edits` 是它的每一行。 */
-export type EditRequest = { note: string; edits: EditEntry[] };
+/** 一次调用 = 一个编辑脚本：`note` 是批次唯一意图，`edits` 是文件作用域
+ * 投影后的内部条目序列（每条目带 path，链式执行）。 */
+export type EditRequest = { note: string; edits: Array<EditEntry & { path: string }> };
 
-export type MatchedEditSpan =
-	| { kind: "replace"; matchIndex: number; matchLength: number; newText: string }
-	/** 零宽插入点：在 matchIndex 处插入 newText。 */
-	| { kind: "insert"; matchIndex: number; newText: string };
+export type MatchedEditSpan = {
+	kind: "replace";
+	matchIndex: number;
+	matchLength: number;
+	newText: string;
+};
 
 type AppliedEditResult = {
 	newContent: string;
@@ -112,6 +121,23 @@ function findAllMatchIndices(content: string, needle: string): number[] {
 	return indices;
 }
 
+function findAllRegexMatches(content: string, pattern: string): Array<{ index: number; length: number }> {
+	const matches: Array<{ index: number; length: number }> = [];
+	let regex: RegExp;
+	try {
+		regex = new RegExp(pattern, "g");
+	} catch (error) {
+		throw editError(`invalid regex: ${error instanceof Error ? error.message : String(error)}`, "INVALID_PARAMETER");
+	}
+	let match: RegExpExecArray | null;
+	while ((match = regex.exec(content)) !== null) {
+		matches.push({ index: match.index, length: match[0].length });
+		// 零宽匹配防死循环
+		if (match[0].length === 0) regex.lastIndex += 1;
+	}
+	return matches;
+}
+
 function lineNumberAt(content: string, index: number): number {
 	let line = 1;
 	for (let cursor = 0; cursor < index && cursor < content.length; cursor += 1) {
@@ -127,7 +153,7 @@ function lineNumbersAt(content: string, indices: number[]): number[] {
 /** 只在失败路径计算：错误必须带回文件原文，否则模型只能重读或重试。 */
 function getNotFoundError(content: string, needle: string): EditToolError {
 	return editError(
-		`old_str was not found; ${explainMissingMatch(content, needle)}`,
+		`match was not found; ${explainMissingMatch(content, needle)}`,
 		"NOT_FOUND",
 	);
 }
@@ -141,7 +167,7 @@ function getDuplicateError(matches: number, lineNumbers: number[]): EditToolErro
 		? ` (L${listed.join(", L")}${listed.length < lineNumbers.length ? ", …" : ""})`
 		: "";
 	return editError(
-		`old_str matched ${matches} locations${locations}; use a longer or more specific match`,
+		`match matched ${matches} locations${locations}; use a longer or more specific match`,
 		"DUPLICATE_MATCH",
 	);
 }
@@ -160,29 +186,65 @@ function resolveMatch(
 	allowMultiple: boolean,
 	// Pre-normalized content passed in to avoid re-normalizing per op.
 	normalizedContentForFuzzy?: { content: string },
+	selector?: MatchSelector,
 ): ResolvedMatch[] {
-	const exactMatches = findAllMatchIndices(content, needle);
-	if (exactMatches.length > 0) {
-		if (!allowMultiple && exactMatches.length > 1) {
-			throw getDuplicateError(exactMatches.length, lineNumbersAt(content, exactMatches));
+	// 选择器 → 候选区域：after/before 锚点限定搜索范围。
+	let searchStart = 0;
+	let searchEnd = content.length;
+	if (selector?.after !== undefined) {
+		const anchor = normalizeToLF(selector.after);
+		const anchorIndex = content.indexOf(anchor);
+		if (anchorIndex === -1) {
+			throw editError(`after anchor "${selector.after}" not found`, "NOT_FOUND");
 		}
-		return exactMatches.map((matchIndex) => ({ matchIndex, actualText: needle }));
+		searchStart = anchorIndex + anchor.length;
+	}
+	if (selector?.before !== undefined) {
+		const anchor = normalizeToLF(selector.before);
+		const anchorIndex = content.indexOf(anchor, searchStart);
+		if (anchorIndex === -1) {
+			throw editError(`before anchor "${selector.before}" not found`, "NOT_FOUND");
+		}
+		searchEnd = anchorIndex;
+	}
+	if (selector?.occurrence !== undefined && selector?.limit !== undefined) {
+		throw editError("occurrence and limit are mutually exclusive", "INVALID_PARAMETER");
+	}
+	const scopedContent = content.slice(searchStart, searchEnd);
+	const exactMatches = selector?.regex
+		? findAllRegexMatches(scopedContent, needle)
+		: findAllMatchIndices(scopedContent, needle).map((index) => ({ index, length: needle.length }));
+	if (exactMatches.length > 0) {
+		let selected = exactMatches;
+		if (selector?.occurrence !== undefined) {
+			const nth = selector.occurrence;
+			if (nth < 1 || nth > exactMatches.length) {
+				throw editError(`occurrence ${nth} exceeds ${exactMatches.length} matches`, "NOT_FOUND");
+			}
+			selected = [exactMatches[nth - 1]!];
+		} else if (selector?.limit !== undefined && selector.limit > 0 && selector.limit < exactMatches.length) {
+			selected = exactMatches.slice(0, selector.limit);
+		}
+		return selected.map(({ index, length }) => ({
+			matchIndex: index + searchStart,
+			actualText: scopedContent.substring(index, index + length),
+		}));
 	}
 
 	const fuzzyContent = normalizedContentForFuzzy?.content ?? normalizeForFuzzyMatch(content);
 	const normalizedNeedle = normalizeForFuzzyMatch(needle);
 	const fuzzyMatches = findAllMatchIndices(fuzzyContent, normalizedNeedle);
 	if (fuzzyMatches.length === 0) {
-		const repair = allowMultiple ? undefined : repairMatch(content, needle);
+		// 修复面与数量无关:总能尝试"找一个可修的唯一处"。修复是谓词(等长+同标记变体),
+		// 命中唯一才交回(多处可修 = 模棱两可,不猜)。
+		const repair = repairMatch(content, needle);
 		const repairedMatches = repair === undefined ? [] : findAllMatchIndices(content, repair.text);
 		if (repair !== undefined && repairedMatches.length === 1) {
 			return [{ matchIndex: repairedMatches[0]!, actualText: repair.text, marks: repair.marks }];
 		}
 		throw getNotFoundError(content, needle);
 	}
-	if (!allowMultiple && fuzzyMatches.length > 1) {
-		throw getDuplicateError(fuzzyMatches.length, lineNumbersAt(content, fuzzyMatches));
-	}
+	// fuzzy 命中多个:replace 默认全部替换,全部返回(选择器在调用方已收窄)。
 	return fuzzyMatches.map((matchIndex) => ({
 		matchIndex,
 		actualText: content.substring(matchIndex, matchIndex + needle.length),
@@ -262,54 +324,25 @@ function applyRepairedMarks(text: string, marks: ReadonlyMap<string, string> | u
 }
 
 function emptyMatchError(): EditToolError {
-	return editError("old_str must not be empty.", "INVALID_PARAMETER");
-}
-
-/** insert：在 insert_line（1-based 第 N 行之后；0 = 文件顶；N = 行数 = 文件尾）之后插入。 */
-function applyInsertOp(content: string, op: InsertOp): AppliedEditResult {
-	const newStr = normalizeToLF(op.new_str);
-	if (newStr.length === 0) {
-		return { newContent: content, matchedSpans: [] };
-	}
-	const lines = content.split("\n");
-	if (!Number.isInteger(op.insert_line) || op.insert_line < 0 || op.insert_line > lines.length) {
-		throw editError(
-			`insert_line must be an integer in 0..${lines.length} (the file has ${lines.length} lines)`,
-			"INVALID_PARAMETER",
-		);
-	}
-	// 插入点 = lines[0..insert_line) 的字节长度（每行含一个换行符）；行尾守卫防越界。
-	let insertAt = 0;
-	for (let index = 0; index < op.insert_line; index += 1) {
-		insertAt += lines[index]!.length + 1;
-	}
-	insertAt = Math.min(insertAt, content.length);
-	const newContent = content.slice(0, insertAt) + newStr + content.slice(insertAt);
-	return { newContent, matchedSpans: [{ kind: "insert", matchIndex: insertAt, newText: newStr }] };
+	return editError("match must not be empty.", "INVALID_PARAMETER");
 }
 
 /**
  * 单条操作应用到当前内容（链式）：
- * - replace/replaceAll：old_str → new_str（replaceAll 命中全部精确匹配，进 fuzzy 面）；
- * - delete：old_str → 空；
- * - insert：在 insert_line 之后插入 new_str。
+ * - replace：match → new_str（默认全部命中，选择器收窄；进 fuzzy 面）；
+ * - delete：match → 空。
  *
  * 失败（找不到/多处命中/空字段）直接抛出单条错误；调用方决定是否中断。
  */
 export function applyOpToNormalizedContent(normalizedContent: string, op: MatchOp | InsertOp): AppliedEditResult {
 	const fuzzyContentCache = { content: normalizeForFuzzyMatch(normalizedContent) };
 
-	if (op.op === "insert") {
-		return applyInsertOp(normalizedContent, op);
-	}
-
-	const isDelete = op.op === "delete";
-	const oldStr = normalizeToLF(op.old_str);
+	const oldStr = normalizeToLF(op.match);
 	if (oldStr.length === 0) throw emptyMatchError();
-	const newStr = normalizeToLF(isDelete ? "" : op.new_str);
-	const allowMultiple = op.op === "replaceAll";
+	// new_str 缺省 = 删除（替换为空）；默认全部命中，选择器收窄。
+	const newStr = normalizeToLF(op.new_str ?? "");
 
-	const matches = resolveMatch(normalizedContent, oldStr, allowMultiple, fuzzyContentCache);
+	const matches = resolveMatch(normalizedContent, oldStr, true, fuzzyContentCache, op);
 	if (matches.length === 0) throw getNotFoundError(normalizedContent, oldStr);
 
 	const spans = matches.map((match) => {
@@ -320,7 +353,7 @@ export function applyOpToNormalizedContent(normalizedContent: string, op: MatchO
 		return { matchIndex: match.matchIndex, matchLength: match.actualText.length, replacement };
 	});
 
-	// 单 op 内 replaceAll 的多个命中互不重叠（顺序扫描），直接拼接。
+	// 单 op 内多个命中互不重叠（顺序扫描），直接拼接。
 	const segments: string[] = [];
 	let cursor = 0;
 	for (const span of spans) {
@@ -345,7 +378,7 @@ export function applyOpToNormalizedContent(normalizedContent: string, op: MatchO
 			}],
 		};
 	}
-	// replaceAll 的多命中各自成 span：窗口按命中位置独立展开，hunk 分隔不丢失。
+	// 多命中各自成 span：窗口按命中位置独立展开，hunk 分隔不丢失。
 	return {
 		newContent,
 		matchedSpans: spans.map((span) => ({
@@ -356,21 +389,21 @@ export function applyOpToNormalizedContent(normalizedContent: string, op: MatchO
 		})),
 	};
 }/**
- * NOT_FOUND 的载荷：文件里最接近 old_str 的那几行，原样带回。
+ * NOT_FOUND 的载荷：文件里最接近 match 的那几行，原样带回。
  *
  * 为什么归引擎：字节的权威副本在引擎手上，模型手上只有一份可能失真的转写。
  * 语料(2026-08-27,560 session/14396 次 edit)里 913 次 NOT_FOUND 有 70% 的下一步
  * 就是重读同一个文件(bash 59% + read 11%)——那次往返取回的正是引擎已经持有的
  * 数据。所以失败响应带回原文,而不是把「not found」说得更好听。
  *
- * 算法一律暴力：按行扫全文,逐个对齐位打分。n 小(8MB 硬闸门,old_str 中位 195 字符),
+ * 算法一律暴力：按行扫全文,逐个对齐位打分。n 小(8MB 硬闸门,match 中位 195 字符),
  * 索引与近似搜索只会换来常数、bug 和读不懂的代码。
  *
  * 失效条件(满足即退役):NOT_FOUND 之后「重读同一文件」的比例没有从 70% 降下来。
  * 那就是说交回原文并未改变行为,这块代码只是在多花 token —— 同 runtime-hints 的判法。
  */
 
-/** 带回的行数上限：old_str 中位 3 行,超过这个数模型该重读而不是抄。 */
+/** 带回的行数上限：match 中位 3 行,超过这个数模型该重读而不是抄。 */
 const MAX_WINDOW_LINES = 8;
 const MAX_LINE_CHARS = 100;
 /**
@@ -410,7 +443,7 @@ function similarity(left: string, right: string): number {
 }
 
 /**
- * old_str 的首行可能从行中间开始、末行可能到行中间为止（模型截取片段作匹配目标）。
+ * match 的首行可能从行中间开始、末行可能到行中间为止（模型截取片段作匹配目标）。
  * 只有这两端允许这样比,中间各行必须整行对整行。
  */
 function matchLine(fileLine: string, needleLine: string, atStart: boolean, atEnd: boolean): LineMatch {
@@ -495,7 +528,7 @@ function isSameMarkVariant(left: string, right: string): boolean {
 type MatchRepair = { text: string; marks: ReadonlyMap<string, string> };
 
 /**
- * 修复面：最近区域与 old_str 只差同标记变体时，交出文件那段真字节，调用方拿它跑
+ * 修复面：最近区域与 match 只差同标记变体时，交出文件那段真字节，调用方拿它跑
  * 普通的精确匹配——定位、唯一性、重叠检查全回到精确字节上。
  *
  * 拒绝修复：没有对齐、并列的同分对齐（模棱两可）、行长不等（不是纯标记差异）、
@@ -524,10 +557,10 @@ function repairSegment(onDisk: string, authored: string, marks: Map<string, stri
 
 /**
  * 修复搜索是结构性的，**不用**诊断面的相似度评分：前后缀相似度低估多处差异
- * （五个全角标点散布一行时只有 0.15），拿它当门槛会把本可修的 old_str 拦在外。
+ * （五个全角标点散布一行时只有 0.15），拿它当门槛会把本可修的 match 拦在外。
  * 判据只有两条：等长，且每处差异都是同标记变体。两处以上都能修 → 模棱两可，不猜。
  *
- * 单行 old_str：可能落在行内任意位置，逐位试。
+ * 单行 match：可能落在行内任意位置，逐位试。
  */
 function repairWithinLine(fileLine: string, needle: string): MatchRepair | undefined {
 	let found: MatchRepair | undefined;
@@ -541,7 +574,7 @@ function repairWithinLine(fileLine: string, needle: string): MatchRepair | undef
 	return found;
 }
 
-/** 多行 old_str：首行可以是某行的后缀、末行可以是某行的前缀，中间各行必須整行。 */
+/** 多行 match：首行可以是某行的后缀、末行可以是某行的前缀，中间各行必須整行。 */
 function repairAcrossLines(lines: string[], needleLines: string[], start: number): MatchRepair | undefined {
 	const marks = new Map<string, string>();
 	const segments: string[] = [];
@@ -615,7 +648,7 @@ function divergenceOf(lines: string[], needleLines: string[], start: number): st
 		// 列号按码位数（CJK/emoji 各算一列），不是 UTF-16 单元。
 		const column = [...fileLine.slice(0, match.offset + prefix)].length + 1;
 		return `L${start + index + 1} col ${column}: file ${describeText(fileText)}`
-			+ ` ≠ old_str ${describeText(needleText)}`;
+			+ ` ≠ match ${describeText(needleText)}`;
 	}
 	return undefined;
 }
@@ -631,7 +664,7 @@ function renderWindow(lines: string[], start: number, count: number): string {
 }
 
 /**
- * 返回接在 `old_str was not found; ` 之后的诊断：定位 + 文件原文。
+ * 返回接在 `match was not found; ` 之后的诊断：定位 + 文件原文。
  * 找不到相近文本时明说找不到——不编造行号。
  */
 function explainMissingMatch(content: string, needle: string): string {

@@ -1,12 +1,10 @@
 /**
- * edit —— 条目式精确编辑工具。契约见 README：一次调用 = 一个编辑脚本，
- * `note` 是脚本的 why，`edits[]` 是扁平条目序列（每条目一个原子修改），
- * 顺序链式执行，失败即停、成功保留。
+ * edit —— 文件作用域化的严格编辑工具。契约见 README：
+ * 一次调用 = 一个编辑脚本；note 是批次唯一意图（docstring：为什么改），
+ * files[path] 是每个文件的条目链（顺序链式执行，失败即停、成功保留）。
  *
- * 一种形状，从模型到磁盘：条目扁平——`op` 是判别符，`old_str`/`new_str`/`insert_line` 等
- * 字段与它平级。schema 说的形状、校验后的形状、执行层吃的形状是同一个对象；
- * 校验只收窄类型，不重组。
-
+ * 严格模式：schema 说死唯一形状——op 未用字段（含 null）、顶层多余键全部拒绝，
+ * 错误即时可见，单一真相源才可能被纠正。不向后兼容。
  */
 
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -16,61 +14,51 @@ import type { EditEntry, EditRequest } from "./match.ts";
 import { executeEditScript, type ScriptOutcome } from "./transaction.ts";
 import { isScriptOutcome, renderCallView, renderClearedCallState, renderInvalidCall, renderResultView } from "./ui.ts";
 
-const opNames = ["replace", "replaceAll", "insert", "delete", "create", "write"] as const;
-type OpName = (typeof opNames)[number];
-
-/**
- * 枚举发成裸 `{ type: "string", enum }`：Google 的 API 不接受 anyOf/const，而
- * 字面量联合（`Type.Union` + `Type.Literal`）正编译成那个形状
- *（docs/extensions.md）。等价于 pi-ai 的 `StringEnum`——本扩展不依赖
- * pi-ai，就地一份。
- */
-function stringEnum<T extends string>(values: readonly T[], description?: string) {
-	return Type.Unsafe<T>({
-		type: "string",
-		enum: [...values],
-		...(description !== undefined ? { description } : {}),
-	});
-}
-
-const opShapesDescription =
-	"replace|replaceAll: old_str+new_str; insert: insert_line+new_str; delete: old_str; create: file_text (new file only); write: file_text (always)";
-// 平铺单对象 schema（保持，不改为 anyOf/const 判别联合）：op 枚举判别 + 字段全集可选，
-// 各 op 必填组合由 OP_REQUIRED 表驱动。字段描述只写一句用途——角色映射在 op 行、
-// null 占位在工具 description，都是单一真源，不重复喂给已 RL 后训练的模型。
-const entrySchema = Type.Object(
+// 平铺单对象 schema：match 必填 + 全字段可选。多余键在 schema 层被拒
+//（additionalProperties:false），未声明字段（含 null）也随之被 schema 拒绝——
+// 这就是严格模式：错误在 schema 就可见，不等到执行。
+const filesEntrySchema = Type.Object(
 	{
-		path: Type.String({ description: "File path, relative to cwd (or absolute)." }),
-		op: stringEnum(opNames, opShapesDescription),
-		old_str: Type.Optional(Type.Unsafe<string | null>({
+		match: Type.Unsafe<string | null>({
 			type: ["string", "null"],
-			description: "The text to locate in the file.",
-		})),
+			description: "Smallest text to match.",
+		}),
 		new_str: Type.Optional(Type.Unsafe<string | null>({
 			type: ["string", "null"],
-			description: "Replacement text / inserted content / new content.",
+			description: "Replacement text; omitted = delete.",
 		})),
-		insert_line: Type.Optional(Type.Unsafe<number | null>({
+		occurrence: Type.Optional(Type.Unsafe<number | null>({
 			type: ["integer", "null"],
-			description: "Line after which to insert: 1-based, 0 = file top.",
 		})),
-		file_text: Type.Optional(Type.Unsafe<string | null>({
+		limit: Type.Optional(Type.Unsafe<number | null>({
+			type: ["integer", "null"],
+		})),
+		after: Type.Optional(Type.Unsafe<string | null>({
 			type: ["string", "null"],
-			description: "Whole-file content for create/write.",
+		})),
+		before: Type.Optional(Type.Unsafe<string | null>({
+			type: ["string", "null"],
+		})),
+		regex: Type.Optional(Type.Unsafe<boolean | null>({
+			type: ["boolean", "null"],
 		})),
 	},
 	{ additionalProperties: false },
 );
 
-// 一次调用 = 一个编辑脚本：note 是脚本级注释（docstring：为什么改），edits
-// 是脚本的 what（每条目一个原子修改）——「批次为什么存在」是脚本级属性，
-// 条目级再带注释只剩复述，删掉。
+// 一次调用 = 一个编辑脚本：note 是批次唯一意图（docstring：为什么改），
+// files 是每个文件的 op 链（顺序执行）。op 条目不带注释——一个意图驱动一批修改。
 const editRequestSchema = Type.Object(
 	{
 		note: Type.String({
-			description: "One line: why this change exists.",
+			description: "One line: why this batch of changes exists.",
 		}),
-		edits: Type.Array(entrySchema, { minItems: 1 }),
+		files: Type.Record(
+			Type.String(),
+			Type.Array(filesEntrySchema, { minItems: 1 }),
+			{ description: "Map of file path → ordered entries for that file." },
+		),
+	
 	},
 	{ additionalProperties: false },
 );
@@ -92,64 +80,64 @@ function describeType(value: unknown): string {
 	return typeof value;
 }
 
-/** 每个 op 必填的参数（类型层在 schema 兜底，这里管「该 op 必须给出」）。 */
-const OP_REQUIRED: Record<OpName, { strings?: readonly string[]; integers?: readonly string[] }> = {
-	replace: { strings: ["old_str", "new_str"] },
-	replaceAll: { strings: ["old_str", "new_str"] },
-	insert: { strings: ["new_str"], integers: ["insert_line"] },
-	delete: { strings: ["old_str"] },
-	create: { strings: ["file_text"] },
-	write: { strings: ["file_text"] },
-};
-
 /**
- * 校验一个条目并收窄类型：返回的就是传进来的那个对象，没有重组。
- *
- * 必填参数按 op 检查，类型错（含 null）报「got X」；多余参数一律不读——
- * str_replace_editor 语义：op 只用自己该用的字段，未用键（含 null 与非 null）
- * 原样忽略。
+ * 严格校验一个条目并收窄类型：返回的就是传进来的那个对象，没有重组。
+ * 必填参数按 op 检查；op 未用的字段（含 null）一律拒绝——错误即时可见，
+ * 单一真相源才可能被纠正。
  */
 function checkEntry(entry: unknown, label: string): EditEntry {
 	if (!isRecord(entry)) invalidEditRequest(`${label} must be an object`);
-	if (typeof entry.path !== "string") {
-		invalidEditRequest(`${label}.path must be a string, got ${describeType(entry.path)}`);
-	}
-	const op = entry.op;
-	if (typeof op !== "string" || !(opNames as readonly string[]).includes(op)) {
-		invalidEditRequest(`${label}.op must be one of ${opNames.join(" | ")}`);
-	}
-	const required = OP_REQUIRED[op as OpName];
-	for (const key of required.strings ?? []) {
-		if (typeof entry[key] !== "string") {
-			invalidEditRequest(`${label}.${key} must be a string, got ${describeType(entry[key])}`);
-		}
-	}
-	for (const key of required.integers ?? []) {
-		if (!Number.isInteger(entry[key])) {
-			invalidEditRequest(`${label}.${key} must be an integer, got ${describeType(entry[key])}`);
-		}
-	}
-	// 收尾：未用字段的 null 视同省略。条目即终态，不重组。
+	// 单一真相源：允许字段 = schema 声明的属性（校验与 schema 永不脱节）。
+	const allowed = Object.keys(filesEntrySchema.properties);
 	for (const key of Object.keys(entry)) {
-		if (entry[key] === null) delete entry[key];
+		if (!allowed.includes(key)) {
+			invalidEditRequest(`${label}.${key} must be removed`);
+		}
+	}
+	if (typeof entry.match !== "string") {
+		invalidEditRequest(`${label}.match must be a string, got ${describeType(entry.match)}`);
+	}
+	if (entry.new_str !== undefined && typeof entry.new_str !== "string") {
+		invalidEditRequest(`${label}.new_str must be a string, got ${describeType(entry.new_str)}`);
 	}
 	return entry as EditEntry;
 }
 
-/** 主形状校验：note + 每条目 path + op 必填参数。 */
+/**
+ * 主形状校验：note + files（path → op 链）。校验即投影：files 展平成
+ * 内部条目序列（条目带 path），执行层继续吃同一种形状——schema 说死的形状
+ * 和执行层吃的形状仍是同一个，只是校验处多做一次确定性投影。
+ *
+ * 严格闸门在这里，不依赖 TypeBox 的松 Record 校验：任何多余键（含 null）、
+ * op 未用字段、缺失必填、空 note/files 都在这里即时拒绝，错误带字段名与
+ * 当前值——单一真相源，一次错误立即纠正，不静默忽略。
+ */
 export function parseEditRequest(input: unknown): EditRequest {
-	if (!isRecord(input)) invalidEditRequest("note must be an object with note and edits");
+	if (!isRecord(input)) invalidEditRequest("note must be an object with note and files");
 	for (const key of Object.keys(input)) {
-		if (key === "edits" || key === "note") continue;
+		if (key === "files" || key === "note") continue;
 		invalidEditRequest(`${key} must be removed`);
 	}
 	if (typeof input.note !== "string" || input.note.trim() === "") {
-		invalidEditRequest("note is required: one line naming why this change exists");
+		invalidEditRequest("note is required: one line naming why this batch exists");
 	}
 	const note = input.note;
-	if (!Array.isArray(input.edits)) invalidEditRequest("edits must be an array");
-	if (input.edits.length === 0) invalidEditRequest("edits must not be empty");
-	return { note, edits: input.edits.map((entry, index) => checkEntry(entry, `edits[${index}]`)) };
+	if (!isRecord(input.files)) invalidEditRequest("files must be an object");
+	// 自有键枚举（getOwnPropertyNames）：__proto__/constructor 等原型键不可见但
+	// 会被 for..in 之外的方式携带——严格模式必须枚举并拒绝它们，不能静默丢弃。
+	const fileKeys = Object.getOwnPropertyNames(input.files);
+	if (fileKeys.length === 0) invalidEditRequest("files must not be empty");
+	const edits: EditEntry[] = [];
+	for (const filePath of fileKeys) {
+		const chain = input.files[filePath];
+		if (!Array.isArray(chain)) invalidEditRequest(`files["${filePath}"] must be an array`);
+		if (chain.length === 0) invalidEditRequest(`files["${filePath}"] must not be empty`);
+		for (const rawEntry of chain) {
+			const entry = checkEntry(rawEntry, `files["${filePath}"]`);
+			edits.push({ path: filePath, ...entry });
+		}
+	}
+	return { note, edits };
 }
 
 /**
@@ -184,16 +172,18 @@ export default function (pi: ExtensionAPI) {
 		label: "edit",
 		renderShell: "default",
 		// prompt 面只写「与后训练先验的差量」，强 RL 模型自明的话一字不写：
-		// 链式条目序列（先验是 files[].edits[] 批形状）、comment 由 schema
+		// 链式条目序列（先验是 files[].edits[] 批形状）、note 由 schema
 		// required 保证、失败即停由结果信封（skipped）自明。
 		description:
-			"Edit files as an entry chain — one op per entry on one path; stops at the first failed entry."
-			+ " null parameters are treated as omitted.",
+			"Edit existing files by string replacement — files grouped by path, entries in order."
+			+ " Entry = match + optional new_str (omitted = delete). New files / full rewrites: use cat."
+			+ " Chain multiple entries per file in order; stops at the first failed entry."
+			+ " Strict: unused parameters (incl. null) are rejected; errors name the field and current value.",
 		promptSnippet: "Exact file edits",
 		parameters: editRequestParameters,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const request = parseEditRequest(params);
-	const outcome = await executeEditScript(request, ctx.cwd, signal);
+			const outcome = await executeEditScript(request, ctx.cwd, signal);
 
 			// AgentToolResult 没有 isError 字段：信封由 harness 写，写在这里会被静默丢弃；
 			// 软失败靠下面的 tool_result handler 改信封。

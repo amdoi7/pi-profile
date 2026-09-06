@@ -163,63 +163,6 @@ function toFailure(error: unknown): Extract<ReadOutcome, { kind: "failed" }> {
 }
 
 /**
- * create 的解析面：不经匹配引擎（match.ts 不参与），存在性闸门代替匹配。
- * 新建：old 为空；write：读旧内容做 diff 展示。零写入。
- */
-async function prepareCreateOp(
-	entry: OpEntryRequest,
-	operations: EntryOperations,
-	signal: AbortSignal | undefined,
-): Promise<ReadOutcome> {
-	throwIfAborted(signal);
-	const text = entry.edit.file_text;
-	if (text.length > MAX_EDIT_FILE_SIZE_BYTES) {
-		return {
-			kind: "failed",
-			error: `File too large for create: sizeBytes=${text.length} limitBytes=${MAX_EDIT_FILE_SIZE_BYTES}`,
-		};
-	}
-
-	let fileExists = false;
-	let rawContent = "";
-	try {
-		await operations.stat(entry.absolutePath);
-		fileExists = true;
-	} catch {
-		fileExists = false;
-	}
-
-	if (fileExists && entry.edit.op === "create") {
-		return {
-			kind: "failed",
-			error: 'File already exists; use op: "write" to replace it',
-		};
-	}
-	if (fileExists) {
-		try {
-			rawContent = await operations.readFile(entry.absolutePath);
-		} catch (error) {
-			return toFailure(error);
-		}
-	}
-	throwIfAborted(signal);
-
-	const { bom, text: oldContent } = stripBom(rawContent === "" ? "" : rawContent);
-	return {
-		kind: "read",
-		prepared: {
-			absolutePath: entry.absolutePath,
-			rawContent,
-			bom,
-			lineEnding: "\n",
-			normalizedContent: oldContent,
-			newContent: text,
-			matchedSpans: [],
-		},
-	};
-}
-
-/**
  * 读 + 应用单条匹配 op（解析面，零写入）。失败作为单条目事实返回；abort 上抛。
  */
 async function readAndApplyOp(
@@ -281,7 +224,7 @@ function serializeForDisk(prepared: PreparedEntry): string {
  * 展示 diff：用已知的 matched span 直接构造（span-diff），规模 = 编辑规模。
  */
 function computePreview(entry: PreparedEntry) {
-	// create/write 无锚 span：spans 为空时不能裁剪，走整文件 diff。
+	// 无锚 span 时不能裁剪，走整文件 diff。
 	const diff = entry.matchedSpans.length > 0
 		? diffFromSpans(
 			entry.normalizedContent,
@@ -329,9 +272,7 @@ export async function executeOpEntries(
 				}
 				throwIfAborted(signal);
 
-				const read = entry.edit.op === "create" || entry.edit.op === "write"
-					? await prepareCreateOp(entry, operations, signal)
-					: await readAndApplyOp(entry, operations, signal);
+				const read = await readAndApplyOp(entry, operations, signal);
 				if (read.kind === "failed") {
 					outcomes.push({ edit: entry.edit, status: "failed", error: read.error, ...(read.errorKind !== undefined ? { errorKind: read.errorKind } : {}) });
 					stopped = true;
@@ -369,7 +310,7 @@ function canonicalizePath(filePath: string, cwd: string): string {
  * 脚本执行入口：canonical path 去重后交给条目执行器。别名路径（./a.ts、
  * symlink、大小写不敏感盘上的变体）在读盘前响亮拒绝——此时合并会隐式选定
  * 一个 path 写法并丢弃另一个的意图，语义不无歧义。同 path 多条目不在此合并：
- * 链式顺序应用是主契约，重复 path 是表达多步修改的合法形状。
+ * 链式顺序应用是主契约（files[path] 的 op 链投影成同 path 连续条目）。
  */
 export async function executeEditScript(
 	request: EditRequest,
@@ -382,7 +323,7 @@ export async function executeEditScript(
 		const first = firstUse.get(canonicalPath);
 		if (first !== undefined && request.edits[first]!.path !== request.edits[index]!.path) {
 			throw new Error(
-				`edits[${index}].path is an alias of edits[${first}].path (${canonicalPath}); use one path spelling`,
+				`files["${request.edits[index]!.path}"] and files["${request.edits[first]!.path}"] are aliases of the same file (${canonicalPath}); use one path spelling`,
 			);
 		}
 		firstUse.set(canonicalPath, index);

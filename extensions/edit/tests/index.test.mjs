@@ -44,7 +44,7 @@ test("a rejected sequence flips the tool result envelope to isError", async () =
 
 	const result = await run(tool, {
 		note: "why",
-		edits: [{ path: file, op: "replace", old_str: "missing text", new_str: "replacement" }],
+		files: { [file]: [{ match: "missing text", new_str: "replacement" }] },
 	});
 
 	const payload = JSON.parse(result.content[0].text);
@@ -71,10 +71,10 @@ test("a partial sequence (some applied, some failed) is not an error", async () 
 
 	const result = await run(tool, {
 		note: "why",
-		edits: [
-			{ path: good, op: "replace", old_str: "const x = 1;", new_str: "const x = 99;" },
-			{ path: stale, op: "replace", old_str: "missing anchor", new_str: "z" },
-		],
+		files: {
+			[good]: [{ match: "const x = 1;", new_str: "const x = 99;" }],
+			[stale]: [{ match: "missing anchor", new_str: "z" }],
+		},
 	});
 
 	const payload = JSON.parse(result.content[0].text);
@@ -92,7 +92,7 @@ test("an applied sequence and other tools leave the envelope untouched", async (
 
 	const applied = await run(tool, {
 		note: "why",
-		edits: [{ path: file, op: "replace", old_str: "const x = 1;", new_str: "const x = 2;" }],
+		files: { [file]: [{ match: "const x = 1;", new_str: "const x = 2;" }] },
 	});
 
 	assert.equal(onToolResult({ type: "tool_result", toolName: "edit", isError: false, details: applied.details }), undefined);
@@ -105,20 +105,22 @@ test("an applied sequence is not an error and keeps its entries in the UI detail
 
 	const result = await run(tool, {
 		note: "why",
-		edits: [{ path: file, op: "replaceAll", old_str: "const", new_str: "let" }],
+		files: { [file]: [{ match: "const", new_str: "let" }] },
 	});
 
 	assert.notEqual(result.isError, true);
 	assert.equal(JSON.parse(result.content[0].text).status, "applied");
 	assert.equal(result.details.entries[0].edit.path, file);
-	assert.equal(result.details.entries[0].edit.op, "replaceAll");
+	assert.equal(result.details.entries[0].edit.match, "const");
 });
 
-// provider 侧契约：edits 必填非空，op 枚举受控，字段按 op 分管。
-test("the provider schema requires a non-empty edits array with controlled ops", () => {
-	assert.deepEqual(editRequestParameters.required, ["note", "edits"]);
+// provider 侧契约：files 必填非空，op 枚举受控，字段按 op 分管。
+test("the provider schema requires a non-empty files object with controlled ops", () => {
+	assert.deepEqual(editRequestParameters.required, ["note", "files"]);
 	assert.equal(editRequestParameters.additionalProperties, false);
-	assert.equal(editRequestParameters.properties.edits.minItems, 1);
+	const record = editRequestParameters.properties.files;
+	const entry = record.additionalProperties ?? Object.values(record.patternProperties ?? {})[0];
+	assert.equal(entry.minItems, 1);
 });
 
 test("a sequence missing its entries is rejected before touching the file", async () => {
@@ -126,8 +128,8 @@ test("a sequence missing its entries is rejected before touching the file", asyn
 	const file = await writeTempFile("target.ts", "const x = 1;\n");
 
 	await assert.rejects(
-		() => run(tool, { note: "why", edits: [] }),
-		/edits must not be empty/,
+		() => run(tool, { note: "why", files: {} }),
+		/files must not be empty/,
 	);
 	assert.equal(await fs.readFile(file, "utf-8"), "const x = 1;\n");
 });
