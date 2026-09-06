@@ -94,6 +94,20 @@ describe("transport(窄协议 NDJSON:deliver 投递→接管→ack / who 实时�
 		srv.close();
 	});
 
+	test("mute 视为可接管:挂起/僵死进程(可连不应答)不占位——startPeerServer 接管它", async () => {
+		// 挂起进程(cmd-Z)的 socket:内核接受 connect 但不应答 who;
+		// 有过期心跳(进程活但事件循环冻结)→ probe 判可接管,随后 rm+listen。
+		const mutePath = sockPath();
+		writeFileSync(mutePath.replace(/\.sock$/, ".heartbeat"), `${process.pid} ${Date.now() - 200_000}\n`); // 过期心跳
+		const silent = createServer(() => {}); // 收连接永不应答 = 挂起进程
+		await new Promise((r) => silent.listen(mutePath, r));
+		const srv = await startPeerServer(mutePath, handlers());
+		assert.equal(srv.serving, true, "mute 的 socket 应被接管");
+		await sendPeerMessage(mutePath, msg("接管后可用")); // 新进程应答
+		srv.close();
+		silent.close();
+	});
+
 	test("活进程冲突 → 退让(serving=false,不抢 socket);退让方 close 无害", async () => {
 		const path = sockPath();
 		const a = await startPeerServer(path, handlers());

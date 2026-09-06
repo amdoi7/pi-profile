@@ -6,7 +6,7 @@ export default defineConfig({
 	resolve: {
 		alias: {
 			"@earendil-works/pi-coding-agent":
-				"/Users/amdoi7/.pi/agent/node_modules/@earendil-works/pi-coding-agent/dist/index.js",
+				"/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/index.js",
 			"@earendil-works/pi-tui": "/Users/amdoi7/.pi/agent/node_modules/@earendil-works/pi-tui/dist/index.js",
 		},
 	},

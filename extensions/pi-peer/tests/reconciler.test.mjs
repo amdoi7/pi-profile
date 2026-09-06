@@ -143,18 +143,63 @@ describe("reconciler(在场循环:接管重试 + 退役门)", () => {
 		assert.equal(rec.serving(), false);
 	});
 
-	test("退役门(退让中脱离):停止接管重试,onRetire(wasServing=false)", async () => {
-		let detached = false;
+	test("影子检测(服务中):amIServing 返回 taken → 退役;gone → 席位重建", async () => {
+		// taken:另一进程 rm+listen 接管了同一 socket,本进程 fd 已失效 → 退役让位。
+		// gone:路径被外部移除 → 不退役,置 serving=false 重建,下 tick 重新接管。
 		const retired = [];
+		let serveCalls = 0;
+		let shadow;
 		const rec = await startReconciler({
-			tryServe: async () => false, // 占用方在场,一直退让
-			shouldRetire: () => detached,
+			tryServe: async () => {
+				serveCalls++;
+				return true; // 首轮接管成功
+			},
+			amIServing: () => shadow,
 			onRetire: (wasServing) => retired.push(wasServing),
 			intervalMs: MANUAL,
 		});
-		assert.equal(rec.serving(), false);
-		detached = true;
+		assert.equal(rec.serving(), true, "首轮在场");
+		shadow = "taken"; // 被接管
 		await rec.tick();
-		assert.deepEqual(retired, [false]);
+		assert.deepEqual(retired, [true], "taken → 退役并释放 socket");
+		assert.equal(rec.serving(), false);
+		await rec.tick();
+		assert.equal(serveCalls, 1, "退役后冻结,不再尝试接管(身份已让渡)");
+	});
+
+	test("影子检测(gone):路径被外部移除 → 席位重建,下 tick 重新接管", async () => {
+		const retired = [];
+		let serveCalls = 0;
+		let shadow = "ok";
+		const rec = await startReconciler({
+			tryServe: async () => {
+				serveCalls++;
+				return true;
+			},
+			amIServing: () => shadow,
+			onRetire: (wasServing) => retired.push(wasServing),
+			intervalMs: MANUAL,
+		});
+		assert.equal(rec.serving(), true, "首轮在场");
+		shadow = "gone"; // 外部移除
+		await rec.tick();
+		assert.deepEqual(retired, [], "gone 不退役");
+		assert.equal(rec.serving(), true, "gone 同 tick 内即重建(置 serving=false 后立即 tryServe)");
+		shadow = "ok"; // 外部接管方退出,自己重新接管成功
+		await rec.tick();
+		assert.equal(rec.serving(), true, "重建成功");
+		rec.stop();
+	});
+
+	test("影子检测(退让中):未服务也检查,被接管后退役", async () => {
+		const retired = [];
+		const rec = await startReconciler({
+			tryServe: async () => false, // 一直退让
+			amIServing: () => "taken", // 从未真正服务(被接管)
+			onRetire: (wasServing) => retired.push(wasServing),
+			intervalMs: MANUAL,
+		});
+		await rec.tick();
+		assert.deepEqual(retired, [false], "未服务被接管 → 退役(无需释放 socket)");
 	});
 });

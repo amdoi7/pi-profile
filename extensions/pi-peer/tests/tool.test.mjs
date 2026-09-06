@@ -1,5 +1,6 @@
 import { describe, test } from "vitest";
 import assert from "node:assert/strict";
+import { createServer } from "node:net";
 import { mkdirSync, mkdtempSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +8,7 @@ import { join } from "node:path";
 import { WindowQuota } from "../src/quota.ts";
 import { humanizeIdle, registerPeerTools } from "../src/tool.ts";
 import { socketDir, socketPathFor, startPeerServer } from "../src/transport.ts";
+import { writeHeartbeat } from "../src/process.ts";
 
 /** 测试基建:假 pi 抓 registerTool;peers 以真 socket server 扮演(端到端走协议),
  * 每次 setup 独立 socket 目录(socket 目录即名册,按 cwd 分区)。 */
@@ -24,7 +26,9 @@ async function setup(peers = [], over = {}) {
 	registerPeerTools(pi, () => rt);
 	const servers = [];
 	for (const p of peers) {
-		servers.push(await startPeerServer(socketPathFor(p.identity.sessionId, CWD), { who: () => p.identity, deliver: p.deliver ?? (async () => {}) }));
+		const sockPath = socketPathFor(p.identity.sessionId, CWD);
+		writeHeartbeat(sockPath.replace(/\.sock$/, ".heartbeat"), process.pid);
+		servers.push(await startPeerServer(sockPath, { who: () => p.identity, deliver: p.deliver ?? (async () => {}) }));
 	}
 	const run = (name) => (params = {}) => tools[name].execute("c1", params, undefined, undefined, { cwd: CWD });
 	return {
@@ -107,6 +111,22 @@ describe("peer 工具", () => {
 			"<error>not delivered:",
 			"<error>- ghost: no live peer",
 		], "部分失败不能长得像全成功");
+	});
+
+	// 可连但不应答的占位:不列 peer,但显式上报为 suspended(挂起,带 pid)
+	test("list:suspended socket 单独上报(带 pid),不混入 peer 行", async () => {
+		const { list, dir, close } = await setup([{ identity: identity({ sessionId: "liveaaaa-0001" }) }]);
+		const silent = createServer(() => {});
+		const mutePath = join(dir, "mute-1234-abcdef1234.sock");
+		await new Promise((r) => silent.listen(mutePath, r));
+		writeFileSync(join(dir, "mute-1234-abcdef1234.heartbeat"), `${process.pid} ${Date.now() - 200_000}\n`); // 过期心跳 = 挂起
+		const text = (await list()).content[0].text;
+		assert.ok(text.includes("Online pi sessions (1)"), "计数只算应答的活会话");
+		assert.ok(text.includes("id=liveaaaa"));
+		assert.ok(text.includes("Suspended sockets"), "挂起占位显式上报");
+		assert.ok(text.includes(String(process.pid)), "挂起占位带 pid");
+		silent.close();
+		close();
 	});
 
 	test("humanizeIdle 边界:now/m/h/d", () => {

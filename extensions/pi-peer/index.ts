@@ -1,11 +1,13 @@
 import { isatty } from "node:tty";
+import { mkdirSync, rmSync } from "node:fs";
 import { getMarkdownTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { buildInjectedContent, formatIncomingCard } from "./src/messages.ts";
 import { WindowQuota } from "./src/quota.ts";
 import { startReconciler, type Reconciler } from "./src/reconciler.ts";
 import { PEER_SEND_QUOTA, registerPeerTools, type PeerRuntime } from "./src/tool.ts";
-import { sendPeerMessage, socketPathFor, startPeerServer, type PeerIdentity, type PeerMessage, type PeerServer } from "./src/transport.ts";
+import { sendPeerMessage, heartbeatPathFor, socketPathFor, startPeerServer, type PeerIdentity, type PeerMessage, type PeerServer } from "./src/transport.ts";
+import { writeHeartbeat } from "./src/process.ts";
 
 /**
  * pi-peer:同机 pi 会话互发消息。
@@ -18,6 +20,8 @@ export default function (pi: ExtensionAPI): void {
 	let rt: PeerRuntime | undefined;
 	let server: PeerServer | undefined;
 	let rec: Reconciler | undefined;
+let hbPath: string | undefined;
+let hbTimer: ReturnType<typeof setInterval> | undefined;
 
 	registerPeerTools(pi, () => rt);
 
@@ -35,6 +39,13 @@ export default function (pi: ExtensionAPI): void {
 		const sessionId = sm.getSessionId();
 		const startedAt = Date.now();
 		const socketPath = socketPathFor(sessionId, ctx.cwd);
+		hbPath = heartbeatPathFor(sessionId, ctx.cwd);
+		// 在场性心跳:观察者据此用 kill 0 + 时间戳判在线/挂起/尸体,零外部命令。
+		mkdirSync(hbPath.slice(0, hbPath.lastIndexOf("/")), { recursive: true });
+		writeHeartbeat(hbPath, process.pid);
+		// 周期刷新心跳:挂起(事件循环冻结)时停更 → 观察者判 suspended
+		hbTimer = setInterval(() => writeHeartbeat(hbPath!, process.pid), 60_000);
+		hbTimer.unref?.();
 		// 身份每次实时求值(sessionFile 在 print/ephemeral 下可能晚到)
 		const identity = (): PeerIdentity => ({
 			sessionId,
@@ -83,6 +94,9 @@ export default function (pi: ExtensionAPI): void {
 				if (srv.serving) server = srv;
 				return srv.serving;
 			},
+			// 影子检测(三态):ok 仍是我;gone 路径被外部移除 → 席位重建(下 tick 重接管);
+			// taken 他人接管身份 → 退役。挂起期间的接管由观察者(其他活会话)负责。
+			amIServing: async () => (server ? await server.amIServing() : "gone"),
 			onYield: () => {
 				if (ctx.hasUI) ctx.ui.notify("pi-peer: 本会话已有另一进程在线收信,已退让并周期重试接管(发送不受影响)", "warning");
 			},
@@ -103,8 +117,12 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("session_shutdown", () => {
 		rec?.stop();
 		server?.close(); // close 即 unlink socket = 从名册消失,一步完成
+		if (hbTimer) clearInterval(hbTimer);
+		if (hbPath) rmSync(hbPath, { force: true }); // 一并移除 heartbeat
 		rec = undefined;
 		server = undefined;
+		hbTimer = undefined;
+		hbPath = undefined;
 		rt = undefined;
 	});
 }

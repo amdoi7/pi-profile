@@ -34,6 +34,9 @@ type SendFailure = { target: string; reason: string };
 
 interface PeerToolDetails {
 	peerCount?: number;
+	/** OS 确证挂起(T/D)的 socket 占位:文件名 + pid。 */
+	suspended?: { path: string; pid: number }[];
+
 	/** 实际接收了的会话（已去重）。 */
 	to?: string[];
 }
@@ -64,13 +67,27 @@ function idleOf(p: PeerIdentity, now: number): number | undefined {
 	}
 }
 
+/** 挂起占位:文件名 + OS 确证 pid + 可行动下一步(唤醒或移除)。 */
+export function describeSuspended(path: string, pid: number): string {
+	return `- ${path} suspended pid=${pid} (fg 或 kill -CONT 唤醒;kill 移除)`;
+}
+
+/** 无证据占位:直接过滤,不占认知(见 rosterText)。 */
+
 function failureText(failed: SendFailure[]): string {
 	return failed.map((f) => `- ${f.target}: ${f.reason}`).join("\n");
 }
 
-function rosterText(peers: PeerIdentity[], now: number): string {
-	if (peers.length === 0) return "No other online pi sessions.";
-	return `Online pi sessions (${peers.length}):\n${peers.map((p) => formatPeerLine(p, idleOf(p, now))).join("\n")}`;
+function rosterText(alive: PeerIdentity[], suspended: { path: string; pid: number }[], now: number): string {
+	const lines = alive.map((p) => formatPeerLine(p, idleOf(p, now)));
+	const sus = suspended.map((s) => describeSuspended(s.path, s.pid));
+	if (lines.length === 0 && sus.length === 0) return "No other online pi sessions.";
+	const head = `Online pi sessions (${alive.length}):`;
+	return [
+		head,
+		...lines,
+		...(sus.length > 0 ? ["", "Suspended sockets (T/D, pid):", ...sus] : []),
+	].join("\n");
 }
 
 /** 未知键不能静默忽略:语料里的 { quiet: true } 被当成默认模式投出,模型要的语义
@@ -99,12 +116,15 @@ export function registerPeerTools(pi: ExtensionAPI, getRt: () => PeerRuntime | u
 			const rt = runtime();
 			rejectUnknownKeys("peer_list", p ?? {}, []);
 			const now = Date.now();
-			const alive = await discoverPeers(rt.self.sessionId, ctx.cwd);
+			const roster = await discoverPeers(rt.self.sessionId, ctx.cwd);
 			// 自身 id 先给:模型的 sessionId 不在任何别处可得,自报家门与
 			// 「这个目标是不是我自己」都要它(语料:5 次发给自己)。
 			return {
-				content: [{ type: "text", text: `you: id=${rt.self.sessionId.slice(0, 8)}\n${rosterText(alive, now)}` }],
-				details: { peerCount: alive.length },
+				content: [{ type: "text", text: `you: id=${rt.self.sessionId.slice(0, 8)}\n${rosterText(roster.alive, roster.suspended, now)}` }],
+				details: {
+					peerCount: roster.alive.length,
+					suspended: roster.suspended,
+				},
 			};
 		},
 	});
@@ -148,7 +168,8 @@ export function registerPeerTools(pi: ExtensionAPI, getRt: () => PeerRuntime | u
 			if (targets.length === 0) throw new Error("missing to; peer_send needs at least one target session name/sessionId");
 			if (!p.text?.trim()) throw new Error("missing text; peer_send needs a message");
 			const text = p.text.trim();
-			const alive = await discoverPeers(rt.self.sessionId, ctx.cwd);
+			const roster = await discoverPeers(rt.self.sessionId, ctx.cwd);
+			const alive = roster.alive;
 
 			const delivered: PeerIdentity[] = [];
 			const failed: SendFailure[] = [];
@@ -194,7 +215,7 @@ export function registerPeerTools(pi: ExtensionAPI, getRt: () => PeerRuntime | u
 
 			// 零送达不是成功:全部失败走错误信封,并把手上的名册一并交回
 			if (delivered.length === 0) {
-				throw new Error(`not delivered:\n${failureText(failed)}\n${rosterText(alive, now)}`);
+				throw new Error(`not delivered:\n${failureText(failed)}\n${rosterText(alive, roster.suspended, now)}`);
 			}
 			// 结果只说新事实:谁接收了、谁没接收。异步投递与回执语义在工具描述里
 			// (每请求一份)——在每次成功里再背一遍是重复付费。
