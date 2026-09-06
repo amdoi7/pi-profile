@@ -1,4 +1,3 @@
-import { spawnSync } from "node:child_process";
 import { highlightCode } from "@earendil-works/pi-coding-agent";
 
 export const CODE_PREVIEW = {
@@ -71,46 +70,15 @@ export function renderShellCommandCall(
 	return `${theme.fg("toolTitle", title)} ${commandText}${timeout}`;
 }
 
-const FISH_SYNTAX_COLOR_NAMES = new Set([
-	"fish_color_command",
-	"fish_color_keyword",
-	"fish_color_quote",
-	"fish_color_redirection",
-	"fish_color_end",
-	"fish_color_error",
-	"fish_color_param",
-	"fish_color_valid_path",
-	"fish_color_option",
-	"fish_color_comment",
-	"fish_color_operator",
-	"fish_color_escape",
-]);
-const FISH_DEFAULT_SYNTAX_ENV: Record<string, string> = {
-	fish_color_command: "blue",
-	fish_color_keyword: "blue",
-	fish_color_quote: "yellow",
-	fish_color_redirection: "cyan --bold",
-	fish_color_end: "green",
-	fish_color_error: "brred",
-	fish_color_param: "cyan",
-	fish_color_valid_path: "cyan",
-	fish_color_option: "cyan",
-	fish_color_comment: "red",
-	fish_color_operator: "brcyan",
-	fish_color_escape: "brcyan",
-};
-const ANSI_SEQUENCE_PATTERN = /\x1b\[[0-9;]*m/;
-const ANSI_SEQUENCE_GLOBAL_PATTERN = /\x1b\[[0-9;]*m/g;
 const SHELL_HIGHLIGHT_CACHE_LIMIT = 200;
-
-let cachedFishSyntaxEnv: Record<string, string> | undefined;
 const shellHighlightCache = new Map<string, string>();
 
 function renderShellSyntax(command: string): string {
 	const cached = shellHighlightCache.get(command);
 	if (cached !== undefined) return cached;
 
-	const rendered = renderWithEmbeddedHeredocs(command) ?? renderWithFishIndent(command) ?? escapeControlChars(command);
+	// 复用 pi 原生高亮：shell 行用 bash 语言，heredoc 内嵌块按推断语言走 highlightCode。
+	const rendered = renderWithEmbeddedHeredocs(command) ?? renderShellWithNativeHighlight(command);
 	if (shellHighlightCache.size >= SHELL_HIGHLIGHT_CACHE_LIMIT) {
 		shellHighlightCache.clear();
 	}
@@ -149,10 +117,12 @@ function renderWithEmbeddedHeredocs(command: string): string | undefined {
 }
 
 function renderShellLine(line: string): string {
-	const rendered = renderWithFishIndent(line);
-	if (!rendered) return escapeControlChars(line);
-	if (line.includes("<<") && !stripAnsi(rendered).includes("<<")) return escapeControlChars(line);
-	return rendered;
+	// 单行走 pi 原生 highlightCode(bash);失败降级为纯转义。
+	try {
+		return highlightCode(escapeControlChars(line), "bash").join("\n");
+	} catch {
+		return escapeControlChars(line);
+	}
 }
 
 function renderEmbeddedCodeLines(lines: string[], language: string | undefined): string[] {
@@ -194,64 +164,40 @@ function findHeredocEnd(lines: string[], marker: string, startLine: number): num
 	return undefined;
 }
 
+const HEREDOC_LANGUAGE_BY_MARKER: Record<string, string> = {
+	py: "python", python: "python",
+	js: "javascript", jsx: "javascript", mjs: "javascript", cjs: "javascript", node: "javascript", javascript: "javascript",
+	ts: "typescript", tsx: "typescript", typescript: "typescript",
+	json: "json", bash: "bash", sh: "bash", shell: "bash", zsh: "bash",
+	yaml: "yaml", yml: "yaml",
+	sql: "sql", go: "go", rs: "rust", rust: "rust", c: "c", cpp: "cpp", h: "c", hpp: "cpp",
+	java: "java", rb: "ruby", ruby: "ruby", php: "php", swift: "swift", kt: "kotlin",
+	md: "markdown", markdown: "markdown", html: "html", css: "css", xml: "xml", diff: "diff",
+};
+
 function inferHeredocLanguage(header: string, marker: string): string | undefined {
 	const markerName = marker.toLowerCase();
 	const command = header.toLowerCase();
-	if (/\bpython(?:3(?:\.\d+)?)?\b/.test(command) || markerName === "py" || markerName === "python") return "python";
-	if (/\bnode\b|\bbun\b/.test(command) || markerName === "js" || markerName === "javascript" || markerName === "node") return "javascript";
-	if (markerName === "ts" || markerName === "typescript") return "typescript";
+	// 命令里显式写的语言（python3/node …）优先；否则按 heredoc 标记名推断。
+	for (const [key, lang] of Object.entries(HEREDOC_LANGUAGE_BY_MARKER)) {
+		if (markerName === key || command.includes(key)) return lang;
+	}
+	// 常见扩展名直接映射到语言
+	const extMatch = /[^\s]+(?:\.(\w+))\s*$/.exec(command);
+	if (extMatch) {
+		const ext = extMatch[1]!.toLowerCase();
+		return HEREDOC_LANGUAGE_BY_MARKER[ext];
+	}
 	return undefined;
 }
 
-function stripAnsi(text: string): string {
-	return text.replace(ANSI_SEQUENCE_GLOBAL_PATTERN, "");
-}
-
-function renderWithFishIndent(command: string): string | undefined {
-	const result = spawnSync("fish_indent", ["--ansi", "--no-indent"], {
-		encoding: "utf8",
-		env: { ...process.env, ...getFishSyntaxEnv() },
-		input: command.endsWith("\n") ? command : `${command}\n`,
-		maxBuffer: 1024 * 1024,
-		timeout: 500,
-	});
-	if (result.error || result.status !== 0 || typeof result.stdout !== "string") return undefined;
-	if (!ANSI_SEQUENCE_PATTERN.test(result.stdout)) return undefined;
-	return result.stdout.trimEnd().replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/\n+/g, " ");
-}
-
-function getFishSyntaxEnv(): Record<string, string> {
-	cachedFishSyntaxEnv ??= loadFishSyntaxEnv();
-	return cachedFishSyntaxEnv;
-}
-
-function loadFishSyntaxEnv(): Record<string, string> {
-	const result = spawnSync("fish", ["-ic", "fish_config theme dump"], {
-		encoding: "utf8",
-		maxBuffer: 128 * 1024,
-		timeout: 1000,
-	});
-	if (result.error || result.status !== 0 || typeof result.stdout !== "string") {
-		return { ...FISH_DEFAULT_SYNTAX_ENV };
+/** shell 行高亮:复用 pi 原生 highlightCode(bash);异常/无高亮降级为纯转义。 */
+function renderShellWithNativeHighlight(command: string): string {
+	try {
+		return highlightCode(escapeControlChars(command), "bash").join("\n");
+	} catch {
+		return escapeControlChars(command);
 	}
-
-	const env = parseFishThemeDump(result.stdout);
-	return Object.keys(env).length > 0 ? env : { ...FISH_DEFAULT_SYNTAX_ENV };
-}
-
-function parseFishThemeDump(output: string): Record<string, string> {
-	const env: Record<string, string> = {};
-	for (const rawLine of output.split("\n")) {
-		const line = rawLine.trim().replace(/\s+--theme=[^\s]+$/, "");
-		const firstSpace = line.search(/\s/);
-		if (firstSpace <= 0) continue;
-		const name = line.slice(0, firstSpace);
-		if (!FISH_SYNTAX_COLOR_NAMES.has(name)) continue;
-		const value = line.slice(firstSpace).trim();
-		if (value.length === 0) continue;
-		env[name] = value;
-	}
-	return env;
 }
 
 function withSecretWarning(source: string, preview: string, theme: PreviewTheme): string {

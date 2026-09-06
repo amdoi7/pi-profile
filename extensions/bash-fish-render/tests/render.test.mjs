@@ -96,6 +96,17 @@ describe("bash-fish-render", () => {
 		expect(output).toContain("PATCH");
 	});
 
+	it("renderCall highlights .mjs heredoc body via native highlightCode", () => {
+		const pi = makePi();
+		registerExtension(pi);
+		const tool = pi.registered[0];
+		const command = `cat > probe7.mjs <<'EOF'\nimport { spawn } from \"node:child_process\";\nconst x = 1;\nEOF`;
+		const component = tool.renderCall({ command }, makeTheme(), makeContext(command));
+		const output = component.render(200).join("\n");
+		expect(output).toContain("EOF");
+		expect(output).toMatch(ANSI_PATTERN); // 有 ANSI 高亮(原生 highlightCode)
+	});
+
 	it("renderResult renders structured patchFiles as dual-gutter file diffs", async () => {
 		const pi = makePi();
 		registerExtension(pi);

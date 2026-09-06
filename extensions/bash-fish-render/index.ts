@@ -1,4 +1,4 @@
-import { createBashToolDefinition, type ExtensionAPI, type Theme } from "@earendil-works/pi-coding-agent";
+import { createBashToolDefinition, type AgentToolResult, type BashToolDetails, type ExtensionAPI, type Theme } from "@earendil-works/pi-coding-agent";
 import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 
 import { renderShellCommandCall } from "../_shared/code-preview.ts";
@@ -8,13 +8,13 @@ import { APPLY_PATCH_RE, parseGuardedPatchFiles } from "./guarded-diff.ts";
 import { executeApplyPatchGuarded } from "./execute.ts";
 
 /**
- * bash-fish-render:bash 工具调用的 fish 式语义高亮 + apply_patch 展示 diff 守卫。
+ * bash-fish-render:bash 工具调用的语义高亮 + apply_patch 展示 diff 守卫。
  *
  * 只覆写 bash 的 renderCall:先走内置 renderCall(计时/状态推进/lastComponent
- * 语义与内置完全一致),再把命令文本替换为 fish 式着色——用真实
- * `fish_indent --ansi` + fish 主题 dump 上色(命令存在→主题命令色、缺失→红,
- * 选项/字符串/变量/操作符各按其语义),实现见 _shared/code-preview.ts 的
- * renderShellCommandCall。
+ * 语义与内置完全一致),再把命令文本替换为着色——**复用 pi 原生
+ * highlightCode**(_shared/code-preview.ts 的 renderShellCommandCall):shell
+ * 行用 bash 语言,heredoc 内嵌块按推断语言高亮(js/ts/py/json 等常见扩展)。
+ * 不再自维护 fish_indent/主题 dump,零外部命令依赖。
  *
  * execute:apply_patch 命令走 execute.ts 的守卫执行(worker-backed diff,
  * 250ms Myers tripwire / 5s batch watchdog / O(N) fast path,防大 buffer
@@ -59,7 +59,7 @@ export default function bashFishRenderExtension(pi: ExtensionAPI): void {
 			return component;
 		},
 		renderResult(result, options, theme, context) {
-			const component = baseRenderResult(result, options, theme, context);
+			const component = baseRenderResult(result as AgentToolResult<BashToolDetails | undefined>, options, theme, context);
 			const parsed = parseGuardedPatchFiles((result as { details?: unknown }).details);
 			if (parsed.kind === "absent" || !(component instanceof Container)) {
 				return component;
