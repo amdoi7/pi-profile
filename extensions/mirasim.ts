@@ -475,17 +475,10 @@ function makeProxyFetch(getTarget: () => ProxyTarget | null) {
 }
 
 // ---------------------------------------------------------------------------
-// Model definitions（白名单固定；relay 只有 anthropic messages 一条模型通道）
+// Model definitions（动态:从 relay /v1/models 拉取,不硬编码）
 // ---------------------------------------------------------------------------
 
 type PiModel = Model<"anthropic-messages">;
-
-const MIRASIM_MODEL_IDS = [
-  "gpt-5.6-sol",
-  "claude-fable-5",
-  "claude-fable-5-1",
-  "claude-opus-5",
-];
 
 // 映射 xhigh + max 两级（relay 实测）；其余级别隐藏（null）不出现。
 // off 不发 thinking 参数，让模型走默认行为。
@@ -499,13 +492,28 @@ const THINKING_LEVEL_MAP: ThinkingLevelMap = {
   max: "max",
 };
 
-// 模型元数据全部本地构造。relay 实测规则（curl 逐项验证）：
-// - thinking:{type:"enabled"/"disabled"/off} → 400；adaptive 格式
-//   (type:"adaptive"+output_config.effort) → 200 → forceAdaptiveThinking
-// - temperature 字段任意值 → 400 → supportsTemperature:false 抑制发送
-// - reasoning:{effort} → 200（openrouter 兼容）
-function buildLocalModels(): PiModel[] {
-  return MIRASIM_MODEL_IDS.map((id) => ({
+/**
+ * 从 relay 拉取当前可用模型列表（权威来源）。
+ * 模型元数据本地构造；relay 实测规则（curl 逐项验证）：
+ * - thinking:{type:"enabled"/"disabled"/off} → 400；adaptive 格式
+ *   (type:"adaptive"+output_config.effort) → 200 → forceAdaptiveThinking
+ * - temperature 字段任意值 → 400 → supportsTemperature:false 抑制发送
+ * - reasoning:{effort} → 200（openrouter 兼容）
+ * 拉取失败时返回空数组（provider 仍注册,模型为 0；重载后重试）。
+ */
+async function fetchModelsFromRelay(signal?: AbortSignal): Promise<PiModel[]> {
+  const token = await getFreshAccessToken(signal).catch(() => null);
+  if (!token) return [];
+  const res = await fetch(`${RELAY_BASE}/v1/models`, {
+    headers: { "anthropic-version": "2023-06-01", "x-api-key": token },
+    signal,
+  });
+  if (!res.ok) return [];
+  const payload = (await res.json()) as { data?: Array<{ id?: unknown }> };
+  const ids = (payload.data ?? [])
+    .map((m) => (typeof m.id === "string" ? m.id : ""))
+    .filter((id) => id !== "");
+  return ids.map((id) => ({
     id,
     name: id,
     provider: "mirasim",
@@ -517,7 +525,8 @@ function buildLocalModels(): PiModel[] {
     thinkingLevelMap: { ...THINKING_LEVEL_MAP },
     compat: { supportsTemperature: false, forceAdaptiveThinking: true },
     input: ["text"],
-    contextWindow: 1000000,
+    // gpt-6-astra 真实上下文限制 872K（其余模型 1M）——compact 触发基准按真实窗口
+    contextWindow: id === "gpt-6-astra" ? 872000 : 1000000,
     maxTokens: 128000,
     cost: { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 },
   }));
@@ -527,8 +536,9 @@ function buildLocalModels(): PiModel[] {
 // Extension entry point
 // ---------------------------------------------------------------------------
 
-export default function (pi: ExtensionAPI) {
-  const models = buildLocalModels();
+export default async function (pi: ExtensionAPI) {
+  // 动态拉取 relay 模型列表（启动时一次；失败为空数组,provider 仍注册,下次 /reload 重试）
+  const models = await fetchModelsFromRelay().catch(() => []);
 
   let proxyTarget: ProxyTarget | null = null;
   let discovery: Promise<ProxyTarget | null> | null = null;
@@ -597,7 +607,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerProvider(
     createProvider({
       id: "mirasim",
-      name: "Mirasim（本地反代直连）",
+      name: "Mirasim",
       baseUrl: RELAY_BASE,
       api,
       models,
