@@ -58,7 +58,7 @@ const editRequestSchema = Type.Object(
 			Type.Array(filesEntrySchema, { minItems: 1 }),
 			{ description: "Map of file path → ordered entries for that file." },
 		),
-	
+
 	},
 	{ additionalProperties: false },
 );
@@ -175,11 +175,8 @@ export default function (pi: ExtensionAPI) {
 		// 链式条目序列（先验是 files[].edits[] 批形状）、note 由 schema
 		// required 保证、失败即停由结果信封（skipped）自明。
 		description:
-			"Edit existing files by string replacement — files grouped by path, entries in order."
-			+ " Entry = match + optional new_str (omitted = delete). New files / full rewrites: use cat."
-			+ " Chain multiple entries per file in order; stops at the first failed entry."
-			+ " Strict: unused parameters (incl. null) are rejected; errors name the field and current value.",
-		promptSnippet: "Exact file edits",
+			"Entry = match + optional new_str (omitted = delete)."
+			+ "Chain multiple entries per file in order; stops at the first failed entry.",
 		parameters: editRequestParameters,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const request = parseEditRequest(params);
