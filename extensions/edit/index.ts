@@ -1,23 +1,27 @@
 /**
- * edit —— 文件作用域化的严格编辑工具。契约见 README：
- * 一次调用 = 一个编辑脚本；note 是批次唯一意图（docstring：为什么改），
- * files[path] 是每个文件的条目链（顺序链式执行，失败即停、成功保留）。
+ * edit —— 单文件严格编辑工具。契约见 README：一次调用 = 一个文件的一个编辑脚本；
+ * note 是批次唯一意图（docstring：为什么改），path 是唯一目标文件，edits 是
+ * 该文件的条目链（顺序链式执行，失败即停、成功保留）。
  *
- * 严格模式：schema 说死唯一形状——op 未用字段（含 null）、顶层多余键全部拒绝，
+ * 严格模式：schema 说死唯一形状——条目未声明字段（含 null）、顶层多余键全部拒绝，
  * 错误即时可见，单一真相源才可能被纠正。不向后兼容。
  */
 
+import * as path from "node:path";
+import * as fs from "node:fs";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { evaluateCommand } from "../command-policy/policy.ts";
+import { createBashThenRunRunner, executeThenRun, type ThenRunInput } from "../edit/then-run.ts";
 
 import type { EditEntry, EditRequest } from "./match.ts";
 import { executeEditScript, type ScriptOutcome } from "./transaction.ts";
 import { isScriptOutcome, renderCallView, renderClearedCallState, renderInvalidCall, renderResultView } from "./ui.ts";
 
-// 平铺单对象 schema：match 必填 + 全字段可选。多余键在 schema 层被拒
-//（additionalProperties:false），未声明字段（含 null）也随之被 schema 拒绝——
-// 这就是严格模式：错误在 schema 就可见，不等到执行。
-const filesEntrySchema = Type.Object(
+// 平铺单对象 schema：path 顶层唯一（一次调用 = 一个文件），match 必填 + 全字段
+// 可选。多余键在 schema 层被拒（additionalProperties:false）——schema 是指令通道；
+// 它的报错是 generic 的 TypeBox 文案，rich 文案走 prepareArguments（见下）。
+const editEntrySchema = Type.Object(
 	{
 		match: Type.Unsafe<string | null>({
 			type: ["string", "null"],
@@ -27,11 +31,15 @@ const filesEntrySchema = Type.Object(
 			type: ["string", "null"],
 			description: "Replacement text; omitted = delete.",
 		})),
-		occurrence: Type.Optional(Type.Unsafe<number | null>({
-			type: ["integer", "null"],
-		})),
-		limit: Type.Optional(Type.Unsafe<number | null>({
-			type: ["integer", "null"],
+		range: Type.Optional(Type.Unsafe<{ start: number; count: number } | null>({
+			type: ["object", "null"],
+			properties: {
+				start: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+				count: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+			},
+			required: ["start", "count"],
+			additionalProperties: false,
+			description: "1-based match window; both start and count are required positive integers.",
 		})),
 		after: Type.Optional(Type.Unsafe<string | null>({
 			type: ["string", "null"],
@@ -46,19 +54,31 @@ const filesEntrySchema = Type.Object(
 	{ additionalProperties: false },
 );
 
-// 一次调用 = 一个编辑脚本：note 是批次唯一意图（docstring：为什么改），
-// files 是每个文件的 op 链（顺序执行）。op 条目不带注释——一个意图驱动一批修改。
+// 一次调用 = 一个文件的一个编辑脚本：note 是批次唯一意图（docstring：为什么改），
+// path 是唯一目标文件，edits 是该文件的条目链（顺序执行）。条目不带 path——
+// 一个意图驱动一个文件的一批修改，文件在调用层只说一次。
 const editRequestSchema = Type.Object(
 	{
 		note: Type.String({
 			description: "One line: why this batch of changes exists.",
 		}),
-		files: Type.Record(
-			Type.String(),
-			Type.Array(filesEntrySchema, { minItems: 1 }),
-			{ description: "Map of file path → ordered entries for that file." },
-		),
-
+		path: Type.String({
+			description: "The one file this call edits. One call = one file.",
+		}),
+		edits: Type.Array(editEntrySchema, {
+			description: "Ordered entries for that file; each { match, optional new_str (omitted = delete) }.",
+			minItems: 1,
+		}),
+		then_run: Type.Optional(Type.Object(
+			{
+				command: Type.String({ description: "Bash command to run after the edit is applied." }),
+				timeout: Type.Optional(Type.Number({ description: "Timeout in seconds." })),
+			},
+			{
+				additionalProperties: false,
+				description: "Optional validation command fused into this call: runs only if the edit script applied (skipped on rejection; a non-zero exit is reported but keeps the edit). Prefer fusing the predictable follow-up check here instead of spending a separate turn on it.",
+			},
+		)),
 	},
 	{ additionalProperties: false },
 );
@@ -82,13 +102,19 @@ function describeType(value: unknown): string {
 
 /**
  * 严格校验一个条目并收窄类型：返回的就是传进来的那个对象，没有重组。
- * 必填参数按 op 检查；op 未用的字段（含 null）一律拒绝——错误即时可见，
- * 单一真相源才可能被纠正。
+ * match 必填（new_str 缺省 = 删除）；未声明字段（含 null）一律拒绝——
+ * 错误即时可见，单一真相源才可能被纠正。
+ *
+ * 选择器字段的可选写法有两种：字段不出现，或显式 null —— provider 把
+ * 「可选」序列化成 null 是常态（语料 2026-09-09:721 次 edit 调用 718 次
+ * 带显式 null 选择器），两者同义（= 未选择），在入口统一丢弃；null 不是
+ * 第三种语义，不能在选择器消费点炸裸 TypeError（2026-09-09 现场事故：
+ * `null.indexOf`）。除 null 以外的错型仍然显式拒绝。
  */
 function checkEntry(entry: unknown, label: string): EditEntry {
 	if (!isRecord(entry)) invalidEditRequest(`${label} must be an object`);
 	// 单一真相源：允许字段 = schema 声明的属性（校验与 schema 永不脱节）。
-	const allowed = Object.keys(filesEntrySchema.properties);
+	const allowed = Object.keys(editEntrySchema.properties);
 	for (const key of Object.keys(entry)) {
 		if (!allowed.includes(key)) {
 			invalidEditRequest(`${label}.${key} must be removed`);
@@ -97,73 +123,138 @@ function checkEntry(entry: unknown, label: string): EditEntry {
 	if (typeof entry.match !== "string") {
 		invalidEditRequest(`${label}.match must be a string, got ${describeType(entry.match)}`);
 	}
+	// null = omit 的唯一归一点:provider 把「可选」序列化成 null(语料 718/721),
+	// 统一丢弃,后续层只看 undefined —— 删除语义(new_str 缺省 = 替换为空)不变。
+	if (entry.new_str === null) delete entry.new_str;
+	for (const key of ["after", "before", "range", "regex"] as const) {
+		if (entry[key] === null) delete entry[key];
+	}
 	if (entry.new_str !== undefined && typeof entry.new_str !== "string") {
 		invalidEditRequest(`${label}.new_str must be a string, got ${describeType(entry.new_str)}`);
+	}
+	for (const key of ["after", "before"] as const) {
+		const value = entry[key];
+		if (value !== undefined && value !== null && typeof value !== "string") {
+			invalidEditRequest(`${label}.${key} must be a string, got ${describeType(value)}`);
+		}
+	}
+	if (entry.range !== undefined) {
+		if (!isRecord(entry.range)) {
+			invalidEditRequest(`${label}.range must be an object, got ${describeType(entry.range)}`);
+		}
+		for (const key of Object.keys(entry.range)) {
+			if (key !== "start" && key !== "count") {
+				invalidEditRequest(`${label}.range.${key} must be removed`);
+			}
+		}
+		for (const key of ["start", "count"] as const) {
+			const value = entry.range[key];
+			if (!Number.isSafeInteger(value) || value < 1) {
+				invalidEditRequest(`${label}.range.${key} must be a positive safe integer, got ${String(value)}`);
+			}
+		}
+	}
+	if (entry.regex !== undefined && entry.regex !== null && typeof entry.regex !== "boolean") {
+		invalidEditRequest(`${label}.regex must be a boolean, got ${describeType(entry.regex)}`);
 	}
 	return entry as EditEntry;
 }
 
 /**
- * 主形状校验：note + files（path → op 链）。校验即投影：files 展平成
- * 内部条目序列（条目带 path），执行层继续吃同一种形状——schema 说死的形状
- * 和执行层吃的形状仍是同一个，只是校验处多做一次确定性投影。
+ * 主形状校验：note + path + edits（单文件条目链）。校验即收窄：schema 说死的
+ * 形状和执行层吃的形状是同一个，输入即内部形状，无第二层映射。
  *
- * 严格闸门在这里，不依赖 TypeBox 的松 Record 校验：任何多余键（含 null）、
- * op 未用字段、缺失必填、空 note/files 都在这里即时拒绝，错误带字段名与
+ * 严格闸门在这里，不依赖 TypeBox 的松 Array 校验：任何多余键（含 null）、
+ * 条目未用字段、缺失必填、空 note/edits 都在这里即时拒绝，错误带字段名与
  * 当前值——单一真相源，一次错误立即纠正，不静默忽略。
  */
+function checkThenRun(value: unknown): ThenRunInput {
+	if (!isRecord(value)) invalidEditRequest("then_run must be an object: {command, timeout?}");
+	for (const key of Object.keys(value)) {
+		if (key !== "command" && key !== "timeout") {
+			invalidEditRequest(`then_run.${key} must be removed`);
+		}
+	}
+	if (typeof value.command !== "string" || value.command.trim() === "") {
+		invalidEditRequest("then_run.command must be a non-empty string");
+	}
+	if (value.timeout !== undefined && (typeof value.timeout !== "number" || !(value.timeout > 0))) {
+		invalidEditRequest("then_run.timeout must be a positive number");
+	}
+	return value as ThenRunInput;
+}
+
+/** 与 transaction.ts 的 canonicalizePath 同规则(那里不导出,路径归一在两层保持一致)。 */
+function resolveAbsolutePath(filePath: string, cwd: string): string {
+	const resolvedPath = path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
+	try {
+		return fs.realpathSync.native(resolvedPath);
+	} catch {
+		return path.normalize(resolvedPath);
+	}
+}
+
 export function parseEditRequest(input: unknown): EditRequest {
-	if (!isRecord(input)) invalidEditRequest("note must be an object with note and files");
+	if (!isRecord(input)) invalidEditRequest("edit expects an object: {note, path, edits}");
 	for (const key of Object.keys(input)) {
-		if (key === "files" || key === "note") continue;
+		if (key === "note" || key === "path" || key === "edits" || key === "then_run") continue;
 		invalidEditRequest(`${key} must be removed`);
 	}
 	if (typeof input.note !== "string" || input.note.trim() === "") {
 		invalidEditRequest("note is required: one line naming why this batch exists");
 	}
-	const note = input.note;
-	if (!isRecord(input.files)) invalidEditRequest("files must be an object");
-	// 自有键枚举（getOwnPropertyNames）：__proto__/constructor 等原型键不可见但
-	// 会被 for..in 之外的方式携带——严格模式必须枚举并拒绝它们，不能静默丢弃。
-	const fileKeys = Object.getOwnPropertyNames(input.files);
-	if (fileKeys.length === 0) invalidEditRequest("files must not be empty");
-	const edits: EditEntry[] = [];
-	for (const filePath of fileKeys) {
-		const chain = input.files[filePath];
-		if (!Array.isArray(chain)) invalidEditRequest(`files["${filePath}"] must be an array`);
-		if (chain.length === 0) invalidEditRequest(`files["${filePath}"] must not be empty`);
-		for (const rawEntry of chain) {
-			const entry = checkEntry(rawEntry, `files["${filePath}"]`);
-			edits.push({ path: filePath, ...entry });
-		}
+	if (typeof input.path !== "string" || input.path.trim() === "") {
+		invalidEditRequest("path is required: the one file this call edits");
 	}
-	return { note, edits };
+	if (!Array.isArray(input.edits)) invalidEditRequest("edits must be an array");
+	if (input.edits.length === 0) invalidEditRequest("edits must not be empty");
+	const edits: EditEntry[] = input.edits.map((rawEntry, index) => checkEntry(rawEntry, `edits[${index}]`));
+	return {
+		note: input.note,
+		path: input.path,
+		edits,
+		...(input.then_run !== undefined && input.then_run !== null
+			? { then_run: checkThenRun(input.then_run) }
+			: {}),
+	};
 }
 
 /**
- * agent 结果：逐条目事实。成功列 stats/定位；失败列错误与 kind；
- * skipped 列被中断的条目（模型据此只重发 failed + skipped 段）。
+ * pi 的 prepare 顺序：prepareArguments → validateToolArguments（schema 闸门）→
+ * beforeToolCall → execute；prepare 段任何异常都被包成 isError tool_result 回给
+ * 模型——这是扩展唯一能抢在 schema 闸门之前的错误通道。严格校验全部在此发生：
+ * 非法输入以字段名+当前值先炸，generic 的 TypeBox 文案轮不到出场；合法输入
+ * 原样返回（输入即内部形状，无重组）。不向后兼容：旧形状直接被拒，错误教新形状。
+ */
+export function prepareEditArguments<T>(args: T): T {
+	parseEditRequest(args);
+	return args;
+}
+
+/**
+ * agent 结果：逐条目事实。path 提到顶层（一次调用只改这一个文件），条目只带
+ * 自己的结局。成功列 stats/定位；失败列错误与 kind；skipped 列被中断的条目
+ * （模型据此只重发 failed + skipped 段）。
  */
 export function buildOutcomeAgentContent(outcome: ScriptOutcome): string {
 	const entries = outcome.entries.map((entry) => {
-		const identity = { path: entry.edit.path, op: entry.edit.op };
 		if (entry.status === "applied") {
 			return {
-				...identity,
 				changes: entry.changeStats,
 				...(entry.firstChangedLine !== undefined ? { firstChangedLine: entry.firstChangedLine } : {}),
 			};
 		}
 		if (entry.status === "failed") {
 			return {
-				...identity,
 				...(entry.errorKind !== undefined ? { kind: entry.errorKind } : {}),
 				message: entry.error,
+				// NOT_FOUND 的照抄载荷:文件原文整行,无前缀 —— 重发 match 直接用它。
+				...(entry.closest !== undefined ? { closest: entry.closest } : {}),
 			};
 		}
-		return { ...identity, skipped: true };
+		return { skipped: true };
 	});
-	return JSON.stringify({ status: outcome.status, entries });
+	return JSON.stringify({ status: outcome.status, path: outcome.path, entries });
 }
 
 export default function (pi: ExtensionAPI) {
@@ -171,21 +262,52 @@ export default function (pi: ExtensionAPI) {
 		name: "edit",
 		label: "edit",
 		renderShell: "default",
-		// prompt 面只写「与后训练先验的差量」，强 RL 模型自明的话一字不写：
-		// 链式条目序列（先验是 files[].edits[] 批形状）、note 由 schema
-		// required 保证、失败即停由结果信封（skipped）自明。
+		// prompt 面说清形状：一次调用 = 一个文件；path 顶层唯一，edits 是该文件
+		// 的 match 链；数量选择只通过结构化 range 表达。
 		description:
-			"Entry = match + optional new_str (omitted = delete)."
-			+ "Chain multiple entries per file in order; stops at the first failed entry.",
+			"Edit ONE file with a batch of chained replacements. "
+			+ "note: one line why. path: the single file this call edits. "
+			+ "edits: ordered entries, each { match, optional new_str (omitted = delete) }; "
+			+ "entries chain against evolving content; stops at the first failed entry. "
+			+ "One call edits one file — issue separate calls for other files. "
+			+ "Prefer this tool for modifying existing files; do not use perl/python/sed "
+			+ "one-liners or heredoc rewrites to mutate files. "
+			+ "then_run: optional {command, timeout?} to fuse the predictable follow-up "
+			+ "validation into this call — runs only if the edit applied; a non-zero exit "
+			+ "is reported but keeps the edit.",
 		parameters: editRequestParameters,
+		// rich 错误通道：schema 闸门之前先跑严格校验（见 prepareEditArguments）。
+		// execute 里的 parseEditRequest 是最终守卫（防绕过 prepare 的直调路径），
+		// canonical 输入零成本复检。
+		prepareArguments: prepareEditArguments,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const request = parseEditRequest(params);
 			const outcome = await executeEditScript(request, ctx.cwd, signal);
 
+			let thenRunText = "";
+			if (request.then_run !== undefined) {
+				// 命令与交互式 bash 走同一条 command-policy 通道(block/rewrite 一致);
+				// rewrite 后的命令才是真正运行的。
+				const decision = evaluateCommand(request.then_run.command);
+				const runner = createBashThenRunRunner(ctx);
+				if (decision.kind === "block") {
+					thenRunText = "\n\n[then_run:blocked] " + decision.reason;
+				} else {
+					const command = decision.kind === "rewrite" ? decision.executedCommand : decision.command;
+					thenRunText = "\n\n" + await executeThenRun(
+						outcome,
+						{ ...request.then_run, command },
+						resolveAbsolutePath(request.path, ctx.cwd),
+						runner,
+						signal,
+					);
+				}
+			}
+
 			// AgentToolResult 没有 isError 字段：信封由 harness 写，写在这里会被静默丢弃；
 			// 软失败靠下面的 tool_result handler 改信封。
 			return {
-				content: [{ type: "text" as const, text: buildOutcomeAgentContent(outcome) }],
+				content: [{ type: "text" as const, text: buildOutcomeAgentContent(outcome) + thenRunText }],
 				details: outcome,
 			};
 		},
