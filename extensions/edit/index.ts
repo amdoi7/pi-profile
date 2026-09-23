@@ -25,30 +25,11 @@ const editEntrySchema = Type.Object(
 	{
 		match: Type.Unsafe<string | null>({
 			type: ["string", "null"],
-			description: "Smallest text to match.",
+			description: "Smallest text to match. Must be unique in the file — make it longer until it is.",
 		}),
 		new_str: Type.Optional(Type.Unsafe<string | null>({
 			type: ["string", "null"],
 			description: "Replacement text; omitted = delete.",
-		})),
-		range: Type.Optional(Type.Unsafe<{ start: number; count: number } | null>({
-			type: ["object", "null"],
-			properties: {
-				start: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
-				count: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
-			},
-			required: ["start", "count"],
-			additionalProperties: false,
-			description: "1-based match window; both start and count are required positive integers.",
-		})),
-		after: Type.Optional(Type.Unsafe<string | null>({
-			type: ["string", "null"],
-		})),
-		before: Type.Optional(Type.Unsafe<string | null>({
-			type: ["string", "null"],
-		})),
-		regex: Type.Optional(Type.Unsafe<boolean | null>({
-			type: ["boolean", "null"],
 		})),
 	},
 	{ additionalProperties: false },
@@ -66,7 +47,7 @@ const editRequestSchema = Type.Object(
 			description: "The one file this call edits. One call = one file.",
 		}),
 		edits: Type.Array(editEntrySchema, {
-			description: "Ordered entries for that file; each { match, optional new_str (omitted = delete) }.",
+			description: "Ordered entries for that file; each { match, optional new_str (omitted = delete) }; entries chain against evolving content; stops at the first failed entry.",
 			minItems: 1,
 		}),
 		then_run: Type.Optional(Type.Object(
@@ -105,11 +86,14 @@ function describeType(value: unknown): string {
  * match 必填（new_str 缺省 = 删除）；未声明字段（含 null）一律拒绝——
  * 错误即时可见，单一真相源才可能被纠正。
  *
- * 选择器字段的可选写法有两种：字段不出现，或显式 null —— provider 把
+ * `new_str` 的可选写法有两种：字段不出现，或显式 null —— provider 把
  * 「可选」序列化成 null 是常态（语料 2026-09-09:721 次 edit 调用 718 次
- * 带显式 null 选择器），两者同义（= 未选择），在入口统一丢弃；null 不是
- * 第三种语义，不能在选择器消费点炸裸 TypeError（2026-09-09 现场事故：
- * `null.indexOf`）。除 null 以外的错型仍然显式拒绝。
+ * 带显式 null），两者同义（= 删除），在入口统一丢弃；null 不是第三种语义。
+ * 除 null 以外的错型仍然显式拒绝。
+ *
+ * 选择器已全部退役（range/regex/after/before）：收窄的唯一办法是把 match
+ * 加长到唯一——选择器能表达的，更长的 match 都能表达，少一个原语少一类
+ * 失败（选择器自身也可能 NOT_FOUND / 超窗）。
  */
 function checkEntry(entry: unknown, label: string): EditEntry {
 	if (!isRecord(entry)) invalidEditRequest(`${label} must be an object`);
@@ -126,36 +110,8 @@ function checkEntry(entry: unknown, label: string): EditEntry {
 	// null = omit 的唯一归一点:provider 把「可选」序列化成 null(语料 718/721),
 	// 统一丢弃,后续层只看 undefined —— 删除语义(new_str 缺省 = 替换为空)不变。
 	if (entry.new_str === null) delete entry.new_str;
-	for (const key of ["after", "before", "range", "regex"] as const) {
-		if (entry[key] === null) delete entry[key];
-	}
 	if (entry.new_str !== undefined && typeof entry.new_str !== "string") {
 		invalidEditRequest(`${label}.new_str must be a string, got ${describeType(entry.new_str)}`);
-	}
-	for (const key of ["after", "before"] as const) {
-		const value = entry[key];
-		if (value !== undefined && value !== null && typeof value !== "string") {
-			invalidEditRequest(`${label}.${key} must be a string, got ${describeType(value)}`);
-		}
-	}
-	if (entry.range !== undefined) {
-		if (!isRecord(entry.range)) {
-			invalidEditRequest(`${label}.range must be an object, got ${describeType(entry.range)}`);
-		}
-		for (const key of Object.keys(entry.range)) {
-			if (key !== "start" && key !== "count") {
-				invalidEditRequest(`${label}.range.${key} must be removed`);
-			}
-		}
-		for (const key of ["start", "count"] as const) {
-			const value = entry.range[key];
-			if (!Number.isSafeInteger(value) || value < 1) {
-				invalidEditRequest(`${label}.range.${key} must be a positive safe integer, got ${String(value)}`);
-			}
-		}
-	}
-	if (entry.regex !== undefined && entry.regex !== null && typeof entry.regex !== "boolean") {
-		invalidEditRequest(`${label}.regex must be a boolean, got ${describeType(entry.regex)}`);
 	}
 	return entry as EditEntry;
 }
@@ -220,11 +176,9 @@ export function parseEditRequest(input: unknown): EditRequest {
 }
 
 /**
- * pi 的 prepare 顺序：prepareArguments → validateToolArguments（schema 闸门）→
- * beforeToolCall → execute；prepare 段任何异常都被包成 isError tool_result 回给
- * 模型——这是扩展唯一能抢在 schema 闸门之前的错误通道。严格校验全部在此发生：
- * 非法输入以字段名+当前值先炸，generic 的 TypeBox 文案轮不到出场；合法输入
- * 原样返回（输入即内部形状，无重组）。不向后兼容：旧形状直接被拒，错误教新形状。
+ * 严格校验在工具参数进 schema 闸门之前先跑：非法输入以字段名+当前值先炸，
+ * generic 的 TypeBox 文案轮不到出场；合法输入原样返回（输入即内部形状，
+ * 无重组）。不向后兼容：旧形状直接被拒，错误教新形状。
  */
 export function prepareEditArguments<T>(args: T): T {
 	parseEditRequest(args);
@@ -263,7 +217,7 @@ export default function (pi: ExtensionAPI) {
 		label: "edit",
 		renderShell: "default",
 		// prompt 面说清形状：一次调用 = 一个文件；path 顶层唯一，edits 是该文件
-		// 的 match 链；数量选择只通过结构化 range 表达。
+		// 的 match 链；match 必须唯一命中，收窄靠加长 match。
 		description:
 			"Edit ONE file with a batch of chained replacements. "
 			+ "note: one line why. path: the single file this call edits. "
@@ -277,7 +231,7 @@ export default function (pi: ExtensionAPI) {
 			+ "is reported but keeps the edit.",
 		parameters: editRequestParameters,
 		// rich 错误通道：schema 闸门之前先跑严格校验（见 prepareEditArguments）。
-		// execute 里的 parseEditRequest 是最终守卫（防绕过 prepare 的直调路径），
+		// execute 里的 parseEditRequest 是最终守卫（防绕过校验的直调路径），
 		// canonical 输入零成本复检。
 		prepareArguments: prepareEditArguments,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {

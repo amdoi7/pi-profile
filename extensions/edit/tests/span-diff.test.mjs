@@ -2,7 +2,7 @@ import { test } from "vitest";
 import assert from "node:assert/strict";
 
 import { generateFinalDiff, serializeDisplayDiff } from "../../_shared/final-diff.ts";
-import { applyOpToNormalizedContent } from "../match.ts";
+import { applyEntryToNormalizedContent } from "../match.ts";
 import { diffFromSpans } from "../span-diff.ts";
 
 const CONTEXT = 4;
@@ -12,7 +12,7 @@ const CONTEXT = 4;
  * 「把整个文件交给通用 diff」逐字节同构（行号、fold、词级高亮、stats）。
  */
 function assertSameAsWholeFileDiff(oldContent, op, label) {
-	const { newContent, matchedSpans } = applyOpToNormalizedContent(oldContent, op);
+	const { newContent, matchedSpans } = applyEntryToNormalizedContent(oldContent, op);
 	const whole = generateFinalDiff(oldContent, newContent, CONTEXT);
 	const spanBased = diffFromSpans(oldContent, newContent, matchedSpans, CONTEXT);
 
@@ -94,14 +94,14 @@ test("whole-line deletion matches the whole-file diff", () => {
 test("replace across many lines matches the whole-file diff", () => {
 	assertSameAsWholeFileDiff(
 		numbered(80),
-		{ match: "padding", new_str: "padded" },
+		{ match: "const value42 = 42; // padding", new_str: "const value42 = 42; // padded" },
 		"replace",
 	);
 });
 
 test("whole-file rewrite keeps exact stats without the Myers path", () => {
 	const oldContent = numbered(2000);
-	const { newContent, matchedSpans } = applyOpToNormalizedContent(
+	const { newContent, matchedSpans } = applyEntryToNormalizedContent(
 		oldContent,
 		{ match: oldContent, new_str: oldContent.replace(/const/g, "let") },
 	);
@@ -114,7 +114,7 @@ test("whole-file rewrite keeps exact stats without the Myers path", () => {
 test("diff cost follows the edit size, not the file size", () => {
 	// 5MB 文件、末尾改一处：整文件 Myers 是 O(N·D)，span 版只碰改动窗口。
 	const oldContent = numbered(80_000);
-	const { newContent, matchedSpans } = applyOpToNormalizedContent(
+	const { newContent, matchedSpans } = applyEntryToNormalizedContent(
 		oldContent,
 		{ match: "const value79999 = 79999; // padding", new_str: "const value79999 = 80000; // padded" },
 	);

@@ -17,9 +17,10 @@ import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { generateFinalDiff } from "../_shared/final-diff.ts";
 import type { ChangeStats, DisplayDiff } from "../_shared/final-diff.ts";
 import {
-	applyOpToNormalizedContent,
+	applyEntryToNormalizedContent,
 	isEditToolError,
 	normalizeToLF,
+	type ClosestText,
 	type EditEntry,
 	type EditRequest,
 	type MatchedEditSpan,
@@ -59,7 +60,7 @@ function throwIfAborted(signal?: AbortSignal): void {
 	}
 }
 
-/** 事务的文件系统端口：测试用内存实现替换它（唯一消费者是 executeOpEntries）。 */
+/** 事务的文件系统端口：测试用内存实现替换它（唯一消费者是 executeEntries）。 */
 type EntryOperations = {
 	access: (absolutePath: string) => Promise<void>;
 	readFile: (absolutePath: string) => Promise<string>;
@@ -107,18 +108,18 @@ async function withAllFileMutationQueues<T>(
 	return acquire(0);
 }
 
-type OpEntryRequest = {
-	/** 已 canonicalize 的绝对路径；序列内可重复（同一文件的多个 op 顺序应用）。 */
+type EntryRequest = {
+	/** 已 canonicalize 的绝对路径；序列内可重复（同一文件的多个条目顺序应用）。 */
 	absolutePath: string;
 	/** 模型发来的条目，原样传入——路径解析是唯一加进来的东西。 */
-	edit: EditEntry;
+	entry: EditEntry;
 };
 
 /**
- * 一个条目的结局。`edit` 是模型发来的那一条，原样回贴——展示与复述都用它，
+ * 一个条目的结局。`entry` 是模型发来的那一条，原样回贴——展示与复述都用它，
  * 不再另造一份 identity。字段名即终局：UI 与 agent 输出直接读这些名字。
  */
-export type EntryOutcome = { edit: EditEntry } & (
+export type EntryOutcome = { entry: EditEntry } & (
 	| {
 			status: "applied";
 			changeStats: ChangeStats;
@@ -126,7 +127,7 @@ export type EntryOutcome = { edit: EditEntry } & (
 			truncated: boolean;
 			firstChangedLine?: number;
 	  }
-	| { status: "failed"; error: string; errorKind?: RecoverableEditErrorKind }
+	| { status: "failed"; error: string; errorKind?: RecoverableEditErrorKind; closest?: ClosestText }
 	/** 前序条目失败后未尝试的条目。 */
 	| { status: "skipped" }
 );
@@ -135,6 +136,8 @@ export type EntryOutcome = { edit: EditEntry } & (
 export type ScriptOutcome = {
 	status: "applied" | "rejected" | "partial";
 	note: string;
+	/** 一次调用只改这一个文件：path 顶层说一次，条目不再重复。 */
+	path: string;
 	/** 渲染要用它把绝对路径显示成相对路径。 */
 	cwd: string;
 	/** 与 `edits` 同序同长。 */
@@ -153,20 +156,25 @@ type PreparedEntry = {
 
 type ReadOutcome =
 	| { kind: "read"; prepared: PreparedEntry }
-	| { kind: "failed"; error: string; errorKind?: RecoverableEditErrorKind };
+	| { kind: "failed"; error: string; errorKind?: RecoverableEditErrorKind; closest?: ClosestText };
 
 function toFailure(error: unknown): Extract<ReadOutcome, { kind: "failed" }> {
 	if (isEditToolError(error)) {
-		return { kind: "failed", error: error.message, errorKind: error.kind };
+		return {
+			kind: "failed",
+			error: error.message,
+			errorKind: error.kind,
+			...(error.closest !== undefined ? { closest: error.closest } : {}),
+		};
 	}
 	return { kind: "failed", error: error instanceof Error ? error.message : String(error) };
 }
 
 /**
- * 读 + 应用单条匹配 op（解析面，零写入）。失败作为单条目事实返回；abort 上抛。
+ * 读 + 应用单条编辑条目（解析面，零写入）。失败作为单条目事实返回；abort 上抛。
  */
-async function readAndApplyOp(
-	entry: OpEntryRequest,
+async function readAndApplyEntry(
+	request: EntryRequest,
 	operations: EntryOperations,
 	signal: AbortSignal | undefined,
 ): Promise<ReadOutcome> {
@@ -174,7 +182,7 @@ async function readAndApplyOp(
 	try {
 		// Preflight: hard file-size gate before reading content into memory.
 		try {
-			const fileStat = await operations.stat(entry.absolutePath);
+			const fileStat = await operations.stat(request.absolutePath);
 			if (fileStat.size > MAX_EDIT_FILE_SIZE_BYTES) {
 				throw new Error(
 					`File too large: sizeBytes=${fileStat.size} limitBytes=${MAX_EDIT_FILE_SIZE_BYTES}; use a narrower match or a streaming tool.`,
@@ -185,23 +193,23 @@ async function readAndApplyOp(
 		}
 
 		try {
-			await operations.access(entry.absolutePath);
+			await operations.access(request.absolutePath);
 		} catch (error) {
 			throw formatAccessError(error);
 		}
 		throwIfAborted(signal);
 
-		const rawContent = await operations.readFile(entry.absolutePath);
+		const rawContent = await operations.readFile(request.absolutePath);
 		throwIfAborted(signal);
 
 		const { bom, text } = stripBom(rawContent);
 		const lineEnding = detectLineEnding(text);
 		const normalizedContent = normalizeToLF(text);
-		const { newContent, matchedSpans } = applyOpToNormalizedContent(normalizedContent, entry.edit);
+		const { newContent, matchedSpans } = applyEntryToNormalizedContent(normalizedContent, request.entry);
 		return {
 			kind: "read",
 			prepared: {
-				absolutePath: entry.absolutePath,
+				absolutePath: request.absolutePath,
 				rawContent,
 				bom,
 				lineEnding,
@@ -248,8 +256,8 @@ function computePreview(entry: PreparedEntry) {
  * - 失败后所有后续条目标记 skipped（不被尝试）；
  * - status：全成 = applied，零写入全败 = rejected（首条即败），否则 partial。
  */
-export async function executeOpEntries(
-	entries: readonly OpEntryRequest[],
+export async function executeEntries(
+	entries: readonly EntryRequest[],
 	signal?: AbortSignal,
 	operations: EntryOperations = defaultEntryOperations,
 ): Promise<{ status: ScriptOutcome["status"]; entries: EntryOutcome[] }> {
@@ -265,29 +273,35 @@ export async function executeOpEntries(
 			let stopped = false;
 			let appliedCount = 0;
 
-			for (const entry of entries) {
+			for (const request of entries) {
 				if (stopped) {
-					outcomes.push({ edit: entry.edit, status: "skipped" });
+					outcomes.push({ entry: request.entry, status: "skipped" });
 					continue;
 				}
 				throwIfAborted(signal);
 
-				const read = await readAndApplyOp(entry, operations, signal);
+				const read = await readAndApplyEntry(request, operations, signal);
 				if (read.kind === "failed") {
-					outcomes.push({ edit: entry.edit, status: "failed", error: read.error, ...(read.errorKind !== undefined ? { errorKind: read.errorKind } : {}) });
+					outcomes.push({
+					entry: request.entry,
+					status: "failed",
+					error: read.error,
+					...(read.errorKind !== undefined ? { errorKind: read.errorKind } : {}),
+					...(read.closest !== undefined ? { closest: read.closest } : {}),
+				});
 					stopped = true;
 					continue;
 				}
 
 				// 提交点：此后不再检查 abort 的幂等性问题——writeFile 是单次原子调用。
 				try {
-					await operations.writeFile(entry.absolutePath, serializeForDisk(read.prepared));
-					outcomes.push({ edit: entry.edit, status: "applied", ...computePreview(read.prepared) });
+					await operations.writeFile(request.absolutePath, serializeForDisk(read.prepared));
+					outcomes.push({ entry: request.entry, status: "applied", ...computePreview(read.prepared) });
 					appliedCount += 1;
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
 					// 写失败的文件可能留下不完整字节——无回滚，必须响亮说明。
-					outcomes.push({ edit: entry.edit, status: "failed", error: `${message}; the file may be partially written` });
+					outcomes.push({ entry: request.entry, status: "failed", error: `${message}; the file may be partially written` });
 					stopped = true;
 				}
 			}
@@ -307,31 +321,18 @@ function canonicalizePath(filePath: string, cwd: string): string {
 }
 
 /**
- * 脚本执行入口：canonical path 去重后交给条目执行器。别名路径（./a.ts、
- * symlink、大小写不敏感盘上的变体）在读盘前响亮拒绝——此时合并会隐式选定
- * 一个 path 写法并丢弃另一个的意图，语义不无歧义。同 path 多条目不在此合并：
- * 链式顺序应用是主契约（files[path] 的 op 链投影成同 path 连续条目）。
+ * 脚本执行入口：一次调用只改一个文件——path 顶层唯一，同一文件的多个拼法
+ * 没有并存的机会，别名歧义在形状上不存在。条目按序链式应用到该文件。
  */
 export async function executeEditScript(
 	request: EditRequest,
 	cwd: string,
 	signal?: AbortSignal,
 ): Promise<ScriptOutcome> {
-	const canonicalPaths = request.edits.map((entry) => canonicalizePath(entry.path, cwd));
-	const firstUse = new Map<string, number>();
-	canonicalPaths.forEach((canonicalPath, index) => {
-		const first = firstUse.get(canonicalPath);
-		if (first !== undefined && request.edits[first]!.path !== request.edits[index]!.path) {
-			throw new Error(
-				`files["${request.edits[index]!.path}"] and files["${request.edits[first]!.path}"] are aliases of the same file (${canonicalPath}); use one path spelling`,
-			);
-		}
-		firstUse.set(canonicalPath, index);
-	});
-
-	const result = await executeOpEntries(
-		request.edits.map((entry, index) => ({ absolutePath: canonicalPaths[index]!, edit: entry })),
+	const absolutePath = canonicalizePath(request.path, cwd);
+	const result = await executeEntries(
+		request.edits.map((edit) => ({ absolutePath, entry: edit })),
 		signal,
 	);
-	return { status: result.status, note: request.note, cwd, entries: result.entries };
+	return { status: result.status, note: request.note, path: request.path, cwd, entries: result.entries };
 }

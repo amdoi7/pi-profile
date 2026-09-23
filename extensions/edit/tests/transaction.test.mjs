@@ -5,8 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 
-import { applyOpToNormalizedContent } from "../match.ts";
-import { executeOpEntries } from "../transaction.ts";
+import { applyEntryToNormalizedContent } from "../match.ts";
+import { executeEntries } from "../transaction.ts";
 
 async function writeTempFile(prefix, name, content) {
 	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), prefix));
@@ -17,7 +17,7 @@ async function writeTempFile(prefix, name, content) {
 
 /** 单条目调用仍走同一个执行入口（sequence of one）。 */
 function runOneEntry(absolutePath, op, signal, operations) {
-	return executeOpEntries([{ absolutePath, edit: { path: absolutePath, ...op } }], signal, operations);
+	return executeEntries([{ absolutePath, entry: { ...op } }], signal, operations);
 }
 
 /**
@@ -98,9 +98,9 @@ test("the executor takes every target file's lock before reading any of them", a
 	});
 	await outerStarted;
 
-	const seq = executeOpEntries([
-		{ absolutePath: first, edit: { path: first, match: "one", new_str: "uno" } },
-		{ absolutePath: second, edit: { path: second, match: "two", new_str: "dos" } },
+	const seq = executeEntries([
+		{ absolutePath: first, entry: { match: "one", new_str: "uno" } },
+		{ absolutePath: second, entry: { match: "two", new_str: "dos" } },
 	]);
 
 	await new Promise((resolve) => setTimeout(resolve, 20));
@@ -121,10 +121,10 @@ test("one failed entry applies the earlier ones, names the failure, and stops", 
 	await fs.promises.writeFile(stale, "beta\n", "utf-8");
 	await fs.promises.writeFile(later, "gamma\n", "utf-8");
 
-	const result = await executeOpEntries([
-		{ absolutePath: good, edit: { path: good, match: "alpha", new_str: "ALPHA" } },
-		{ absolutePath: stale, edit: { path: stale, match: "missing", new_str: "BETA" } },
-		{ absolutePath: later, edit: { path: later, match: "gamma", new_str: "GAMMA" } },
+	const result = await executeEntries([
+		{ absolutePath: good, entry: { match: "alpha", new_str: "ALPHA" } },
+		{ absolutePath: stale, entry: { match: "missing", new_str: "BETA" } },
+		{ absolutePath: later, entry: { match: "gamma", new_str: "GAMMA" } },
 	]);
 
 	assert.equal(result.status, "partial");
@@ -143,9 +143,9 @@ test("a failure on the first entry rejects the sequence with nothing written", a
 		{ "/mem/a.txt": "alpha\n", "/mem/b.txt": "beta\n" },
 	);
 
-	const result = await executeOpEntries([
-		{ absolutePath: "/mem/a.txt", edit: { path: "/mem/a.txt", match: "missing-a", new_str: "x" } },
-		{ absolutePath: "/mem/b.txt", edit: { path: "/mem/b.txt", match: "beta", new_str: "BETA" } },
+	const result = await executeEntries([
+		{ absolutePath: "/mem/a.txt", entry: { match: "missing-a", new_str: "x" } },
+		{ absolutePath: "/mem/b.txt", entry: { match: "beta", new_str: "BETA" } },
 	], undefined, operations);
 
 	assert.equal(result.status, "rejected");
@@ -163,10 +163,10 @@ test("a write failure keeps earlier entries applied, stops the sequence, and rep
 		(target) => target === "/mem/b.txt",
 	);
 
-	const result = await executeOpEntries([
-		{ absolutePath: "/mem/a.txt", edit: { path: "/mem/a.txt", match: "alpha", new_str: "ALPHA" } },
-		{ absolutePath: "/mem/b.txt", edit: { path: "/mem/b.txt", match: "beta", new_str: "BETA" } },
-		{ absolutePath: "/mem/c.txt", edit: { path: "/mem/c.txt", match: "gamma", new_str: "GAMMA" } },
+	const result = await executeEntries([
+		{ absolutePath: "/mem/a.txt", entry: { match: "alpha", new_str: "ALPHA" } },
+		{ absolutePath: "/mem/b.txt", entry: { match: "beta", new_str: "BETA" } },
+		{ absolutePath: "/mem/c.txt", entry: { match: "gamma", new_str: "GAMMA" } },
 	], undefined, operations);
 
 	assert.equal(result.status, "partial");
@@ -187,9 +187,9 @@ test("an applied sequence returns one preview per entry", async () => {
 	await fs.promises.writeFile(first, "const a = 1;\n", "utf-8");
 	await fs.promises.writeFile(second, "const b = 2;\n", "utf-8");
 
-	const result = await executeOpEntries([
-		{ absolutePath: first, edit: { path: first, match: "const a = 1;", new_str: "const a = 11;" } },
-		{ absolutePath: second, edit: { path: second, match: "const b = 2;", new_str: "const b = 22;" } },
+	const result = await executeEntries([
+		{ absolutePath: first, entry: { match: "const a = 1;", new_str: "const a = 11;" } },
+		{ absolutePath: second, entry: { match: "const b = 2;", new_str: "const b = 22;" } },
 	]);
 
 	assert.equal(result.status, "applied");
@@ -206,58 +206,64 @@ test("identical entries in one sequence chain on the same file", async () => {
 	const file = path.join(dir, "c.txt");
 	await fs.promises.writeFile(file, "one\n", "utf-8");
 
-	const result = await executeOpEntries([
-		{ absolutePath: file, edit: { path: file, match: "one", new_str: "two" } },
-		{ absolutePath: file, edit: { path: file, match: "two", new_str: "three" } },
+	const result = await executeEntries([
+		{ absolutePath: file, entry: { match: "one", new_str: "two" } },
+		{ absolutePath: file, entry: { match: "two", new_str: "three" } },
 	]);
 
 	assert.equal(result.status, "applied");
 	assert.equal(await fs.promises.readFile(file, "utf-8"), "three\n");
 });
 
-// ─── 匹配语义（applyOpToNormalizedContent） ─────────────────────────────────
+// ─── 匹配语义（applyEntryToNormalizedContent） ─────────────────────────────────
 
-test("quote fallback preserves unrelated typography and replacement quote style", () => {
+// 引号不再有回写方言:弯引号文件里写什么就洛什么。match 必须显式写弯引号,没命中
+// 走显式 closest hint。
+test("curly quotes in the file must be matched verbatim — no silent rewriting", () => {
 	const original = ['title: “keep me”', 'message: “old value”', 'footer — untouched', ''].join("\n");
 
-	const { newContent } = applyOpToNormalizedContent(
-		original,
-		{ match: 'message: "old value"\n', new_str: 'message: "new value"\n' },
-	);
-
-	assert.equal(
-		newContent,
-		['title: “keep me”', 'message: “new value”', 'footer — untouched', ''].join("\n"),
+	assert.throws(
+		() => applyEntryToNormalizedContent(
+			original,
+			{ match: 'message: "old value"\n', new_str: 'message: "new value"\n' },
+		),
+		(error) => {
+			assert.equal(error.kind, "NOT_FOUND");
+			assert.ok(error.closest !== undefined, "closest hint must be present");
+			return true;
+		},
 	);
 });
 
 
 
 test("delete removes the matched text verbatim", () => {
-	const { newContent } = applyOpToNormalizedContent(
+	const { newContent } = applyEntryToNormalizedContent(
 		"keep\ndead_code();\nkeep\n",
 		{ match: "dead_code();\n" },
 	);
 	assert.equal(newContent, "keep\nkeep\n");
 });
 
-test("replace replaces every exact occurrence and reports a span per hit", () => {
-	const { newContent, matchedSpans } = applyOpToNormalizedContent(
-		"const oldName = oldName + oldName;\n",
+test("replace reports one span for the unique hit", () => {
+	const { newContent, matchedSpans } = applyEntryToNormalizedContent(
+		"const oldName = 1;\n",
 		{ match: "oldName", new_str: "newName" },
 	);
 
-	assert.equal(newContent, "const newName = newName + newName;\n");
-	assert.equal(matchedSpans.length, 3);
+	assert.equal(newContent, "const newName = 1;\n");
+	assert.equal(matchedSpans.length, 1);
 });
 
-test("replace defaults to replacing all matches", () => {
-	const { newContent } = applyOpToNormalizedContent("aaa aaa", { match: "aaa", new_str: "b" });
-	assert.equal(newContent, "b b");
+test("a repeated match is rejected as DUPLICATE_MATCH", () => {
+	assert.throws(
+		() => applyEntryToNormalizedContent("aaa aaa", { match: "aaa", new_str: "b" }),
+		/matched 2 locations/,
+	);
 });
 
 test("exact unique match wins over fuzzy-equivalent quote variants elsewhere", () => {
-	const { newContent } = applyOpToNormalizedContent(
+	const { newContent } = applyEntryToNormalizedContent(
 		'x: “v”\nx: "v"\n',
 		{ match: 'x: “v”\n', new_str: 'x: “w”\n' },
 	);
@@ -343,20 +349,15 @@ test("identical replacement fails closed as a structured no-change edit error", 
 
 test("an empty match is rejected at the boundary", () => {
 	assert.throws(
-		() => applyOpToNormalizedContent("alpha\n", { match: "", new_str: "y" }),
+		() => applyEntryToNormalizedContent("alpha\n", { match: "", new_str: "y" }),
 		/^Error: match must not be empty\.$/,
 	);
 });
 
 // 匹配阶梯的语义优先级（不是性能优化，是行为承诺）：
-// - exact 命中存在 ⇒ 只用 exact 桶，fuzzy 变体不参与计数或替换；
-// - 全弯引号两处命中直引号 match ⇒ fuzzy 层全部替换（多命中不再报 DUPLICATE_MATCH）。
+// 一切分歧显式化(2026-09-09 撤修):直引号 match 不再折叠弯/全角变体,
+// 文件里是什么写法就必须用什么写法;没命中就走显式 closest hint,引擎不猜方言。
 test("exact hit suppresses the fuzzy variant of the same text", () => {
-	const { newContent } = applyOpToNormalizedContent("x,y x，y\n", { match: "x,y", new_str: "z" });
+	const { newContent } = applyEntryToNormalizedContent("x,y x，y\n", { match: "x,y", new_str: "z" });
 	assert.equal(newContent, "z x，y\n");
-});
-
-test("two fuzzy variants of a straight-quote match are replaced by default", () => {
-	const { newContent } = applyOpToNormalizedContent("x’y x’y\n", { match: "x'y", new_str: "z" });
-	assert.equal(newContent, "z z\n");
 });

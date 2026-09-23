@@ -58,14 +58,11 @@ async function loadRegisteredEditTool() {
 }
 
 const REASONING = "align settlement field names";
+const PATH = "src/example.ts";
 
 function makeArgs(entries) {
-	// 新契约：files[path] = op 链。按 path 分组，去 path 后的条目进链。
-	const files = {};
-	for (const { path: filePath, ...op } of entries) {
-		(files[filePath] ??= []).push(op);
-	}
-	return { note: REASONING, files };
+	// 新契约：note + path + edits。输入即内部形状，无第二层映射。
+	return { note: REASONING, path: PATH, edits: entries };
 }
 
 function createTheme() {
@@ -145,9 +142,9 @@ function contextDisplay(entries) {
 	};
 }
 
-function appliedEntry(filePath, display, overrides = {}) {
+function appliedEntry(display, overrides = {}) {
 	return {
-		edit: { path: filePath, match: "before" },
+		entry: { match: "before" },
 		status: "applied",
 		changeStats: { additions: 1, deletions: 1, changedLines: 2 },
 		display,
@@ -162,7 +159,7 @@ function buildAgentResult(entries, { status = "applied", cwd = process.cwd() } =
 	return {
 		content: [{ type: "text", text: JSON.stringify({ status }) }],
 		isError: status === "rejected",
-		details: { status, note: REASONING, cwd, entries },
+		details: { status, note: REASONING, path: PATH, cwd, entries },
 	};
 }
 
@@ -172,7 +169,7 @@ test("pending render shows the route and the planned entries without any diff te
 	const output = renderText(
 		tool.renderCall(
 			makeArgs([
-				{ path: "src/example.ts", match: "before", new_str: "after" },
+				{ match: "before", new_str: "after" },
 			]),
 			createTheme(),
 			createRenderContext({ executionStarted: false, argsComplete: true, isPartial: false }),
@@ -189,10 +186,10 @@ test("applied result attributes the tool once and lists one line per entry", asy
 	const tool = await loadRegisteredEditTool();
 	const output = renderText(tool.renderResult(
 		buildAgentResult([
-			appliedEntry("src/example.ts", replacementDisplay(1, "before", "after"), {
+			appliedEntry(replacementDisplay(1, "before", "after"), {
 				changeStats: { additions: 2, deletions: 1, changedLines: 3 },
 			}),
-			appliedEntry("src/other.ts", replacementDisplay(1, "left", "right")),
+			appliedEntry(replacementDisplay(1, "left", "right")),
 		]),
 		{ expanded: true },
 		createTheme(),
@@ -200,7 +197,7 @@ test("applied result attributes the tool once and lists one line per entry", asy
 	));
 
 	assert.equal(countOccurrences(output, "edit"), 1, output);
-	assertAppearsInOrder(output, ["edit", "src/example.ts · +2 -1", "src/other.ts · +1 -1"]);
+	assertAppearsInOrder(output, ["edit", "src/example.ts · +2 -1", "src/example.ts · +1 -1"]);
 });
 
 test("production result renderer uses Pi native diff rendering", async () => {
@@ -208,7 +205,7 @@ test("production result renderer uses Pi native diff rendering", async () => {
 	const tool = await loadRegisteredEditTool();
 	const output = renderText(tool.renderResult(
 		buildAgentResult([
-			appliedEntry("src/example.ts", replacementDisplay(10, "\tindented", "  indented"), { firstChangedLine: 10 }),
+			appliedEntry(replacementDisplay(10, "\tindented", "  indented"), { firstChangedLine: 10 }),
 		]),
 		{ expanded: true },
 		createTheme(),
@@ -223,7 +220,7 @@ test("each entry header sits directly above its own diff", async () => {
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
 	const output = renderText(tool.renderResult(
-		buildAgentResult([appliedEntry("src/example.ts", replacementDisplay(1, "before", "after"))]),
+		buildAgentResult([appliedEntry(replacementDisplay(1, "before", "after"))]),
 		{ expanded: true },
 		createTheme(),
 		createRenderContext(),
@@ -240,8 +237,8 @@ test("rejected sequence says nothing was written and marks the untouched entries
 	const tool = await loadRegisteredEditTool();
 	const output = renderText(tool.renderResult(
 		buildAgentResult([
-			{ edit: { path: "src/skipped.ts", match: "x" }, status: "skipped" },
-			{ edit: { path: "src/stale.ts", match: "x" }, status: "failed", error: "match was not found." },
+			{ entry: { match: "x" }, status: "skipped" },
+			{ entry: { match: "x" }, status: "failed", error: "match was not found." },
 		], { status: "rejected" }),
 		{ expanded: true },
 		createTheme(),
@@ -249,7 +246,7 @@ test("rejected sequence says nothing was written and marks the untouched entries
 	));
 
 	assert.match(output, /rejected · nothing written/);
-	assert.match(output, /src\/skipped\.ts · skipped/);
+	assert.match(output, /src\/example\.ts · skipped/);
 	assert.match(output, /match was not found/);
 });
 
@@ -263,14 +260,14 @@ test("the multi-line not-found payload keeps every line under the rail", async (
 		"288|guide 出引导卡、hint 出提醒。",
 	].join("\n");
 	const output = renderText(tool.renderResult(
-		buildAgentResult([{ edit: { path: "docs/design.md", match: "x" }, status: "failed", error }], { status: "rejected" }),
+		buildAgentResult([{ entry: { match: "x" }, status: "failed", error }], { status: "rejected" }),
 		{ expanded: true },
 		createTheme(),
 		createRenderContext(),
 	));
 
 	const lines = output.split("\n");
-	const pathIndex = lines.findIndex((line) => line.includes("docs/design.md"));
+	const pathIndex = lines.findIndex((line) => line.includes(PATH));
 	const indent = (line) => line.length - line.trimStart().length;
 	const headIndex = lines.findIndex((line) => line.includes("match was not found; L287 col 56"));
 	const firstRegion = lines.findIndex((line) => line.includes("287|gate 出导航卡"));
@@ -288,9 +285,9 @@ test("partial sequence counts applied and failed entries in the header", async (
 	const tool = await loadRegisteredEditTool();
 	const output = renderText(tool.renderResult(
 		buildAgentResult([
-			appliedEntry("src/applied.ts", replacementDisplay(1, "before", "after")),
-			{ edit: { path: "src/failed.ts", match: "x" }, status: "failed", error: "ENOSPC: no space left on device" },
-			{ edit: { path: "src/skipped.ts", match: "x" }, status: "skipped" },
+			appliedEntry(replacementDisplay(1, "before", "after")),
+			{ entry: { match: "x" }, status: "failed", error: "ENOSPC: no space left on device" },
+			{ entry: { match: "x" }, status: "skipped" },
 		], { status: "partial" }),
 		{ expanded: true },
 		createTheme(),
@@ -298,9 +295,9 @@ test("partial sequence counts applied and failed entries in the header", async (
 	));
 
 	assert.match(output, /partial · 1 applied · 1 failed/);
-	assert.match(output, /src\/applied\.ts · \+1 -1/);
+	assert.match(output, /src\/example\.ts · \+1 -1/);
 	assert.match(output, /ENOSPC/);
-	assert.match(output, /src\/skipped\.ts · skipped/);
+	assert.match(output, /src\/example\.ts · skipped/);
 });
 
 // pi 包装执行前失败(prepareArguments/schema/abort/blocked)时用的信封:
@@ -357,14 +354,14 @@ test("completed tool execution replaces the pending plan with the final diff", a
 	initTheme("dark");
 	const tool = await loadRegisteredEditTool();
 	const args = makeArgs([
-		{ path: "/tmp/pi-edit-ui-demo/example.ts", match: "before", new_str: "after" },
+		{ match: "before", new_str: "after" },
 	]);
 	const component = createToolExecutionComponent(tool, args);
 	component.setArgsComplete();
 	component.markExecutionStarted();
 	component.updateResult(
 		buildAgentResult([
-			appliedEntry("/tmp/pi-edit-ui-demo/example.ts", contextDisplay([
+			appliedEntry(contextDisplay([
 				[1, "export const value = 1;"],
 				[2, 'export const name = "after";'],
 			])),
@@ -373,8 +370,8 @@ test("completed tool execution replaces the pending plan with the final diff", a
 	);
 
 	const output = renderText(component);
-	assert.equal(countOccurrences(output, "/tmp/pi-edit-ui-demo/example.ts"), 1);
-	assertAppearsInOrder(output, ["edit", "/tmp/pi-edit-ui-demo/example.ts", 'export const name = "after";']);
+	assert.equal(countOccurrences(output, PATH), 1, output);
+	assertAppearsInOrder(output, ["edit", PATH, 'export const name = "after";']);
 });
 
 // 端到端：参数残缺的调用走到 pi 的执行前失败信封。
@@ -403,7 +400,7 @@ test("a failed entry puts its message directly under its own line", async () => 
 	const tool = await loadRegisteredEditTool();
 	const output = renderText(tool.renderResult(
 		buildAgentResult(
-			[{ edit: { path: "src/a.ts", match: "x" }, status: "failed", error: "match was not found." }],
+			[{ entry: { match: "x" }, status: "failed", error: "match was not found." }],
 			{ status: "rejected" },
 		),
 		{ expanded: true },
@@ -411,7 +408,7 @@ test("a failed entry puts its message directly under its own line", async () => 
 		createRenderContext(),
 	));
 	const lines = output.split("\n");
-	const pathIndex = lines.findIndex((line) => line.includes("src/a.ts"));
+	const pathIndex = lines.findIndex((line) => line.includes(PATH));
 	assert.ok(pathIndex >= 0);
 	assert.match(lines[pathIndex + 1] ?? "", /match was not found/);
 });
@@ -422,7 +419,7 @@ test("renderResult makes edit path headers clickable file hyperlinks", async () 
 	const cwd = "/tmp/pi-edit-link-demo";
 	const raw = renderRawText(
 		tool.renderResult(
-			buildAgentResult([appliedEntry("src/example.ts", contextDisplay([[1, "after"]]))], { cwd }),
+			buildAgentResult([appliedEntry(contextDisplay([[1, "after"]]))], { cwd }),
 			{ expanded: true },
 			createTheme(),
 			createRenderContext({ cwd }),

@@ -2,7 +2,7 @@
  * ui.ts —— edit 的条目展示：每条目一行（含 diff）。
  *
  * 归因只在工具名出现一次（label="edit"），条目行用缩进 rail 归属到这个调用；
- * 每条目显示 path + op 摘要（含选择器：occurrence/limit/after/before/regex），
+ * 每条目显示 path + op 摘要，
  * 成功条目的 diff 嵌在行后。
  */
 
@@ -35,12 +35,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function isEntryOutcome(value: unknown): value is EntryOutcome {
-	if (!isRecord(value) || !isRecord(value.edit)) return false;
-	if (typeof value.edit.path !== "string" || typeof value.edit.match !== "string") return false;
+	if (!isRecord(value) || !isRecord(value.entry)) return false;
+	if (typeof value.entry.match !== "string") return false;
 	if (value.status === "applied") {
 		return isChangeStats(value.changeStats) && isDisplayDiff(value.display);
 	}
-	if (value.status === "failed") return typeof value.error === "string";
+	if (value.status === "failed") {
+		if (typeof value.error !== "string") return false;
+		// closest 是失败载荷的一部分(不进门面渲染,门面用 message 单行 pointer)
+		const closest = value.closest;
+		if (closest !== undefined && (!isRecord(closest) || typeof closest.text !== "string")) return false;
+		return true;
+	}
 	return value.status === "skipped";
 }
 
@@ -48,7 +54,7 @@ function isEntryOutcome(value: unknown): value is EntryOutcome {
 export function isScriptOutcome(value: unknown): value is ScriptOutcome {
 	if (!isRecord(value)) return false;
 	if (value.status !== "applied" && value.status !== "rejected" && value.status !== "partial") return false;
-	if (typeof value.note !== "string" || typeof value.cwd !== "string") return false;
+	if (typeof value.note !== "string" || typeof value.path !== "string" || typeof value.cwd !== "string") return false;
 	return Array.isArray(value.entries) && value.entries.every(isEntryOutcome);
 }
 
@@ -62,28 +68,16 @@ export function renderClearedCallState(context: EditToolRenderContext): Containe
 	return beginPendingFileMutationRender(context);
 }
 
-/** 条目摘要：pending 阶段一行说清这一步要做什么（非执行语义）。 */
-function selectorSuffix(entry: EditEntry): string {
-	const parts: string[] = [];
-	if (entry.occurrence !== undefined) parts.push(`#${entry.occurrence}`);
-	if (entry.limit !== undefined) parts.push(`≤${entry.limit}`);
-	if (entry.after !== undefined) parts.push(`after "${truncate(entry.after)}"`);
-	if (entry.before !== undefined) parts.push(`before "${truncate(entry.before)}"`);
-	if (entry.regex === true) parts.push("regex");
-	return parts.length > 0 ? ` [${parts.join(", ")}]` : "";
-}
-
 function truncate(text: string, max = 24): string {
 	return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
 /** 条目摘要：pending 阶段一行说清这一步要做什么（非执行语义）。 */
 export function entryLabel(entry: EditEntry): string {
-	const suffix = selectorSuffix(entry);
 	if (entry.new_str === undefined) {
-		return `delete "${truncate(entry.match)}"${suffix}`;
+		return `delete "${truncate(entry.match)}"`;
 	}
-	return `${truncate(entry.match)} → ${truncate(entry.new_str)}${suffix}`;
+	return `${truncate(entry.match)} → ${truncate(entry.new_str)}`;
 }
 
 /** 校验没过：能给用户的唯一真实信息就是这条消息。 */
@@ -102,7 +96,7 @@ export function renderCallView(
 		container,
 		request.edits.map((entry) => fileMutationPlanItem({
 			label: "",
-			path: entry.path,
+			path: request.path,
 			cwd: context.cwd,
 			changeStats: { additions: 0, deletions: 0, changedLines: 0 },
 			note: entryLabel(entry),
@@ -143,7 +137,7 @@ function entryItems(details: ScriptOutcome, theme: Theme) {
 		if (entry.status === "applied") {
 			return fileResultItem({
 				label: "",
-				path: entry.edit.path,
+				path: details.path,
 				cwd: details.cwd,
 				changeStats: entry.changeStats,
 				display: entry.display,
@@ -153,7 +147,7 @@ function entryItems(details: ScriptOutcome, theme: Theme) {
 		if (entry.status === "failed") {
 			return fileResultItem({
 				label: "",
-				path: entry.edit.path,
+				path: details.path,
 				cwd: details.cwd,
 				changeStats: { additions: 0, deletions: 0, changedLines: 0 },
 				display: { lineNumberWidth: 1, rows: [] },
@@ -164,7 +158,7 @@ function entryItems(details: ScriptOutcome, theme: Theme) {
 		}
 		return fileMutationPlanItem({
 			label: "",
-			path: entry.edit.path,
+			path: details.path,
 			cwd: details.cwd,
 			changeStats: { additions: 0, deletions: 0, changedLines: 0 },
 			note: "skipped",

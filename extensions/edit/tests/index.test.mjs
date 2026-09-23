@@ -3,8 +3,11 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Compile } from "typebox/compile";
 
 import editExtension, { editRequestParameters } from "../index.ts";
+
+const validateRequest = Compile(editRequestParameters);
 
 function captureExtension() {
 	let registeredTool;
@@ -32,8 +35,11 @@ async function writeTempFile(name, content) {
 	return file;
 }
 
-function run(tool, args) {
-	return tool.execute("call-1", args, undefined, undefined, { cwd: process.cwd() });
+async function run(tool, args) {
+	const prepared = tool.prepareArguments(args);
+	const errors = [...validateRequest.Errors(prepared)];
+	if (errors.length > 0) throw new Error(errors.map((error) => error.message).join("; "));
+	return tool.execute("call-1", prepared, undefined, undefined, { cwd: process.cwd() });
 }
 
 // rejected（零写入）进错误信封；partial 是信息完整的执行结果，不是 error。
@@ -44,7 +50,8 @@ test("a rejected sequence flips the tool result envelope to isError", async () =
 
 	const result = await run(tool, {
 		note: "why",
-		files: { [file]: [{ match: "missing text", new_str: "replacement" }] },
+		path: file,
+		edits: [{ match: "missing text", new_str: "replacement" }],
 	});
 
 	const payload = JSON.parse(result.content[0].text);
@@ -71,10 +78,11 @@ test("a partial sequence (some applied, some failed) is not an error", async () 
 
 	const result = await run(tool, {
 		note: "why",
-		files: {
-			[good]: [{ match: "const x = 1;", new_str: "const x = 99;" }],
-			[stale]: [{ match: "missing anchor", new_str: "z" }],
-		},
+		path: good,
+		edits: [
+			{ match: "const x = 1;", new_str: "const x = 99;" },
+			{ match: "missing anchor", new_str: "z" },
+		],
 	});
 
 	const payload = JSON.parse(result.content[0].text);
@@ -92,7 +100,8 @@ test("an applied sequence and other tools leave the envelope untouched", async (
 
 	const applied = await run(tool, {
 		note: "why",
-		files: { [file]: [{ match: "const x = 1;", new_str: "const x = 2;" }] },
+		path: file,
+		edits: [{ match: "const x = 1;", new_str: "const x = 2;" }],
 	});
 
 	assert.equal(onToolResult({ type: "tool_result", toolName: "edit", isError: false, details: applied.details }), undefined);
@@ -105,22 +114,88 @@ test("an applied sequence is not an error and keeps its entries in the UI detail
 
 	const result = await run(tool, {
 		note: "why",
-		files: { [file]: [{ match: "const", new_str: "let" }] },
+		path: file,
+		edits: [{ match: "const", new_str: "let" }],
 	});
 
 	assert.notEqual(result.isError, true);
 	assert.equal(JSON.parse(result.content[0].text).status, "applied");
-	assert.equal(result.details.entries[0].edit.path, file);
-	assert.equal(result.details.entries[0].edit.match, "const");
+	assert.equal(result.details.path, file);
+	assert.equal(result.details.entries[0].entry.match, "const");
 });
 
-// provider 侧契约：files 必填非空，op 枚举受控，字段按 op 分管。
-test("the provider schema requires a non-empty files object with controlled ops", () => {
-	assert.deepEqual(editRequestParameters.required, ["note", "files"]);
+test("a non-unique match is rejected as DUPLICATE_MATCH without writing", async () => {
+	const tool = captureTool();
+	const original = "import first\nimport unused_one\nimport last\n";
+	const file = await writeTempFile("imports.py", original);
+
+	const result = await run(tool, {
+		note: "remove an unused import",
+		path: file,
+		edits: [{ match: "import", new_str: "from" }],
+	});
+
+	const payload = JSON.parse(result.content[0].text);
+	assert.equal(payload.status, "rejected");
+	assert.equal(payload.entries[0].kind, "DUPLICATE_MATCH");
+	assert.match(payload.entries[0].message, /matched 3 locations/);
+	assert.equal(await fs.readFile(file, "utf-8"), original);
+});
+
+test("a longer unique match disambiguates repeated text", async () => {
+	const tool = captureTool();
+	const file = await writeTempFile(
+		"imports.py",
+		"import first\nimport unused_one\nimport last\n",
+	);
+
+	const result = await run(tool, {
+		note: "remove an unused import",
+		path: file,
+		edits: [{ match: "import unused_one", new_str: "from unused_one" }],
+	});
+
+	assert.equal(JSON.parse(result.content[0].text).status, "applied");
+	assert.equal(
+		await fs.readFile(file, "utf-8"),
+		"import first\nfrom unused_one\nimport last\n",
+	);
+});
+
+test.each([
+	["legacy occurrence", { match: "import", occurrence: 1 }, /occurrence must be removed/],
+	["legacy limit", { match: "import", limit: 1 }, /limit must be removed/],
+	["retired range", { match: "import", range: { start: 1, count: 1 } }, /range must be removed/],
+	["retired regex", { match: "import", regex: true }, /regex must be removed/],
+	["retired after", { match: "import", after: "x" }, /after must be removed/],
+	["retired before", { match: "import", before: "x" }, /before must be removed/],
+])("invalid match selection is rejected before IO: %s", async (_scenario, edit, expectedError) => {
+	const tool = captureTool();
+	const original = "import first\nimport last\n";
+	const file = await writeTempFile("imports.py", original);
+
+	await assert.rejects(
+		() => run(tool, { note: "remove an unused import", path: file, edits: [edit] }),
+		expectedError,
+	);
+	assert.equal(await fs.readFile(file, "utf-8"), original);
+});
+
+// provider 侧契约：note/path/edits 必填，条目 match 必填且不带 path，字段受控。
+test("the provider schema requires note, path and a non-empty edits array with controlled entries", () => {
+	assert.deepEqual(editRequestParameters.required, ["note", "path", "edits"]);
 	assert.equal(editRequestParameters.additionalProperties, false);
-	const record = editRequestParameters.properties.files;
-	const entry = record.additionalProperties ?? Object.values(record.patternProperties ?? {})[0];
-	assert.equal(entry.minItems, 1);
+	const entry = editRequestParameters.properties.edits.items;
+	assert.deepEqual(entry.required, ["match"]);
+	assert.ok(!("path" in entry.properties), "path belongs at the top level");
+	assert.ok(!("occurrence" in entry.properties));
+	assert.ok(!("limit" in entry.properties));
+	assert.ok(!("range" in entry.properties), "selectors are retired");
+	assert.ok(!("regex" in entry.properties), "selectors are retired");
+	assert.ok(!("after" in entry.properties), "selectors are retired");
+	assert.ok(!("before" in entry.properties), "selectors are retired");
+	assert.equal(entry.additionalProperties, false);
+	assert.equal(editRequestParameters.properties.edits.minItems, 1);
 });
 
 test("a sequence missing its entries is rejected before touching the file", async () => {
@@ -128,10 +203,8 @@ test("a sequence missing its entries is rejected before touching the file", asyn
 	const file = await writeTempFile("target.ts", "const x = 1;\n");
 
 	await assert.rejects(
-		() => run(tool, { note: "why", files: {} }),
-		/files must not be empty/,
+		() => run(tool, { note: "why", path: file, edits: [] }),
+		/edits must not be empty/,
 	);
 	assert.equal(await fs.readFile(file, "utf-8"), "const x = 1;\n");
 });
-
-;

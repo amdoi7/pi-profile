@@ -30,7 +30,7 @@ type WindowSpan = {
 	kind: "replace";
 	matchIndex: number;
 	matchLength: number;
-	newText: string;
+	replacement: string;
 };
 
 type DiffWindow = {
@@ -96,11 +96,11 @@ function spanEnd(span: WindowSpan): number {
 }
 
 function spanDelta(span: WindowSpan): number {
-	return span.newText.length - span.matchLength;
+	return span.replacement.length - span.matchLength;
 }
 
 function spanToWindow(span: MatchedEditSpan): WindowSpan {
-	return { kind: "replace", matchIndex: span.matchIndex, matchLength: span.matchLength, newText: span.newText };
+	return { kind: "replace", matchIndex: span.matchIndex, matchLength: span.matchLength, replacement: span.replacement };
 }
 
 /**
