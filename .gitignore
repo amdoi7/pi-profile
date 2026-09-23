@@ -22,6 +22,11 @@
 /.cache/
 /pi-crash.log
 
+# mirasim 生成物与运行时缓存（启动时同步读、后台拉取后覆盖）
+/extensions/mirasim-gateway-*.js
+/extensions/smx-agent-status.js
+/mirasim-models.json
+
 # Dependencies, build output, and test coverage
 **/node_modules/
 **/dist/
