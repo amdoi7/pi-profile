@@ -23,7 +23,7 @@ import { CONFIG_DIR_NAME, type ExtensionAPI } from "@earendil-works/pi-coding-ag
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
 import { chmod, readFile, rename, stat, writeFile } from "node:fs/promises";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -44,6 +44,8 @@ const CLAUDE_BETA =
 // 后补 /v1/messages。若 baseUrl 带 /v1 会拼成 /v1/v1/messages。relay 只有 anthropic
 // messages 一条模型通道（openai chat/completions 404）。
 const RELAY_BASE = "https://mirasim-relay.mirofish.ai";
+// 模型列表本地缓存：启动时同步读（零网络），后台拉取后更新供下次启动。
+const MODEL_CACHE_PATH = join(homedir(), CONFIG_DIR_NAME, "agent", "mirasim-models.json");
 
 // ---------------------------------------------------------------------------
 // Token 路径与加密（mirasim app 兼容）
@@ -486,8 +488,8 @@ const THINKING_LEVEL_MAP: ThinkingLevelMap = {
   off: null,
   minimal: null,
   low: null,
-  medium: null,
-  high: null,
+  medium: "medium",
+  high: "high",
   xhigh: "xhigh",
   max: "max",
 };
@@ -513,7 +515,12 @@ async function fetchModelsFromRelay(signal?: AbortSignal): Promise<PiModel[]> {
   const ids = (payload.data ?? [])
     .map((m) => (typeof m.id === "string" ? m.id : ""))
     .filter((id) => id !== "");
-  return ids.map((id) => ({
+  return ids.map((id) => buildModel(id));
+}
+
+/** 模型元数据本地构造（fetch 与默认共用同一规则）。 */
+function buildModel(id: string): PiModel {
+  return {
     id,
     name: id,
     provider: "mirasim",
@@ -529,16 +536,37 @@ async function fetchModelsFromRelay(signal?: AbortSignal): Promise<PiModel[]> {
     contextWindow: id === "gpt-6-astra" ? 872000 : 1000000,
     maxTokens: 128000,
     cost: { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 },
-  }));
+  };
+}
+
+/** 无缓存时的内置默认模型（覆盖 relay 核心模型，启动零网络）。 */
+function buildDefaultModels(): PiModel[] {
+  return ["gpt-5.6-sol", "claude-fable-5", "claude-fable-5-1", "claude-opus-5"].map(buildModel);
+}
+
+/** 读上次拉取的模型缓存（损坏/缺失返回 null → 回退默认）。 */
+function readCachedModels(): PiModel[] | null {
+  try {
+    if (!existsSync(MODEL_CACHE_PATH)) return null;
+    const raw = JSON.parse(readFileSync(MODEL_CACHE_PATH, "utf8")) as unknown;
+    if (!Array.isArray(raw) || raw.length === 0) return null;
+    const models = raw
+      .filter((m): m is { id: string } => !!m && typeof (m as { id?: unknown }).id === "string")
+      .map((m) => buildModel(m.id));
+    return models.length > 0 ? models : null;
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Extension entry point
 // ---------------------------------------------------------------------------
 
-export default async function (pi: ExtensionAPI) {
-  // 动态拉取 relay 模型列表（启动时一次；失败为空数组,provider 仍注册,下次 /reload 重试）
-  const models = await fetchModelsFromRelay().catch(() => []);
+export default function (pi: ExtensionAPI) {
+  // 异步加载：启动零网络阻塞。模型列表用本地缓存（上次拉取结果）同步注册，
+  // 无缓存时回退内置默认 4 模型；后台从 relay 刷新缓存供下次启动。
+  const models = readCachedModels() ?? buildDefaultModels();
 
   let proxyTarget: ProxyTarget | null = null;
   let discovery: Promise<ProxyTarget | null> | null = null;
@@ -650,4 +678,14 @@ export default async function (pi: ExtensionAPI) {
       },
     }),
   );
+
+  // 后台刷新模型缓存（不阻塞启动）：拉取成功写盘，供下次启动同步注册。
+  void fetchModelsFromRelay().then((fetched) => {
+    if (fetched.length === 0) return; // 拉取失败：保留现有缓存，下次重试
+    try {
+      writeFileSync(MODEL_CACHE_PATH, JSON.stringify(fetched, null, 2), { mode: 0o600 });
+    } catch (error) {
+      console.error(`[mirasim] 写模型缓存失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  });
 }
