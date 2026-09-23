@@ -30,6 +30,7 @@ import {
 	formatSessionRow,
 	formatUsageLine,
 	layoutFooter,
+	sessionAnchorRgb,
 } from "./custom-footer-format.ts";
 import {
 	createUsageFetcher,
@@ -203,9 +204,14 @@ export default function (pi: ExtensionAPI) {
 						: "no-model";
 					const thinking = pi.getThinkingLevel();
 					const sessionId = ctx.sessionManager.getSessionId();
+					// 会话锚：前 8 位，真彩色 = id 哈希（djb2→色相→HSL，同 id 恒同色）。
+					// 不经过主题 token——裸 ANSI 由这里拼，displayWidth 剥 SGR 兼容。
 					const sessionTag =
 						sessionId && sessionId.length > 0
-							? `${theme.fg("accent", `◈${sessionId.slice(0, 8)}`)} ` // 会话锚：前 8 位，accent 色（omp session 段）
+							? (() => {
+									const [r, g, b] = sessionAnchorRgb(sessionId);
+									return `\x1b[38;2;${r};${g};${b}m◈${sessionId.slice(0, 8)}\x1b[39m `;
+								})()
 							: "";
 					const segments = {
 						model: `${sessionTag}${formatModel(theme, providerName, model?.id, thinking)}`,

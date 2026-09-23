@@ -189,7 +189,7 @@ describe("custom footer extension statusline", () => {
     );
 
     expect(footer.render(120)).toEqual([
-      `cwd: /tmp${" ".repeat(35)}◈sess-123 test-model · think:high`,
+      `cwd: /tmp${" ".repeat(35)}\x1b[38;2;230;105;76m◈sess-123\x1b[39m test-model · think:high`,
       "ctx: ? ? $0.00",
       "review running",
       "impl queued",

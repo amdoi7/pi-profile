@@ -31,6 +31,50 @@ export type FooterTheme = {
   fg(name: FooterColor, text: string): string;
 };
 
+// --- session 哈希色 ---------------------------------------------------------
+
+/** djb2 哈希（omp session-color 同款），32 位无符号。 */
+export function hashString(s: string): number {
+  let hash = 5381;
+  for (let i = 0; i < s.length; i++) {
+    hash = ((hash << 5) + hash) ^ s.charCodeAt(i);
+    hash = hash >>> 0;
+  }
+  return hash;
+}
+
+/** 会话锚色相（0-360）：同一 id 恒同色、不同会话大概率异色（omp 同思路）。 */
+export function sessionAnchorHue(sessionId: string | undefined): number {
+  if (!sessionId || sessionId.length === 0) return 0;
+  return hashString(sessionId) % 360;
+}
+
+/** HSL → RGB（h 0-360，s/l 0-1），纯函数可单测。 */
+export function hslToRgb(h: number, s: number, l: number): [number, number, number] {
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+  const m = l - c / 2;
+  let r = 0;
+  let g = 0;
+  let b = 0;
+  if (h < 60) { r = c; g = x; }
+  else if (h < 120) { r = x; g = c; }
+  else if (h < 180) { g = c; b = x; }
+  else if (h < 240) { g = x; b = c; }
+  else if (h < 300) { r = x; b = c; }
+  else { r = c; b = x; }
+  return [Math.round((r + m) * 255), Math.round((g + m) * 255), Math.round((b + m) * 255)];
+}
+
+/**
+ * 会话锚真彩色 RGB：哈希决定色相，固定 S=75% / L=60%（深色终端可读的折中）。
+ * 不经过主题 token——真哈希色是 omp 思路（djb2 → 色相），主题注入只保留
+ * 在 fg() 抽象层，本函数输出裸 RGB 由 index.ts 拼 ANSI。
+ */
+export function sessionAnchorRgb(sessionId: string | undefined): [number, number, number] {
+  return hslToRgb(sessionAnchorHue(sessionId), 0.75, 0.6);
+}
+
 // --- number formatting ------------------------------------------------------
 
 export function formatCompact(n: number): string {
@@ -244,7 +288,7 @@ export function cacheHitRate(flow: Pick<RoundFlow, "cacheRead" | "cacheWrite" | 
 export function formatCacheHit(theme: FooterTheme, rate: number): string {
   const clamped = Math.min(100, Math.max(0, rate));
   const color: FooterColor = clamped >= 90 ? "success" : clamped >= 70 ? "text" : "warning";
-  return theme.fg(color, `ℂ${clamped.toFixed(1)}%`);
+  return theme.fg(color, `ℂ${clamped.toFixed(2)}%`);
 }
 
 /** 思考时长显示：`42s` / `1m5s` / `1h30m51s`（毫秒输入，≥60m 进位到 h）。 */

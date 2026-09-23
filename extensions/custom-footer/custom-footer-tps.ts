@@ -13,16 +13,16 @@
  * - TTFB = 本条消息首个响应块 − 本条消息的 turn_start(pi 事件 turn_start 在
  *   每条 LLM 响应发出前触发,每条消息独立测量;turn_start 缺失时回退
  *   agent_start)。
- * - t/s = 本轮速率,双消息源:
- *   - 实时源(进行中显示):message_end 增量——每条 assistant 消息完成时
- *     累加 usage.output(含 thinking——output 是服务端实际生成的 tokens,
- *     含 reasoning,pi 的 Usage 类型注释:reasoning 是 output 的子集)。
+ * - t/s = 生成速率(非墙钟吞吐),分母 = 本轮流式时间——各条 assistant 消息
+ *   首块到结束的时长之和(firstChunk → message_end,逐消息累计,消息间隙/
+ *   工具执行/思考等待不计入)。分子 = output 含 thinking(服务端实际生成
+ *   tokens,pi 的 Usage 注释:reasoning 是 output 子集)。无流式记录时回退
+ *   墙钟(agent_start → agent_settled)分母。双消息源：
+ *   - 实时源(进行中显示):message_end 增量。
  *   - 批量源(settled 锁定):agent_end 事件的 messages 一次累加——官方
  *     消息源,不依赖事件流完整性;失败/aborted 消息没有 message_end
  *     (agent-loop 错误路径直接 emit agent_end),增量源会漏计,批量源
  *     包含其 usage.output。
- *   分子取批量源,分母 = 本轮墙钟(首次 agent_start → agent_settled,
- *   含工具执行与思考等待——端到端速率,与官方 TPS 口径一致)。
  * Tracked per working directory.
  *
  * 渲染 hook:数据变化通过 onChange 通知(live 节流 / commit 立即),
@@ -108,6 +108,8 @@ type TpsEntry = {
   roundLiveFlow: RoundFlow;
   /** 批量源：agent_end 段批量累计（settled 锁定）。 */
   roundBatchFlow: RoundFlow;
+  /** 本轮流式时间累计（各消息 firstChunk→message_end 之和，毫秒）。 */
+  roundStreamMs: number;
   /** 最近完成轮的锁定 flow（跨轮保留，新轮完成时替换）。 */
   lastRoundFlow: RoundFlow | null;
   lastTurnMs: number | null;
@@ -129,6 +131,7 @@ export function createTpsTracker(deps: TpsTrackerDeps = {}): TpsTracker {
     messageFirstChunkMs: null,
     roundLiveFlow: emptyRoundFlow(),
     roundBatchFlow: emptyRoundFlow(),
+    roundStreamMs: 0,
     lastRoundFlow: previous?.lastRoundFlow ?? null,
     lastTurnMs: previous?.lastTurnMs ?? null,
     lastTokPerSec: previous?.lastTokPerSec ?? null,
@@ -146,6 +149,7 @@ export function createTpsTracker(deps: TpsTrackerDeps = {}): TpsTracker {
         // 新轮：双源归零（continue 不清零）。
         entry.roundLiveFlow = emptyRoundFlow();
         entry.roundBatchFlow = emptyRoundFlow();
+        entry.roundStreamMs = 0;
         notify("live");
       }
       entries.set(cwd, entry);
@@ -175,12 +179,18 @@ export function createTpsTracker(deps: TpsTrackerDeps = {}): TpsTracker {
       const nowMs = getNowMs();
       entry.lastTurnMs = nowMs - entry.agentStartMs;
       // 锁定 flow：批量源（官方消息源，含失败消息 usage）优先，无批量回退实时源。
+      // tps 分母 = 本轮流式时间（流式口径）；无流式记录（批量源-only 轮）回退墙钟。
       const batchOutput = entry.roundBatchFlow.output;
+      const streamMs = entry.roundStreamMs;
       if (batchOutput > 0) {
-        entry.lastTokPerSec = (batchOutput / (nowMs - entry.agentStartMs)) * 1000;
+        const denomMs = streamMs > 0 ? streamMs : nowMs - entry.agentStartMs;
+        entry.lastTokPerSec = (batchOutput / denomMs) * 1000;
         entry.lastRoundFlow = { ...entry.roundBatchFlow };
       } else if (entry.roundLiveFlow.output > 0) {
         entry.lastRoundFlow = { ...entry.roundLiveFlow };
+        if (streamMs > 0) {
+          entry.lastTokPerSec = (entry.roundLiveFlow.output / streamMs) * 1000;
+        }
       }
       // 本轮结束：清空起点——实时值变 null，显示回退固定总时长。
       entry.agentStartMs = null;
@@ -211,8 +221,11 @@ export function createTpsTracker(deps: TpsTrackerDeps = {}): TpsTracker {
       const nowMs = getNowMs();
       const firstChunkMs = entry.messageFirstChunkMs;
       entry.messageFirstChunkMs = null;
-      // TTFB = 本条消息首块 − 本条消息的 turn_start（缺失时回退轮起点）。
+      // 流式时长 = 首块 → 结束（仅含生成时间；首块缺失时不计，tps 分母不含
+      // 思考等待——墙钟口径把工具执行与等待稀释进速率，48 t/s 偏低的根因）。
       if (firstChunkMs !== null) {
+        entry.roundStreamMs += nowMs - firstChunkMs;
+        // TTFB = 本条消息首块 − 本条消息的 turn_start（缺失时回退轮起点）。
         const startMs = entry.turnStartMs ?? entry.agentStartMs;
         if (startMs !== null) {
           entry.lastTtfbMs = firstChunkMs - startMs;
@@ -244,10 +257,12 @@ export function createTpsTracker(deps: TpsTrackerDeps = {}): TpsTracker {
     getLast(cwd) {
       const entry = entries.get(cwd);
       if (!entry) return null;
-      // 进行中：实时值 = 实时源累计 / 当前经过时间；无累计则回退上一轮锁定值。
+      // 进行中：实时值 = 实时源累计 / 流式时间（无流式记录回退墙钟）；
+      // 无累计则回退上一轮锁定值。
       if (entry.agentStartMs !== null) {
         if (entry.roundLiveFlow.output > 0) {
-          const elapsedMs = getNowMs() - entry.agentStartMs;
+          const streamMs = entry.roundStreamMs;
+          const elapsedMs = streamMs > 0 ? streamMs : getNowMs() - entry.agentStartMs;
           if (elapsedMs > 0) return (entry.roundLiveFlow.output / elapsedMs) * 1000;
         }
         return entry.lastTokPerSec;

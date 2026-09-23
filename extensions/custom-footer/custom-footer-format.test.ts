@@ -10,7 +10,11 @@ import {
 	formatGitSegment,
 	formatModel,
 	formatSessionRow,
+	hashString,
+	hslToRgb,
 	layoutFooter,
+	sessionAnchorHue,
+	sessionAnchorRgb,
 	thinkingLevelColor,
 	usageBar,
 	usageColor,
@@ -90,9 +94,9 @@ describe("cacheHitRate / formatCacheHit (omp cache_hit 口径)", () => {
 		// miss 记在 input：命中 80 / 全部 100。
 		expect(cacheHitRate({ cacheRead: 80, cacheWrite: 0, input: 20 })).toBeCloseTo(80, 5);
 	});
-	test("formatCacheHit 显示一位小数(clamped 0..100)", () => {
-		expect(formatCacheHit(theme, 94.2)).toContain("94.2%");
-		expect(formatCacheHit(theme, 150)).toContain("100.0%");
+	test("formatCacheHit 显示两位小数(clamped 0..100，与 omp cache_hit 对齐)", () => {
+		expect(formatCacheHit(theme, 94.2)).toContain("94.20%");
+		expect(formatCacheHit(theme, 150)).toContain("100.00%");
 	});
 });
 
@@ -183,7 +187,7 @@ describe("formatSessionRow", () => {
 		// 真浪费（≥5 分）才显示。
 		const loud = formatSessionRow(theme, { ...opts, waste: { missedTokens: 293_000, missedCost: 0.51, missCount: 97 } });
 		expect(loud).toContain("miss 293k (97×) (+$0.51)");
-		expect(loud).toContain("ℂ99.0%");
+		expect(loud).toContain("ℂ99.02%");
 	});
 	test("subscription shows S-prefixed cost (omp spend)", () => {
 		const row = formatSessionRow(theme, { ...base, used: 100, pct: 10, contextWindow: 200_000, subscription: true, sessionCost: 0.75, roundFlow: null });
@@ -435,5 +439,41 @@ describe("extensionStatusLines", () => {
 			"impl queued",
 			"line with spaces  ",
 		]);
+	});
+});
+
+describe("sessionAnchorRgb (真哈希色, omp session-color 思路)", () => {
+	test("same id always maps to the same color", () => {
+		expect(sessionAnchorRgb("sess-abc123")).toEqual(sessionAnchorRgb("sess-abc123"));
+		expect(sessionAnchorRgb("abcdefgh")).toEqual(sessionAnchorRgb("abcdefgh"));
+	});
+	test("different ids spread across hues (not all the same)", () => {
+		const ids = ["sess-a", "sess-b", "sess-c", "sess-d", "sess-e", "sess-f", "sess-g", "sess-h"];
+		const hues = new Set(ids.map((id) => sessionAnchorHue(id)));
+		expect(hues.size).toBeGreaterThan(1);
+	});
+	test("empty or missing id falls back to hue 0 (red)", () => {
+		expect(sessionAnchorHue(undefined)).toBe(0);
+		expect(sessionAnchorHue("")).toBe(0);
+	});
+	test("hashString is deterministic and unsigned", () => {
+		expect(hashString("sess-abc123")).toBe(hashString("sess-abc123"));
+		expect(hashString("x")).toBeGreaterThanOrEqual(0);
+	});
+	test("hslToRgb converts known values (red/cyan/green)", () => {
+		expect(hslToRgb(0, 1, 0.5)).toEqual([255, 0, 0]);
+		expect(hslToRgb(180, 1, 0.5)).toEqual([0, 255, 255]);
+		expect(hslToRgb(120, 1, 0.5)).toEqual([0, 255, 0]);
+	});
+	test("sessionAnchorRgb outputs are in 0..255 range", () => {
+		for (const id of ["a", "b", "c", "sess-xyz"]) {
+			const [r, g, b] = sessionAnchorRgb(id);
+			expect(r).toBeGreaterThanOrEqual(0);
+			expect(r).toBeLessThanOrEqual(255);
+			expect(g).toBeGreaterThanOrEqual(0);
+			expect(g).toBeLessThanOrEqual(255);
+			expect(b).toBeGreaterThanOrEqual(0);
+			expect(b).toBeLessThanOrEqual(255);
+		}
 	});
 });

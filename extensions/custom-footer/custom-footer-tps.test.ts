@@ -184,7 +184,8 @@ describe("custom footer tps tracker (round rate + per-message ttfb)", () => {
     tracker.onAgentSettled("/repo");
 
     expect(tracker.getLastTtfbMs("/repo")).toBe(500); // 5500-5000(消息2 自己的)
-    expect(tracker.getLast("/repo")).toBeCloseTo(100 / 6, 5); // 100/(7000-1000)ms
+    // 流式口径:批量 output 100 / 流式时间(仅消息2:5500→6000=500ms;消息1无首块不计)= 200 t/s
+    expect(tracker.getLast("/repo")).toBeCloseTo(200, 5);
     expect(tracker.getLastTurnMs("/repo")).toBe(6_000); // 7000-1000
   });
 
