@@ -25,11 +25,15 @@ const editEntrySchema = Type.Object(
 	{
 		match: Type.Unsafe<string | null>({
 			type: ["string", "null"],
-			description: "Smallest text to match. Must be unique in the file — make it longer until it is.",
+			description: "Smallest text to match. Must be unique in the file — make it longer until it is, or set replace_all: true.",
 		}),
 		new_str: Type.Optional(Type.Unsafe<string | null>({
 			type: ["string", "null"],
 			description: "Replacement text; omitted = delete.",
+		})),
+		replace_all: Type.Optional(Type.Unsafe<boolean | null>({
+			type: ["boolean", "null"],
+			description: "Replace every occurrence instead of requiring a unique match (renames).",
 		})),
 	},
 	{ additionalProperties: false },
@@ -112,6 +116,10 @@ function checkEntry(entry: unknown, label: string): EditEntry {
 	if (entry.new_str === null) delete entry.new_str;
 	if (entry.new_str !== undefined && typeof entry.new_str !== "string") {
 		invalidEditRequest(`${label}.new_str must be a string, got ${describeType(entry.new_str)}`);
+	}
+	if (entry.replace_all === null) delete entry.replace_all;
+	if (entry.replace_all !== undefined && typeof entry.replace_all !== "boolean") {
+		invalidEditRequest(`${label}.replace_all must be a boolean, got ${describeType(entry.replace_all)}`);
 	}
 	return entry as EditEntry;
 }
@@ -217,12 +225,13 @@ export default function (pi: ExtensionAPI) {
 		label: "edit",
 		renderShell: "default",
 		// prompt 面说清形状：一次调用 = 一个文件；path 顶层唯一，edits 是该文件
-		// 的 match 链；match 必须唯一命中，收窄靠加长 match。
+		// 的 match 链；match 缺省必须唯一命中，重命名用 replace_all。
 		description:
 			"Edit ONE file with a batch of chained replacements. "
 			+ "note: one line why. path: the single file this call edits. "
-			+ "edits: ordered entries, each { match, optional new_str (omitted = delete) }; "
+			+ "edits: ordered entries, each { match, optional new_str (omitted = delete), optional replace_all }; "
 			+ "entries chain against evolving content; stops at the first failed entry. "
+			+ "replace_all: true replaces every occurrence (renames); without it, match must be unique in the file — make it longer until it is. "
 			+ "One call edits one file — issue separate calls for other files. "
 			+ "Prefer this tool for modifying existing files; do not use perl/python/sed "
 			+ "one-liners or heredoc rewrites to mutate files. "

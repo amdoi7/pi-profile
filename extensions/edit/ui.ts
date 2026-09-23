@@ -74,10 +74,11 @@ function truncate(text: string, max = 24): string {
 
 /** 条目摘要：pending 阶段一行说清这一步要做什么（非执行语义）。 */
 export function entryLabel(entry: EditEntry): string {
+	const suffix = entry.replace_all === true ? " [all]" : "";
 	if (entry.new_str === undefined) {
-		return `delete "${truncate(entry.match)}"`;
+		return `delete "${truncate(entry.match)}"${suffix}`;
 	}
-	return `${truncate(entry.match)} → ${truncate(entry.new_str)}`;
+	return `${truncate(entry.match)} → ${truncate(entry.new_str)}${suffix}`;
 }
 
 /** 校验没过：能给用户的唯一真实信息就是这条消息。 */

@@ -84,4 +84,5 @@ test("note is required: the script needs its why", () => {
 test("entryLabel renders a one-line summary per op", () => {
 	assert.equal(entryLabel({ match: "a", new_str: "b" }), "a → b");
 	assert.equal(entryLabel({ match: "x" }), 'delete "x"');
+	assert.equal(entryLabel({ match: "old", new_str: "new", replace_all: true }), "old → new [all]");
 });

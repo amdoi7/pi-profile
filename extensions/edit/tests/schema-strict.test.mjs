@@ -58,6 +58,17 @@ test("null new_str means delete, not an error (provider null-is-omit)", () => {
 	assert.equal(parsed.edits[0].new_str, undefined, "null normalizes to absent = delete");
 });
 
+test("null replace_all means absent, not an error (provider null-is-omit)", () => {
+	const bogus = { note: "why", path: "a.py", edits: [{ match: "x", new_str: "y", replace_all: null }] };
+	const parsed = parseEditRequest(bogus);
+	assert.equal(parsed.edits[0].replace_all, undefined, "null normalizes to absent");
+});
+
+test("replace_all must be a boolean", () => {
+	const bogus = { note: "why", path: "a.py", edits: [{ match: "x", new_str: "y", replace_all: "yes" }] };
+	assert.throws(() => parseEditRequest(bogus), /edits\[0\]\.replace_all must be a boolean, got string/);
+});
+
 // 顶层严格：多余键、缺 note/path、空 edits 全部拒绝。
 test("rejects a stray top-level key", () => {
 	const bogus = { note: "why", path: "a.py", edits: [{ match: "x" }], comment: "legacy" };

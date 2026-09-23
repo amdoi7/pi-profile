@@ -162,6 +162,26 @@ test("a longer unique match disambiguates repeated text", async () => {
 	);
 });
 
+test("replace_all renames a variable across the file in one entry", async () => {
+	const tool = captureTool();
+	const file = await writeTempFile(
+		"calc.py",
+		"total = oldName + 1\nprint(oldName)\noldName = oldName * 2\n",
+	);
+
+	const result = await run(tool, {
+		note: "rename variable across the file",
+		path: file,
+		edits: [{ match: "oldName", new_str: "newName", replace_all: true }],
+	});
+
+	assert.equal(JSON.parse(result.content[0].text).status, "applied");
+	assert.equal(
+		await fs.readFile(file, "utf-8"),
+		"total = newName + 1\nprint(newName)\nnewName = newName * 2\n",
+	);
+});
+
 test.each([
 	["legacy occurrence", { match: "import", occurrence: 1 }, /occurrence must be removed/],
 	["legacy limit", { match: "import", limit: 1 }, /limit must be removed/],

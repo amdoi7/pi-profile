@@ -43,6 +43,43 @@ test("a longer match disambiguates repeated text", () => {
 	assert.equal(result.newContent, "foo = 1\nbar\nfoo = 3\n");
 });
 
+test("replace_all replaces every occurrence and reports a span per hit", () => {
+	const { newContent, matchedSpans } = applyEntryToNormalizedContent(
+		"const oldName = oldName + oldName;\n",
+		{ match: "oldName", new_str: "newName", replace_all: true },
+	);
+	assert.equal(newContent, "const newName = newName + newName;\n");
+	assert.equal(matchedSpans.length, 3);
+});
+
+test("replace_all delete removes every occurrence", () => {
+	const result = applyEntryToNormalizedContent(
+		"a, a, a",
+		{ match: ", ", replace_all: true },
+	);
+	assert.equal(result.newContent, "aaa");
+});
+
+test("replace_all with zero hits fails as NOT_FOUND", () => {
+	assert.throws(
+		() => applyEntryToNormalizedContent("foo bar", { match: "nope", new_str: "x", replace_all: true }),
+		(error) => {
+			assert.equal(error.kind, "NOT_FOUND");
+			return true;
+		},
+	);
+});
+
+test("replace_all with identical replacement fails as NO_CHANGE", () => {
+	assert.throws(
+		() => applyEntryToNormalizedContent("a a a", { match: "a", new_str: "a", replace_all: true }),
+		(error) => {
+			assert.equal(error.kind, "NO_CHANGE");
+			return true;
+		},
+	);
+});
+
 test("multi-line match is exact, newline included", () => {
 	const result = applyEntryToNormalizedContent(
 		"first\nsecond\nthird\n",

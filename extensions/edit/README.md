@@ -37,7 +37,7 @@
   "edits": [
     { "match": "amountOwed", "new_str": "amountDue" },
     { "match": "# old header", "new_str": "# generated" },
-    { "match": "dead_code()" },
+    { "match": "oldName", "new_str": "newName", "replace_all": true },
     { "match": "legacy", "new_str": "" }
   ]
 }
@@ -47,10 +47,11 @@
 
 - `match` + `new_str`：替换命中
 - `match` 缺省 `new_str`：删除命中（替换为空）
+- `replace_all: true`：替换**全部**命中（重命名等场景），跳过唯一性要求
 
-无选择器：`match` 必须在文件里**唯一命中**。多处命中即 `DUPLICATE_MATCH`
-（带行号清单），收窄的唯一办法是把 `match` 加长到唯一——选择器能表达的，
-更长的 `match` 都能表达，少一个原语少一类失败。
+无选择器：`match` 缺省必须在文件里**唯一命中**。多处命中即 `DUPLICATE_MATCH`
+（带行号清单），两个出口：把 `match` 加长到唯一，或 `replace_all: true`
+一次替换全部——选择器能表达的，更长的 `match` 都能表达，少一个原语少一类失败。
 
 规则：
 
@@ -67,7 +68,7 @@
     - `closest.truncated=true`（needle 超 8 行或整窗超 1200 字符）：重读文件再
       重发——照抄半截窗口只会二次失败
   - 多处命中 → `DUPLICATE_MATCH` + 行号清单（最多 8 处），该条目零写入；
-    把 `match` 加长到唯一后重发
+    把 `match` 加长到唯一，或 `replace_all: true` 后重发
   - 命中但替换归一化后无变化 → `NO_CHANGE`
 - 同一脚本内的连续条目 = 该文件的连续编辑步骤（链式的合法形状）
 

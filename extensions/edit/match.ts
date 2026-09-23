@@ -12,13 +12,15 @@
  * 文件归属在调用层：path 顶层唯一（一次调用 = 一个文件），条目不再携带。
  * 新建/整篇覆盖不做：模型用 cat heredoc 一步成型更自然；条目只管修改。
  *
- * 无选择器：match 必须在文件里唯一命中，多处命中即 DUPLICATE_MATCH——
- * 收窄的唯一办法是把 match 加长到唯一。 */
+ * match 必须唯一命中，多处命中即 DUPLICATE_MATCH——收窄的办法是加长 match，
+ * 或 replace_all 替换全部。 */
 export type EditEntry = {
-	/** 匹配目标（精确文本，必须在文件里唯一）。 */
+	/** 匹配目标（精确文本；缺省要求唯一）。 */
 	match: string;
 	/** 替换文本；缺省 = 删除（替换为空）。 */
 	new_str?: string;
+	/** 替换全部命中（重命名等场景），跳过唯一性要求。 */
+	replace_all?: boolean;
 };
 
 /** 一次调用 = 一个文件的一个编辑脚本：note 是批次唯一意图，path 是唯一目标
@@ -121,7 +123,7 @@ function getDuplicateError(matches: number, lineNumbers: number[]): EditToolErro
 		? ` (L${listed.join(", L")}${listed.length < lineNumbers.length ? ", …" : ""})`
 		: "";
 	return editError(
-		`match matched ${matches} locations${locations}; use a longer or more specific match`,
+		`match matched ${matches} locations${locations}; use a longer or more specific match, or set replace_all: true`,
 		"DUPLICATE_MATCH",
 	);
 }
@@ -148,29 +150,43 @@ function emptyMatchError(): EditToolError {
 
 /**
  * 单条操作应用到当前内容（链式）：match → new_str（缺省 = 删除，替换为空）。
- * match 必须唯一命中；失败（找不到/多处命中/空字段）直接抛出单条错误，
- * 调用方决定是否中断。
+ * 缺省要求唯一命中；replace_all: true 时替换全部命中（重命名场景）。
+ * 失败（找不到/多处命中/空字段）直接抛出单条错误，调用方决定是否中断。
  */
 export function applyEntryToNormalizedContent(normalizedContent: string, entry: EditEntry): AppliedEditResult {
 	const needle = normalizeToLF(entry.match);
 	if (needle.length === 0) throw emptyMatchError();
 	const replacement = normalizeToLF(entry.new_str ?? "");
 
-	const matchIndex = resolveMatch(normalizedContent, needle);
-	const newContent =
-		normalizedContent.substring(0, matchIndex) + replacement + normalizedContent.substring(matchIndex + needle.length);
+	const indices = entry.replace_all === true
+		? findAllMatchIndices(normalizedContent, needle)
+		: [resolveMatch(normalizedContent, needle)];
+	if (indices.length === 0) {
+		throw getNotFoundError(normalizedContent, needle);
+	}
+
+	// 命中互不重叠（顺序扫描），直接拼接。
+	const segments: string[] = [];
+	let cursor = 0;
+	for (const index of indices) {
+		segments.push(normalizedContent.substring(cursor, index));
+		segments.push(replacement);
+		cursor = index + needle.length;
+	}
+	segments.push(normalizedContent.substring(cursor));
+	const newContent = segments.join("");
 
 	if (newContent === normalizedContent) {
 		throw editError("No change: replacement normalizes to the matched text", "NO_CHANGE");
 	}
 	return {
 		newContent,
-		matchedSpans: [{
-			kind: "replace",
-			matchIndex,
+		matchedSpans: indices.map((index) => ({
+			kind: "replace" as const,
+			matchIndex: index,
 			matchLength: needle.length,
 			replacement,
-		}],
+		})),
 	};
 }
 
