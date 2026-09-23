@@ -1,4 +1,5 @@
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 
 /**
  * 在场性判定(全 Node 原生,零外部命令):
@@ -40,6 +41,28 @@ export function readHeartbeat(hbPath: string): Heartbeat | null {
 
 export function writeHeartbeat(hbPath: string, pid: number, now = Date.now()): void {
 	writeFileSync(hbPath, `${pid} ${now}\n`, { mode: 0o600 });
+}
+
+/** 心跳周期:serving 方每 60s 刷新(挂起 → 停更 → 观察者判 suspended)。 */
+export const HEARTBEAT_INTERVAL_MS = 60_000;
+
+/**
+ * 启动"我在服务此身份"的心跳:写文件 + 周期刷新,返回 stop()(停定时器 + 删文件,幂等)。
+ * 心跳是身份服务的在场证据,不是"进程活着"——fork/resume 双活时只有 serving 方写,
+ * 输家/退役方不写(index.ts 只在 tryServe 成功后调用)。intervalMs 供测试缩短。
+ */
+export function startHeartbeat(hbPath: string, pid: number, intervalMs = HEARTBEAT_INTERVAL_MS): () => void {
+	mkdirSync(dirname(hbPath), { recursive: true, mode: 0o700 });
+	writeHeartbeat(hbPath, pid);
+	const timer = setInterval(() => writeHeartbeat(hbPath, pid), intervalMs);
+	timer.unref?.();
+	let stopped = false;
+	return () => {
+		if (stopped) return;
+		stopped = true;
+		clearInterval(timer);
+		rmSync(hbPath, { force: true });
+	};
 }
 
 /** 进程是否存在(信号 0):挂起/僵尸也算存在;EPERM(异 uid)按存在处理。 */

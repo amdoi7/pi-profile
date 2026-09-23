@@ -268,4 +268,27 @@ describe("peer 工具", () => {
 		assert.equal(got[0].from, "selfself-0000", "同目录内 from 就是 sessionId");
 		close();
 	});
+
+	// 回归(2026-09-10):离线/被拒是可重试的瞬时失败——收方瞬拒 2 次后第 3 次送达。
+	// 现状(一次失败即落账)该测试应先红后绿。
+	test("退避重试:目标瞬时被拒 2 次后送达(3 次尝试内成功,只投成一份)", async () => {
+		const got = [];
+		let transientFailures = 0;
+		const { send, close } = await setup([
+			{
+				identity: identity({ sessionId: "retryaa-0001" }),
+				deliver: async (m) => {
+					if (transientFailures < 2) {
+						transientFailures += 1;
+						throw new Error("session 正忙"); // 被拒 = ack{ok:false} → 可重试
+					}
+					got.push(m);
+				},
+			},
+		]);
+		const res = await send({ to: ["retryaa"], text: "x" });
+		assert.equal(got.length, 1, "第 3 次尝试送达,只投成一份");
+		assert.match(res.content[0].text, /accepted by retryaa/);
+		close();
+	});
 });

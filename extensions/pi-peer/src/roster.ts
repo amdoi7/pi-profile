@@ -1,6 +1,6 @@
 import { readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { queryPeer, socketDir, type PeerIdentity } from "./transport.ts";
+import { queryPeer, ROSTER_SWEEP_TIMEOUT_MS, socketDir, type PeerIdentity } from "./transport.ts";
 import { ORPHAN_SUSPENDED_MS, presenceOf, readHeartbeat, removeCorpse } from "./process.ts";
 
 /**
@@ -84,7 +84,7 @@ export async function discoverPeers(
 			// 自己的最新代:不列(自己不在名册里),但也无需清
 			if (sidOf(hbFile) === selfId.slice(0, 8)) return;
 			const presence = presenceOf(hbPath, now);
-			const r = await query(sockPath);
+			const r = await query(sockPath, ROSTER_SWEEP_TIMEOUT_MS);
 			if (r.status === "ok") {
 				if (r.who.sessionId !== selfId) alive.push(r.who);
 				return;
@@ -98,7 +98,7 @@ export async function discoverPeers(
 			if (presence.status === "suspended" || presence.status === "online") {
 				// 孤儿判定(事实级):同 sessionId 存在更新代且 who ok → 本代已被取代,回收占位。
 				const newerSid = bySession.get(sidOf(hbFile));
-				const newerAlive = newerSid ? await query(newerSid[0]!.replace(/\.heartbeat$/, ".sock")) : { status: "dead" };
+				const newerAlive = newerSid ? await query(newerSid[0]!.replace(/\.heartbeat$/, ".sock"), ROSTER_SWEEP_TIMEOUT_MS) : { status: "dead" };
 				if (newerAlive.status === "ok") {
 					removeCorpse(sockPath, hbPath); // 有活替代者 = 本代必无用:回收(不杀进程)
 					return;

@@ -35,6 +35,14 @@ const WHO_TIMEOUT_MS = 1_000;
 const SEND_TIMEOUT_MS = 2_000;
 
 /**
+ * 名册普查(discoverPeers)的 who 超时。普查只分类(ok/dead/mute)、不做交付裁决;
+ * wedged 进程 150ms 不应答,1000ms 也不会应答——健康 peer 亚毫秒即答。钉死病态
+ * 拖慢:实测 3 健康 =1.8ms,+1 wedge=1002ms;150ms 把单次普查上限压到探测级,
+ * 分类不变(超时→mute→按心跳归 suspended/unknown,不误杀健康 peer)。
+ */
+export const ROSTER_SWEEP_TIMEOUT_MS = 150;
+
+/**
  * socket 目录即名册,且按 cwd 分区:同目录才通信是结构保证,不是运行期过滤——
  * 别的目录的会话根本不在这个目录里,连都不会连。
  *
@@ -159,6 +167,16 @@ export async function sendPeerMessage(path: string, msg: PeerMessage, timeoutMs 
 		throw e;
 	}
 	if (!reply?.ok) throw new Error(`peer rejected: ${reply?.error ?? "unknown error"}`);
+}
+
+/**
+ * 发送失败可否退避重试。分类以消息字符串为边界(这些 Error 由本模块构造):
+ * - 离线(拒连)/被拒(收方明确未注入) = 明确未送达,瞬时故障可复 → 可重试;
+ * - 超时 = 可能已送(歧义),重发 = 重复投递风险 → 不自动重发。
+ */
+export function isRetryableSendError(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	return error.message.startsWith("peer offline") || error.message.startsWith("peer rejected");
 }
 
 /**

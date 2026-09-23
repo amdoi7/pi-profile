@@ -5,7 +5,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { isPeerMessage, probeSocket, queryPeer, sendPeerMessage, socketPathFor, startPeerServer } from "../src/transport.ts";
+import { isPeerMessage, isRetryableSendError, probeSocket, queryPeer, sendPeerMessage, socketPathFor, startPeerServer } from "../src/transport.ts";
 
 process.env.PI_PEER_DIR = mkdtempSync(join(tmpdir(), "pi-peer-tr-"));
 
@@ -139,5 +139,18 @@ describe("transport(窄协议 NDJSON:deliver 投递→接管→ack / who 实时�
 		process.env.PI_PEER_DIR = override;
 		assert.ok(a.length < 104, `路径过长: ${a}`);
 		assert.notEqual(a, b, "同前缀不同 id 必须映射到不同 socket 路径");
+	});
+});
+
+describe("isRetryableSendError(发送失败分类:明确未送达可重试,歧义不重试)", () => {
+	test("离线/被拒 = 明确未送达 → 可重试", () => {
+		assert.equal(isRetryableSendError(new Error("peer offline (socket not answering)")), true);
+		assert.equal(isRetryableSendError(new Error("peer rejected: session 正忙")), true);
+	});
+
+	test("超时 = 可能已送(歧义) → 不自动重发;未知错误不重试", () => {
+		assert.equal(isRetryableSendError(new Error("peer receive timeout (may or may not have been injected; check the peer session before deciding)")), false);
+		assert.equal(isRetryableSendError(new Error("boom")), false);
+		assert.equal(isRetryableSendError(undefined), false);
 	});
 });

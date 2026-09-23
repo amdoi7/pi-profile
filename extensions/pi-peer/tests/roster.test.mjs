@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { discoverPeers, resolvePeer } from "../src/roster.ts";
-import { socketDir, socketPathFor, startPeerServer } from "../src/transport.ts";
+import { ROSTER_SWEEP_TIMEOUT_MS, socketDir, socketPathFor, startPeerServer } from "../src/transport.ts";
 import { writeHeartbeat } from "../src/process.ts";
 
 /** 每测试独立 socket 目录(socketDir 每次调用读 env) */
@@ -231,5 +231,21 @@ describe("roster(孤儿回收:代际替代 / 挂起超时,不杀进程)", () => 
 		assert.ok(readdirSync(dir).includes(`${fresh}-bbbb.sock`), "未超时 socket 保留");
 		silent.close();
 		silent2.close();
+	});
+
+	// 回归(2026-09-10):普查一律走探测级超时,wedged peer 最多拖 150ms,不被 1s WHO 超时钉死。
+	test("普查 query 一律携带 ROSTER_SWEEP_TIMEOUT_MS(含 secondary newerAlive 检查)", async () => {
+		const dir = isolate();
+		writeHeartbeat(join(dir, "wedged-0001-abcdef.heartbeat"), process.pid);
+		const calls = [];
+		const spy = async (path, timeoutMs) => {
+			calls.push({ path, timeoutMs });
+			return { status: "mute" }; // mute → 触发 secondary newerAlive 检查,两处超时都验证
+		};
+		await discoverPeers("me", CWD, spy);
+		assert.ok(calls.length >= 1, "普查至少一次 query");
+		for (const c of calls) {
+			assert.equal(c.timeoutMs, ROSTER_SWEEP_TIMEOUT_MS, "普查 query 一律走探测级超时");
+		}
 	});
 });

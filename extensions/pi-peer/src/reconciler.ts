@@ -12,7 +12,14 @@
  * - 接管判定(transport.probeSocket)由观察者用 OS 进程真相(lsof/ss)裁决挂起,见 transport.ts。
  */
 
-const DEFAULT_INTERVAL_MS = 60_000;
+/**
+ * 接管/在场收敛周期(fork/resume 活性上限):赢者骤死后,输家最多等一个 tick
+ * 才接管身份。60s 对"会话恢复可达"太长(resume 用户干等 1 分钟);降到 10s——
+ * 每次 tick 仅一次 socket 探测(150ms 内 timeout),N 进程合计毫秒级,成本可忽略;
+ * 语义不变(退让不是终态、busy 心跳新鲜不抢)。单机尺度 10s 是恢复延迟与
+ * 探查噪声的平衡点;若 N 大到 tick 噪声冒头,再按量调回。
+ */
+const DEFAULT_INTERVAL_MS = 10_000;
 
 export interface ReconcilerDeps {
 	/** 尝试成为收信方(接管 socket);true = 本进程已在服务。已服务后不再被调用。 */

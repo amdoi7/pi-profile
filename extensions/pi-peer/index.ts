@@ -1,5 +1,5 @@
 import { isatty } from "node:tty";
-import { mkdirSync, rmSync } from "node:fs";
+
 import { getMarkdownTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { buildInjectedContent, formatIncomingCard } from "./src/messages.ts";
@@ -7,7 +7,7 @@ import { WindowQuota } from "./src/quota.ts";
 import { startReconciler, type Reconciler } from "./src/reconciler.ts";
 import { PEER_SEND_QUOTA, registerPeerTools, type PeerRuntime } from "./src/tool.ts";
 import { sendPeerMessage, heartbeatPathFor, socketPathFor, startPeerServer, type PeerIdentity, type PeerMessage, type PeerServer } from "./src/transport.ts";
-import { writeHeartbeat } from "./src/process.ts";
+import { startHeartbeat } from "./src/process.ts";
 
 /**
  * pi-peer:同机 pi 会话互发消息。
@@ -20,8 +20,8 @@ export default function (pi: ExtensionAPI): void {
 	let rt: PeerRuntime | undefined;
 	let server: PeerServer | undefined;
 	let rec: Reconciler | undefined;
-let hbPath: string | undefined;
-let hbTimer: ReturnType<typeof setInterval> | undefined;
+	let hbPath: string | undefined;
+	let stopHeartbeat: (() => void) | undefined;
 
 	registerPeerTools(pi, () => rt);
 
@@ -40,12 +40,8 @@ let hbTimer: ReturnType<typeof setInterval> | undefined;
 		const startedAt = Date.now();
 		const socketPath = socketPathFor(sessionId, ctx.cwd);
 		hbPath = heartbeatPathFor(sessionId, ctx.cwd);
-		// 在场性心跳:观察者据此用 kill 0 + 时间戳判在线/挂起/尸体,零外部命令。
-		mkdirSync(hbPath.slice(0, hbPath.lastIndexOf("/")), { recursive: true });
-		writeHeartbeat(hbPath, process.pid);
-		// 周期刷新心跳:挂起(事件循环冻结)时停更 → 观察者判 suspended
-		hbTimer = setInterval(() => writeHeartbeat(hbPath!, process.pid), 60_000);
-		hbTimer.unref?.();
+		// 心跳 = 我在服务此身份(见 startHeartbeat):只在 tryServe 成功后写/续,
+		// 退役/让位即停 —— fork/resume 双活时仅 serving 方代写,pid 不翻摆。
 		// 身份每次实时求值(sessionFile 在 print/ephemeral 下可能晚到)
 		const identity = (): PeerIdentity => ({
 			sessionId,
@@ -91,8 +87,16 @@ let hbTimer: ReturnType<typeof setInterval> | undefined;
 		rec = await startReconciler({
 			tryServe: async () => {
 				const srv = await startPeerServer(socketPath, { who: () => { const self = identity(); if (rt) rt.self = self; return self; }, deliver });
-				if (srv.serving) server = srv;
-				return srv.serving;
+				if (srv.serving) {
+					server = srv;
+					// 接管成功 = 开始服务此身份:开写/续写心跳
+					if (!stopHeartbeat) stopHeartbeat = startHeartbeat(hbPath!, process.pid);
+					return true;
+				}
+				// 让位/失去席位:停止代写心跳(未 serving 过则 no-op)——fork 输家不写
+				stopHeartbeat?.();
+				stopHeartbeat = undefined;
+				return false;
 			},
 			// 影子检测(三态):ok 仍是我;gone 路径被外部移除 → 席位重建(下 tick 重接管);
 			// taken 他人接管身份 → 退役。挂起期间的接管由观察者(其他活会话)负责。
@@ -105,6 +109,9 @@ let hbTimer: ReturnType<typeof setInterval> | undefined;
 				// 退役 = 退出 peer 平面(释放 socket),让位给 resume 的真会话;进程本体不动
 				if (wasServing) server?.close();
 				server = undefined;
+				// 退役即停写心跳:身份不再由本进程服务
+				stopHeartbeat?.();
+				stopHeartbeat = undefined;
 			},
 			onError: (e) => {
 				if (warnedError || !ctx.hasUI) return;
@@ -117,11 +124,10 @@ let hbTimer: ReturnType<typeof setInterval> | undefined;
 	pi.on("session_shutdown", () => {
 		rec?.stop();
 		server?.close(); // close 即 unlink socket = 从名册消失,一步完成
-		if (hbTimer) clearInterval(hbTimer);
-		if (hbPath) rmSync(hbPath, { force: true }); // 一并移除 heartbeat
+		stopHeartbeat?.(); // 停心跳定时器并删文件(未 serving 过则 no-op)
+		stopHeartbeat = undefined;
 		rec = undefined;
 		server = undefined;
-		hbTimer = undefined;
 		hbPath = undefined;
 		rt = undefined;
 	});

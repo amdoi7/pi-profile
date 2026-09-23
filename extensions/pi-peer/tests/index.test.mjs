@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import extension from "../index.ts";
-import { probeSocket, queryPeer, sendPeerMessage, socketPathFor } from "../src/transport.ts";
+import { probeSocket, queryPeer, sendPeerMessage, socketPathFor, startPeerServer } from "../src/transport.ts";
 
 /** 假 pi 宿主:抓注册面与注入面;假 ctx:无 UI headless 会话。 */
 function host(sessionId) {
@@ -41,6 +41,7 @@ describe("index(接线冒烟:注册面 + 会话生命周期 + 收信注入,真 s
 		const r = await queryPeer(sock);
 		assert.equal(r.status, "ok", "session_start 即刻在场,who 可答");
 		assert.equal(r.who.sessionId, sessionId, "同目录内 id 即全部身份");
+		assert.ok(existsSync(sock.replace(/\.sock$/, ".heartbeat")), "serving 即写心跳(身份在服务)");
 
 		// 收信注入:pi-send 语义 steer（在跑注入工具边界后；不在跑 triggerTurn 起新轮）。
 		await sendPeerMessage(sock, { from: "s2-other-0001", text: "hello", ts: 1 });
@@ -53,6 +54,26 @@ describe("index(接线冒烟:注册面 + 会话生命周期 + 收信注入,真 s
 
 		captured.handlers.session_shutdown();
 		assert.ok(!existsSync(sock), "shutdown 关闭并移除 socket(即从名册消失)");
+		assert.ok(!existsSync(sock.replace(/\.sock$/, ".heartbeat")), "shutdown 一并移除心跳");
 		assert.equal(await probeSocket(sock), false);
+	});
+
+	// 回归(2026-09-10,fork/resume):心跳 = "我在服务此身份",仅 serving 方代写。
+	// fork 双活时输家不再写同一心跳文件(pid 不翻摆);现状(无条件写)此测试应红。
+	test("让位(他人持有身份)不写心跳:输家不代写,pid 不翻摆", async () => {
+		process.env.PI_PEER_DIR = mkdtempSync(join(tmpdir(), "pi-peer-idx-"));
+		const sessionId = "yield-0001-4000-8000-abcdefabcdef";
+		const { pi, ctx, captured } = host(sessionId);
+		extension(pi);
+		const sock = socketPathFor(sessionId, "/repo");
+		const hbPath = sock.replace(/\.sock$/, ".heartbeat");
+		const opponent = await startPeerServer(sock, {
+			who: () => ({ sessionId, startedAt: 1 }),
+			deliver: async () => {},
+		});
+		await captured.handlers.session_start({}, ctx);
+		assert.ok(!existsSync(hbPath), "让位:输家不写心跳");
+		opponent.close();
+		captured.handlers.session_shutdown();
 	});
 });

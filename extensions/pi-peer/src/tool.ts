@@ -5,10 +5,16 @@ import { Text } from "@earendil-works/pi-tui";
 import { formatOutgoingCall } from "./messages.ts";
 import { WindowQuota } from "./quota.ts";
 import { discoverPeers, resolvePeer } from "./roster.ts";
-import { sendPeerMessage, socketPathFor, type PeerIdentity, type PeerMessage } from "./transport.ts";
+import { isRetryableSendError, sendPeerMessage, socketPathFor, type PeerIdentity, type PeerMessage } from "./transport.ts";
 
 /** 发送配额配置(判定内核见 quota.ts):超限/重复的文案归本工具。 */
 export const PEER_SEND_QUOTA = { max: 10, windowMs: 300_000, repeatWindowMs: 60_000 };
+
+/** 退避重试:离线/被拒最多尝试到第 3 次,间隔 500ms·2^n;超时歧义不重发(分类见 isRetryableSendError)。 */
+export const PEER_SEND_MAX_ATTEMPTS = 3;
+const PEER_SEND_RETRY_BASE_MS = 500;
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 export interface PeerRuntime {
 	self: PeerIdentity;
@@ -173,44 +179,99 @@ export function registerPeerTools(pi: ExtensionAPI, getRt: () => PeerRuntime | u
 
 			const delivered: PeerIdentity[] = [];
 			const failed: SendFailure[] = [];
-			const reached = new Set<string>();
-			for (const to of targets) {
+
+			// 跨目标并行投递,但同一会话的多个写法(全 id + 前缀)必须只投一次、
+			// 且配额/去重只认成功——这些是 per-peer 的顺序依赖,所以:先纯判定落槽,
+			// 再按 peer 分组,组内串行(语义 = 原逐个循环),组间并行,最后按原顺序重组输出。
+			type SendSlot =
+				| { kind: "self"; to: string }
+				| { kind: "resolve-fail"; to: string; reason: string }
+				| { kind: "attempt"; to: string; peer: PeerIdentity; outcome?: { peer: PeerIdentity } | { reason: string } | { skipped: true } };
+			const slots: SendSlot[] = [];
+			const groups = new Map<string, { index: number; peer: PeerIdentity }[]>();
+			targets.forEach((to) => {
 				// 自己被 discoverPeers 排除在 resolve 面外,先按 id 前缀撞库自投,给明确错误
 				if (rt.self.sessionId.startsWith(to)) {
-					failed.push({ target: to, reason: "cannot send to yourself (same session)" });
-					continue;
+					slots.push({ kind: "self", to });
+					return;
 				}
 				const target = resolvePeer(alive, to);
 				if (!target.ok) {
-					failed.push({ target: to, reason: target.reason });
-					continue;
+					slots.push({ kind: "resolve-fail", to, reason: target.reason });
+					return;
 				}
-				// name 与 id 前缀可能指向同一会话:只投一次
-				if (reached.has(target.peer.sessionId)) continue;
-				const pair = `${rt.self.sessionId}→${target.peer.sessionId}`;
-				const v = rt.quota.check(pair, text, now);
-				if (!v.ok) {
-					failed.push({
-						target: to,
-						reason: v.kind === "repeat"
-							? `duplicate message (same text within ${PEER_SEND_QUOTA.repeatWindowMs / 1000}s), dropped`
-							: `send quota exceeded (${PEER_SEND_QUOTA.max}/${PEER_SEND_QUOTA.windowMs / 60000}min); retry later`,
-					});
-					continue;
+				// name 与 id 前缀可能指向同一会话:同 peer 入同组,组内只投一次
+				const index = slots.length;
+				slots.push({ kind: "attempt", to, peer: target.peer });
+				const g = groups.get(target.peer.sessionId);
+				if (g) g.push({ index, peer: target.peer });
+				else groups.set(target.peer.sessionId, [{ index, peer: target.peer }]);
+			});
+
+			const runGroup = async (attempts: { index: number; peer: PeerIdentity }[]): Promise<void> => {
+				const reachedInGroup = new Set<string>();
+				for (const a of attempts) {
+					const slot = slots[a.index] as Extract<SendSlot, { kind: "attempt" }>;
+					if (reachedInGroup.has(a.peer.sessionId)) {
+						slot.outcome = { skipped: true };
+						continue;
+					}
+					const pair = `${rt.self.sessionId}→${a.peer.sessionId}`;
+					const v = rt.quota.check(pair, text, now);
+					if (!v.ok) {
+						slot.outcome = {
+							reason: v.kind === "repeat"
+								? `duplicate message (same text within ${PEER_SEND_QUOTA.repeatWindowMs / 1000}s), dropped`
+								: `send quota exceeded (${PEER_SEND_QUOTA.max}/${PEER_SEND_QUOTA.windowMs / 60000}min); retry later`,
+						};
+						continue;
+					}
+					const msg: PeerMessage = { from: rt.self.sessionId, text, ts: now };
+					// 退避重试:离线/被拒 = 明确未送达,瞬时故障可复(重试上限 PEER_SEND_MAX_ATTEMPTS);
+					// 超时 = 可能已送(歧义),不自动重发(重发 = 重复投递风险)。失败尝试不烧配额。
+					let outcome: { peer: PeerIdentity } | { reason: string } | undefined;
+					let attemptsMade = 0;
+					let lastReason = "";
+					for (let attempt = 0; attempt < PEER_SEND_MAX_ATTEMPTS; attempt += 1) {
+						attemptsMade = attempt + 1;
+						try {
+							// 同步投递:成功返回 = 对方进程已接管(排队注入);不可达/被拒/超时抛错
+							await sendPeerMessage(socketPathFor(a.peer.sessionId, ctx.cwd), msg);
+							outcome = { peer: a.peer };
+							break;
+						} catch (e) {
+							// 一个目标投不进去不能拖累其他人:记下原因,继续尝试或落账
+							lastReason = e instanceof Error ? e.message : String(e);
+							if (!isRetryableSendError(e)) break; // 歧义/未知:不重发
+							if (attempt < PEER_SEND_MAX_ATTEMPTS - 1) {
+								await sleep(PEER_SEND_RETRY_BASE_MS * 2 ** attempt);
+							}
+						}
+					}
+					if (outcome) {
+						// 送达成功才记账:失败尝试不烧配额、不刷新同文基线,重试可放行
+						rt.quota.commit(pair, text, now);
+						reachedInGroup.add(a.peer.sessionId);
+						slot.outcome = outcome;
+					} else {
+						slot.outcome = {
+							reason: attemptsMade > 1 ? `${lastReason} (after ${attemptsMade} attempts)` : lastReason,
+						};
+					}
 				}
-				const msg: PeerMessage = { from: rt.self.sessionId, text, ts: now };
-				try {
-					// 同步投递:成功返回 = 对方进程已接管(排队注入);不可达/被拒/超时抛错
-					await sendPeerMessage(socketPathFor(target.peer.sessionId, ctx.cwd), msg);
-				} catch (e) {
-					// 一个目标投不进去不能拖累其他人:记下原因,继续下一个
-					failed.push({ target: to, reason: e instanceof Error ? e.message : String(e) });
-					continue;
+			};
+			await Promise.all([...groups.values()].map(runGroup));
+
+			// 按原始 target 顺序重组输出(顺序与逐个投递一致;同 peer 已投/去重不占位)。
+			for (const slot of slots) {
+				if (slot.kind === "self") {
+					failed.push({ target: slot.to, reason: "cannot send to yourself (same session)" });
+				} else if (slot.kind === "resolve-fail") {
+					failed.push({ target: slot.to, reason: slot.reason });
+				} else if (slot.outcome) {
+					if ("peer" in slot.outcome) delivered.push(slot.outcome.peer);
+					else if ("reason" in slot.outcome) failed.push({ target: slot.to, reason: slot.outcome.reason });
 				}
-				// 送达成功才记账:失败尝试不烧配额、不刷新同文基线,重试可放行
-				rt.quota.commit(pair, text, now);
-				reached.add(target.peer.sessionId);
-				delivered.push(target.peer);
 			}
 
 			// 零送达不是成功:全部失败走错误信封,并把手上的名册一并交回

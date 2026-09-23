@@ -1,10 +1,10 @@
 import { describe, test } from "vitest";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { HEARTBEAT_FRESH_MS, presenceOf, readHeartbeat, removeCorpse, writeHeartbeat } from "../src/process.ts";
+import { HEARTBEAT_FRESH_MS, presenceOf, readHeartbeat, removeCorpse, startHeartbeat, writeHeartbeat } from "../src/process.ts";
 
 const dir = () => mkdtempSync(join(tmpdir(), "pi-peer-proc-"));
 const hbPath = (d, id = "s") => join(d, `${id}.heartbeat`);
@@ -32,6 +32,21 @@ describe("process(在场性:heartbeat pid+时间戳 + kill 0,零外部命令)", 
 		const p = hbPath(d);
 		writeHeartbeat(p, process.pid, Date.now() - HEARTBEAT_FRESH_MS - 1000);
 		assert.deepEqual(presenceOf(p), { status: "suspended", pid: process.pid });
+	});
+
+	test("startHeartbeat:启动即写 + 周期刷新推进 ts,stop 停更删文件且幂等", async () => {
+		const d = dir();
+		const p = hbPath(d, "srv");
+		const stop = startHeartbeat(p, process.pid, 40);
+		assert.ok(existsSync(p), "start 即写");
+		const t1 = readHeartbeat(p).ts;
+		await new Promise((r) => setTimeout(r, 70));
+		const t2 = readHeartbeat(p).ts;
+		assert.ok(t2 > t1, "周期刷新推进时间戳");
+		stop();
+		assert.ok(!existsSync(p), "stop 删文件");
+		stop(); // 幂等:二次 stop 无害
+		assert.ok(!existsSync(p));
 	});
 
 	test("presenceOf:进程不存在 → dead(尸体可清)", () => {
