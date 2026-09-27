@@ -22,7 +22,8 @@
 /.cache/
 /pi-crash.log
 
-# mirasim 生成物与运行时缓存（启动时同步读、后台拉取后覆盖）
+# mirasim 本地 provider（机器专属、依赖本机 app/keychain，不入库）与生成物/运行时缓存
+/extensions/mirasim.ts
 /extensions/mirasim-gateway-*.js
 /extensions/smx-agent-status.js
 /mirasim-models.json
